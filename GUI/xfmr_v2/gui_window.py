@@ -341,7 +341,7 @@ class MlpTrainingStudio(QMainWindow):
         layout.setSpacing(10)
 
         layout.addWidget(self._build_metrics_card(), 0)
-        layout.addWidget(self._build_monitor_tabs(), 3)
+        layout.addWidget(self._build_monitor_tabs(), 5)
         layout.addWidget(self._build_run_log_card(), 1)
         return container
 
@@ -482,9 +482,6 @@ class MlpTrainingStudio(QMainWindow):
         layout.addLayout(metadata_grid)
 
         button_row = QHBoxLayout()
-        self.generate_readme_button = self._make_button("Generate README with AI", secondary=True)
-        self.generate_readme_button.clicked.connect(self._open_generate_readme_dialog)
-        button_row.addWidget(self.generate_readme_button)
         self.scan_data_button = self._make_button("Scan Data")
         self.scan_data_button.clicked.connect(self.scan_dataset)
         button_row.addWidget(self.scan_data_button)
@@ -775,7 +772,11 @@ class MlpTrainingStudio(QMainWindow):
         transfer_layout.addWidget(self.transfer_frequency_mae_plot, 1)
         tabs.addTab(transfer_tab, "Transfer Results")
 
-        tabs.addTab(self._build_chat_tab(), "AI Assistant")
+        chat_scroll = QScrollArea()
+        chat_scroll.setWidgetResizable(True)
+        chat_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        chat_scroll.setWidget(self._build_chat_tab())
+        tabs.addTab(chat_scroll, "AI Assistant")
 
         self.monitor_tabs = tabs
         self._reset_baseline_plots()
@@ -789,37 +790,7 @@ class MlpTrainingStudio(QMainWindow):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
 
-        # Chat display area
-        self.chat_display = QPlainTextEdit()
-        self.chat_display.setReadOnly(True)
-        self.chat_display.setMaximumBlockCount(10000)
-        self.chat_display.setStyleSheet(
-            'QPlainTextEdit { font-family: "Cascadia Code", "Consolas", monospace; font-size: 10pt; }'
-        )
-        self.chat_display.setPlaceholderText(
-            "AI Assistant — ask questions about your dataset or request README generation.\n\n"
-            "Examples:\n"
-            "  - \"Analyze my dataset and generate a README\"\n"
-            "  - \"What parameters are in the log.txt?\"\n"
-            "  - \"Change ground_truth_parameters to only S11 and S21\"\n"
-            "  - \"The first frequency is not DC, set drop_first_frequency to false\"\n"
-        )
-        layout.addWidget(self.chat_display, 1)
-
-        # Input row
-        input_row = QHBoxLayout()
-        input_row.setSpacing(8)
-        self.chat_input = QLineEdit()
-        self.chat_input.setPlaceholderText("Type a message... (Enter to send)")
-        self.chat_input.returnPressed.connect(self._on_chat_send)
-        input_row.addWidget(self.chat_input, 1)
-
-        self.chat_send_button = self._make_button("Send")
-        self.chat_send_button.clicked.connect(self._on_chat_send)
-        input_row.addWidget(self.chat_send_button)
-        layout.addLayout(input_row)
-
-        # Action buttons row
+        # Action buttons row — at the top so always visible
         action_row = QHBoxLayout()
         action_row.setSpacing(8)
 
@@ -839,6 +810,36 @@ class MlpTrainingStudio(QMainWindow):
         action_row.addStretch()
         layout.addLayout(action_row)
 
+        # Input row
+        input_row = QHBoxLayout()
+        input_row.setSpacing(8)
+        self.chat_input = QLineEdit()
+        self.chat_input.setPlaceholderText("Type a message... (Enter to send)")
+        self.chat_input.returnPressed.connect(self._on_chat_send)
+        input_row.addWidget(self.chat_input, 1)
+
+        self.chat_send_button = self._make_button("Send")
+        self.chat_send_button.clicked.connect(self._on_chat_send)
+        input_row.addWidget(self.chat_send_button)
+        layout.addLayout(input_row)
+
+        # Chat display area — takes remaining space
+        self.chat_display = QPlainTextEdit()
+        self.chat_display.setReadOnly(True)
+        self.chat_display.setMaximumBlockCount(10000)
+        self.chat_display.setStyleSheet(
+            'QPlainTextEdit { font-family: "Cascadia Code", "Consolas", monospace; font-size: 10pt; }'
+        )
+        self.chat_display.setPlaceholderText(
+            "AI Assistant — ask questions about your dataset or request README generation.\n\n"
+            "Examples:\n"
+            "  - \"Analyze my dataset and generate a README\"\n"
+            "  - \"What parameters are in the log.txt?\"\n"
+            "  - \"Change ground_truth_parameters to only S11 and S21\"\n"
+            "  - \"The first frequency is not DC, set drop_first_frequency to false\"\n"
+        )
+        layout.addWidget(self.chat_display, 1)
+
         # Session state
         self._chat_session = None
         self._last_readme_content = None
@@ -855,7 +856,7 @@ class MlpTrainingStudio(QMainWindow):
         self.run_log_text_edit = QPlainTextEdit()
         self.run_log_text_edit.setReadOnly(True)
         self.run_log_text_edit.setMaximumBlockCount(4000)
-        self.run_log_text_edit.setMinimumHeight(150)
+        self.run_log_text_edit.setMinimumHeight(80)
         self.run_log_text_edit.setStyleSheet(
             self.run_log_text_edit.styleSheet()
             + '\nQPlainTextEdit { font-family: "Cascadia Code", "Consolas", monospace; font-size: 9.5pt; }'
@@ -1295,8 +1296,6 @@ class MlpTrainingStudio(QMainWindow):
         self._gemini_api_key = api_key
 
         # Run generation in background.
-        self.generate_readme_button.setEnabled(False)
-        self.generate_readme_button.setText("Generating...")
         self.append_log(f"Generating README for {dataset_dir} ...")
 
         def _do_generate(*, progress_callback=None, should_stop=None):
@@ -1313,9 +1312,6 @@ class MlpTrainingStudio(QMainWindow):
 
     def _on_readme_generated(self, result: dict) -> None:
         from .readme_generator import save_readme
-
-        self.generate_readme_button.setEnabled(True)
-        self.generate_readme_button.setText("Generate README with AI")
 
         content = result["content"]
         directory = result["directory"]
@@ -1678,8 +1674,7 @@ class MlpTrainingStudio(QMainWindow):
             self.detected_dataset_readme_value.setText("Scan failed. See the run log for details.")
             self.scan_data_button.setText("Scan Data")
         if self.current_task_name == "readme_gen":
-            self.generate_readme_button.setEnabled(True)
-            self.generate_readme_button.setText("Generate README with AI")
+            pass  # readme generation recovered
         if self.current_task_name == "chat_msg":
             self.chat_send_button.setEnabled(True)
             self.chat_input.setEnabled(True)
