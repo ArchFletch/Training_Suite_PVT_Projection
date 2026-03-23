@@ -1,0 +1,5 @@
+{
+  "granted": false,
+  "reason_code": "out_of_credit",
+  "message": "This code is not part of the MVP contract."
+}

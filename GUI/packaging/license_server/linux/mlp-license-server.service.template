@@ -1,0 +1,26 @@
+[Unit]
+Description=MLP License Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__SERVICE_USER__
+Group=__SERVICE_GROUP__
+WorkingDirectory=__WORKING_DIRECTORY__
+EnvironmentFile=-__ENV_FILE__
+Environment=MLP_LICENSE_SERVER_CONFIG=__CONFIG_PATH__
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/bin/sh -lc "$MLP_LICENSE_SERVER_COMMAND"
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=__DATA_DIR__ __LOG_DIR__
+
+[Install]
+WantedBy=multi-user.target

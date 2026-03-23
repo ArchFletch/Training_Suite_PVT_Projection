@@ -1,0 +1,5 @@
+{
+  "granted": false,
+  "reason_code": "all_seats_in_use",
+  "message": "All floating seats are currently in use."
+}

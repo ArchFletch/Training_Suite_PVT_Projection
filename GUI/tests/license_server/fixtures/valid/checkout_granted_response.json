@@ -1,0 +1,12 @@
+{
+  "granted": true,
+  "lease_id": "lease_001",
+  "heartbeat_interval_seconds": 30,
+  "lease_ttl_seconds": 120,
+  "grace_seconds": 300,
+  "expires_at": "2026-04-10T15:22:00Z",
+  "license_type": "evaluation",
+  "company_name": "Acme Design House",
+  "seat_count": 2,
+  "seats_in_use": 1
+}

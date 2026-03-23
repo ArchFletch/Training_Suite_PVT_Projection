@@ -1,0 +1,22 @@
+# Copy to /etc/mlp-license-server/config.toml and replace any remaining __...__ tokens.
+
+[server]
+host = "0.0.0.0"
+port = 8090
+
+[paths]
+data_dir = "__DATA_DIR__"
+log_dir = "__LOG_DIR__"
+database_path = "__DATA_DIR__/license.db"
+identity_path = "__DATA_DIR__/server_identity.json"
+license_path = "__DATA_DIR__/active_license.json"
+request_export_path = "__DATA_DIR__/license_request.json"
+
+[leases]
+lease_ttl_seconds = 120
+heartbeat_interval_seconds = 30
+heartbeat_grace_seconds = 300
+
+[logging]
+level = "INFO"
+format = "text"

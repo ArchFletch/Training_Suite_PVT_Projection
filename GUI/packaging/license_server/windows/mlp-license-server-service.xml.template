@@ -1,0 +1,22 @@
+<service>
+  <id>{{SERVICE_ID}}</id>
+  <name>{{SERVICE_NAME}}</name>
+  <description>{{SERVICE_DESCRIPTION}}</description>
+  <executable>{{SERVICE_COMMAND}}</executable>
+  <arguments>{{SERVICE_ARGUMENTS}}</arguments>
+  <workingdirectory>{{WORKING_DIRECTORY}}</workingdirectory>
+  <startmode>Automatic</startmode>
+  <stoptimeout>15sec</stoptimeout>
+  <stopparentprocessfirst>true</stopparentprocessfirst>
+  <onfailure action="restart" delay="10 sec" />
+  <logpath>{{LOG_DIRECTORY}}</logpath>
+  <log mode="roll-by-size-time">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>14</keepFiles>
+    <pattern>yyyyMMdd</pattern>
+    <autoRollAtTime>00:00:00</autoRollAtTime>
+  </log>
+  <env name="MLP_LICENSE_SERVER_RUNTIME_DIR" value="{{RUNTIME_ROOT}}" />
+  <env name="MLP_LICENSE_SERVER_CONFIG" value="{{CONFIG_PATH}}" />
+  <env name="PYTHONUNBUFFERED" value="1" />
+</service>

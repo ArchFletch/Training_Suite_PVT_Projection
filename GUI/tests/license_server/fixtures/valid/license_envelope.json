@@ -1,0 +1,19 @@
+{
+  "algorithm": "Ed25519",
+  "key_id": "2026-01",
+  "payload": {
+    "schema_version": 1,
+    "product": "Surrogate Model Traning Suite",
+    "license_id": "lic_2026_0001",
+    "license_type": "evaluation",
+    "company_name": "Acme Design House",
+    "server_id": "srv_6f9f6a4f7f2e",
+    "host_fingerprint": "host_5a7d0d8d3d95",
+    "seat_count": 2,
+    "features": ["baseline", "transfer"],
+    "starts_at": "2026-04-01T00:00:00Z",
+    "ends_at": "2026-04-30T23:59:59Z",
+    "notes": "14-day floating POC, non-production"
+  },
+  "signature": "QUJDREVGRw=="
+}

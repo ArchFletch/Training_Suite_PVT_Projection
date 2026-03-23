@@ -1,0 +1,43 @@
+# Python bytecode and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editor settings
+.vscode/
+.idea/
+
+# OS cruft
+Thumbs.db
+.DS_Store
+
+# Generated experiment outputs
+/artifacts/cache/
+/artifacts/runs/
+/artifacts/gui/last_session.json
+/artifacts/*.log
+/artifacts/*.err
+/artifacts/packaging/
+/build/
+/dist/
+/deployment/
+/gui_smoke_err.txt
+/gui_smoke_out.txt
+/nuitka-crash-report.xml
+/runtime/
+/license_vendor_issuance_log.jsonl
+
+# Claude Code
+.claude/
+
+# Dataset files
+Dataset/
+artifacts/
+**/artifacts/

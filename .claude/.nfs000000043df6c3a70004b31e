@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install:*)",
+      "Bash(conda install:*)",
+      "Bash(conda info:*)",
+      "Bash(source ~/.bashrc)",
+      "Bash(conda activate:*)",
+      "Read(//home/lx27/Surrogate_Model_Training_Suite/**)",
+      "Bash(echo $LD_LIBRARY_PATH)",
+      "Bash(LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH python /home/lx27/Surrogate_Model_Training_Suite/Surrogate-Model-Training-Suite/launch_gui.py)",
+      "Bash(python3 -c \":*)",
+      "Bash(ls -lah /home/lx27/Active_ML/Dataset*)",
+      "Bash(grep -E \"^d|\\\\.py$\")",
+      "Bash(grep -r \"MODEL_TYPES\\\\|model_type\" /home/lx27/Surrogate_Model_Training_Suite/GUI/xfmr_v2/*.py)",
+      "Bash(python -c \":*)",
+      "Bash(python -m pytest GUI/tests/ -x -q)",
+      "Bash(PYTHONPATH=GUI python -m pytest GUI/tests/ -x -q --ignore=GUI/tests/gui_license)",
+      "Bash(PYTHONPATH=GUI python -m pytest GUI/tests/test_gui_backend.py -x -q)",
+      "Bash(PYTHONPATH=GUI python -c \":*)",
+      "Bash(pip list:*)",
+      "Read(//home/lx27/**)",
+      "Bash(~/.bashrc)",
+      "Bash(find /rdf/shared/design_automation/Data_EMX/XFMR_2503_1x1/ -name README*)",
+      "Bash(find /home/lx27/ -name README.md -newer /home/lx27/Surrogate_Model_Training_Suite/GUI/xfmr_v2/readme_generator.py -not -path */node_modules/*)",
+      "Bash(ls /rdf/shared/design_automation/Data_EMX/XFMR_2503_1x1/README*)"
+    ]
+  }
+}

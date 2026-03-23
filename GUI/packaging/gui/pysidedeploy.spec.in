@@ -1,0 +1,21 @@
+[app]
+title = __TITLE__
+project_dir = __PROJECT_DIR__
+input_file = __INPUT_FILE__
+exec_directory = __EXEC_DIRECTORY__
+project_file =
+icon = __ICON__
+
+[python]
+python_path = __PYTHON_PATH__
+packages = Nuitka==2.7.11
+
+[qt]
+qml_files =
+excluded_qml_plugins =
+modules =
+plugins =
+
+[nuitka]
+mode = standalone
+extra_args = --quiet --assume-yes-for-downloads --module-parameter=torch-disable-jit=yes --noinclude-qt-translations --include-module=PySide6.QtOpenGL --include-module=PySide6.QtOpenGLWidgets --include-module=PySide6.QtSvg --include-module=PySide6.QtTest --include-package=xfmr_v2 --include-package=numpy --include-package=pyqtgraph --include-package=torch
