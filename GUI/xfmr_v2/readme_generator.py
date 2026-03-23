@@ -558,3 +558,141 @@ def save_readme(directory: str | Path, content: str) -> Path:
     path = Path(directory) / "README.md"
     path.write_text(content, encoding="utf-8")
     return path
+
+
+# ---------------------------------------------------------------------------
+# Multi-turn Chat Session for interactive README generation
+# ---------------------------------------------------------------------------
+
+_CHAT_SYSTEM_PROMPT = """\
+You are a helpful AI assistant embedded in a surrogate-model training GUI.
+Your primary role is to help users understand their datasets and generate
+correct README.md schema files so the training pipeline can load the data.
+
+You have access to pre-analyzed facts about the user's dataset directory.
+When the user asks you to generate or fix a README, use the exact same JSON
+schema format described below.
+
+""" + _SYSTEM_PROMPT.split("## Output format")[0] + """\
+## Important behaviour rules
+
+- When the user asks you to generate a README, output the COMPLETE README.md
+  content (title, description, fenced json block, notes) inside a single
+  markdown code block fenced with ```readme ... ```.
+- When the user asks questions about their data, answer concisely based on
+  the pre-analyzed facts and file previews.
+- If the user asks you to fix or change specific fields, output the full
+  updated README.md (not just the changed part) inside ```readme ... ```.
+- Keep answers concise and focused on the dataset / README task.
+"""
+
+
+class ChatSession:
+    """Multi-turn conversation session with Gemini for dataset assistance."""
+
+    def __init__(
+        self,
+        dataset_dir: str | Path | None = None,
+        api_key: str | None = None,
+        model_name: str = "gemini-2.5-flash-lite",
+    ):
+        self.model_name = model_name
+        self.api_key = api_key or os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+        self.dataset_dir = Path(dataset_dir) if dataset_dir else None
+        self.history: list[dict] = []  # [{"role": "user"/"model", "text": str}]
+        self._facts: dict | None = None
+        self._file_preview: str | None = None
+
+    def set_dataset(self, dataset_dir: str | Path) -> str:
+        """Set or change the dataset directory. Returns a summary of what was found."""
+        self.dataset_dir = Path(dataset_dir)
+        self._facts = _pre_analyze(self.dataset_dir)
+        self._file_preview = _sample_files(self.dataset_dir)
+        summary = _format_facts(self._facts)
+        return f"Dataset loaded: {self.dataset_dir.name}\n{summary}"
+
+    def send(self, user_message: str) -> str:
+        """Send a message and get a response. Blocking call."""
+        try:
+            from google import genai
+        except ImportError:
+            return "Error: google-genai package not installed. Run: pip install google-genai"
+
+        if not self.api_key:
+            return "Error: No Gemini API key configured. Set GOOGLE_API_KEY environment variable or enter it in Settings."
+
+        # Auto-analyze dataset on first message if not done yet.
+        if self._facts is None and self.dataset_dir and self.dataset_dir.is_dir():
+            self.set_dataset(self.dataset_dir)
+
+        # Build the context-enriched first user message.
+        context_block = ""
+        if self._facts:
+            context_block = (
+                f"\n\n[Dataset context — pre-analyzed facts]\n"
+                f"```\n{_format_facts(self._facts)}\n```\n\n"
+                f"[Sample file content]\n{self._file_preview}\n\n"
+            )
+
+        # Build contents for the API call (full history).
+        contents = []
+        for msg in self.history:
+            contents.append(genai.types.Content(
+                role=msg["role"],
+                parts=[genai.types.Part(text=msg["text"])],
+            ))
+
+        # Add the new user message (with context on first message only).
+        enriched_message = user_message
+        if not self.history and context_block:
+            enriched_message = user_message + context_block
+        elif context_block and not any("Dataset context" in m["text"] for m in self.history):
+            enriched_message = user_message + context_block
+
+        contents.append(genai.types.Content(
+            role="user",
+            parts=[genai.types.Part(text=enriched_message)],
+        ))
+
+        try:
+            client = genai.Client(api_key=self.api_key)
+            config = genai.types.GenerateContentConfig(
+                system_instruction=_CHAT_SYSTEM_PROMPT,
+                temperature=0.2,
+            )
+            response = client.models.generate_content(
+                model=self.model_name,
+                contents=contents,
+                config=config,
+            )
+            reply = response.text
+        except Exception as e:
+            reply = f"Error: {e}"
+
+        # Store in history (store enriched version so context is in history).
+        self.history.append({"role": "user", "text": enriched_message})
+        self.history.append({"role": "model", "text": reply})
+
+        return reply
+
+    def extract_readme(self, text: str) -> str | None:
+        """Extract README content from a ```readme ... ``` or ```json ... ``` fenced block in the response."""
+        import re
+        # Try ```readme first, then ```markdown, then look for the json schema block.
+        for pattern in [
+            r"```readme\s*\n(.*?)```",
+            r"```markdown\s*\n(.*?)```",
+        ]:
+            match = re.search(pattern, text, re.DOTALL)
+            if match:
+                return match.group(1).strip()
+        # Fallback: if the response contains a ```json block with "dataset_name",
+        # it's likely the full README.
+        if '"dataset_name"' in text and "```json" in text:
+            # Return the full text as-is (it's already a README).
+            return text.strip()
+        return None
+
+    def clear(self) -> None:
+        """Reset conversation history."""
+        self.history.clear()

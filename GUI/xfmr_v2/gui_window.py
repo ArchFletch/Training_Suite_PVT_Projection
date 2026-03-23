@@ -775,10 +775,75 @@ class MlpTrainingStudio(QMainWindow):
         transfer_layout.addWidget(self.transfer_frequency_mae_plot, 1)
         tabs.addTab(transfer_tab, "Transfer Results")
 
+        tabs.addTab(self._build_chat_tab(), "AI Assistant")
+
         self.monitor_tabs = tabs
         self._reset_baseline_plots()
         self._reset_transfer_plots()
         return tabs
+
+    def _build_chat_tab(self) -> QWidget:
+        """Build the AI Assistant chat tab for interactive README generation."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        # Chat display area
+        self.chat_display = QPlainTextEdit()
+        self.chat_display.setReadOnly(True)
+        self.chat_display.setMaximumBlockCount(10000)
+        self.chat_display.setStyleSheet(
+            'QPlainTextEdit { font-family: "Cascadia Code", "Consolas", monospace; font-size: 10pt; }'
+        )
+        self.chat_display.setPlaceholderText(
+            "AI Assistant — ask questions about your dataset or request README generation.\n\n"
+            "Examples:\n"
+            "  - \"Analyze my dataset and generate a README\"\n"
+            "  - \"What parameters are in the log.txt?\"\n"
+            "  - \"Change ground_truth_parameters to only S11 and S21\"\n"
+            "  - \"The first frequency is not DC, set drop_first_frequency to false\"\n"
+        )
+        layout.addWidget(self.chat_display, 1)
+
+        # Input row
+        input_row = QHBoxLayout()
+        input_row.setSpacing(8)
+        self.chat_input = QLineEdit()
+        self.chat_input.setPlaceholderText("Type a message... (Enter to send)")
+        self.chat_input.returnPressed.connect(self._on_chat_send)
+        input_row.addWidget(self.chat_input, 1)
+
+        self.chat_send_button = self._make_button("Send")
+        self.chat_send_button.clicked.connect(self._on_chat_send)
+        input_row.addWidget(self.chat_send_button)
+        layout.addLayout(input_row)
+
+        # Action buttons row
+        action_row = QHBoxLayout()
+        action_row.setSpacing(8)
+
+        self.chat_generate_button = self._make_button("Generate README", secondary=True)
+        self.chat_generate_button.clicked.connect(lambda: self._chat_send_message("Analyze my dataset and generate a README.md file"))
+        action_row.addWidget(self.chat_generate_button)
+
+        self.chat_save_readme_button = self._make_button("Save Last README", secondary=True)
+        self.chat_save_readme_button.clicked.connect(self._on_chat_save_readme)
+        self.chat_save_readme_button.setEnabled(False)
+        action_row.addWidget(self.chat_save_readme_button)
+
+        self.chat_clear_button = self._make_button("Clear Chat", secondary=True)
+        self.chat_clear_button.clicked.connect(self._on_chat_clear)
+        action_row.addWidget(self.chat_clear_button)
+
+        action_row.addStretch()
+        layout.addLayout(action_row)
+
+        # Session state
+        self._chat_session = None
+        self._last_readme_content = None
+
+        return tab
 
     def _build_run_log_card(self) -> QWidget:
         card = CardFrame()
@@ -1283,6 +1348,167 @@ class MlpTrainingStudio(QMainWindow):
         cancel_btn.clicked.connect(dialog.reject)
         dialog.exec()
 
+    # ------------------------------------------------------------------
+    # AI Chat handlers
+    # ------------------------------------------------------------------
+    def _get_chat_session(self):
+        """Get or create the ChatSession, resolving the dataset dir and API key."""
+        from .readme_generator import ChatSession
+
+        if self._chat_session is None:
+            api_key = getattr(self, "_gemini_api_key", None) or os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+            if not api_key:
+                api_key, ok = QInputDialog.getText(
+                    self,
+                    "Gemini API Key",
+                    "Enter your Google Gemini API key\n(get one at aistudio.google.com):\n\nThe key will be remembered for this session.",
+                    QLineEdit.EchoMode.Password,
+                )
+                if not ok or not api_key.strip():
+                    return None
+                api_key = api_key.strip()
+                self._gemini_api_key = api_key
+
+            dataset_dir = self._resolve_dataset_dir()
+            self._chat_session = ChatSession(
+                dataset_dir=dataset_dir,
+                api_key=api_key,
+            )
+        else:
+            # Update dataset dir if it changed.
+            new_dir = self._resolve_dataset_dir()
+            if new_dir and (self._chat_session.dataset_dir is None or str(new_dir) != str(self._chat_session.dataset_dir)):
+                summary = self._chat_session.set_dataset(new_dir)
+                self._chat_append("system", f"Dataset updated: {summary}")
+
+        return self._chat_session
+
+    def _resolve_dataset_dir(self) -> Path | None:
+        """Resolve the dataset root directory from the GUI path fields."""
+        gt_dir = self.ground_truth_data_folder_path_edit.text().strip()
+        input_path = self.input_feature_path_edit.text().strip()
+        if input_path and gt_dir:
+            return Path(os.path.commonpath([
+                str(Path(input_path).parent),
+                str(Path(gt_dir)),
+            ]))
+        elif input_path:
+            return Path(input_path).parent
+        elif gt_dir:
+            return Path(gt_dir)
+        return None
+
+    def _chat_append(self, role: str, text: str) -> None:
+        """Append a message to the chat display."""
+        if role == "user":
+            self.chat_display.appendPlainText(f"\n>> You: {text}")
+        elif role == "system":
+            self.chat_display.appendPlainText(f"\n[System] {text}")
+        else:
+            self.chat_display.appendPlainText(f"\nAI: {text}")
+        # Auto-scroll to bottom.
+        scrollbar = self.chat_display.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def _on_chat_send(self) -> None:
+        """Handle Enter or Send button click."""
+        message = self.chat_input.text().strip()
+        if not message:
+            return
+        self._chat_send_message(message)
+
+    def _chat_send_message(self, message: str) -> None:
+        """Send a message to the chat session in a background thread."""
+        session = self._get_chat_session()
+        if session is None:
+            return
+
+        self._chat_append("user", message)
+        self.chat_input.clear()
+        self.chat_send_button.setEnabled(False)
+        self.chat_input.setEnabled(False)
+        self.chat_send_button.setText("Thinking...")
+
+        def _do_chat(*, progress_callback=None, should_stop=None):
+            reply = session.send(message)
+            return {"reply": reply}
+
+        self._start_task(
+            _do_chat,
+            kwargs={},
+            task_name="chat_msg",
+            busy_state="Chat",
+            on_result=self._on_chat_reply,
+        )
+
+    def _on_chat_reply(self, result: dict) -> None:
+        """Handle the AI response."""
+        self.chat_send_button.setEnabled(True)
+        self.chat_input.setEnabled(True)
+        self.chat_send_button.setText("Send")
+        self.chat_input.setFocus()
+
+        reply = result["reply"]
+        self._chat_append("model", reply)
+
+        # Check if the reply contains a README — enable save button if so.
+        if self._chat_session:
+            readme = self._chat_session.extract_readme(reply)
+            if readme:
+                self._last_readme_content = readme
+                self.chat_save_readme_button.setEnabled(True)
+                self._chat_append("system", "README detected in response. Click 'Save Last README' to write it to disk.")
+
+    def _on_chat_save_readme(self) -> None:
+        """Save the last README extracted from chat to the dataset directory."""
+        from .readme_generator import save_readme
+
+        if not self._last_readme_content:
+            self._show_warning("No README content found in the chat history.")
+            return
+
+        dataset_dir = self._resolve_dataset_dir()
+        if not dataset_dir or not dataset_dir.is_dir():
+            self._show_warning("Set the data paths first so we know where to save the README.")
+            return
+
+        # Show preview dialog.
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Save README from Chat")
+        dialog.resize(700, 500)
+        dlayout = QVBoxLayout(dialog)
+        dlayout.addWidget(QLabel(f"Saving to: {dataset_dir}/README.md\nReview and edit if needed:"))
+        editor = QPlainTextEdit()
+        editor.setPlainText(self._last_readme_content)
+        editor.setFont(self.font())
+        dlayout.addWidget(editor)
+        btn_row = QHBoxLayout()
+        save_btn = QPushButton("Save README.md")
+        cancel_btn = QPushButton("Cancel")
+        btn_row.addStretch()
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(save_btn)
+        dlayout.addLayout(btn_row)
+
+        def _save():
+            final = editor.toPlainText()
+            path = save_readme(str(dataset_dir), final)
+            self.append_log(f"README.md saved to {path}")
+            self._chat_append("system", f"README saved to {path}")
+            dialog.accept()
+
+        save_btn.clicked.connect(_save)
+        cancel_btn.clicked.connect(dialog.reject)
+        dialog.exec()
+
+    def _on_chat_clear(self) -> None:
+        """Clear chat history and display."""
+        if self._chat_session:
+            self._chat_session.clear()
+        self.chat_display.clear()
+        self._last_readme_content = None
+        self.chat_save_readme_button.setEnabled(False)
+
     def browse_cache_path(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "Select Cache File", self.cache_path_edit.text(), "NumPy Cache (*.npz)")
         if path:
@@ -1454,6 +1680,12 @@ class MlpTrainingStudio(QMainWindow):
         if self.current_task_name == "readme_gen":
             self.generate_readme_button.setEnabled(True)
             self.generate_readme_button.setText("Generate README with AI")
+        if self.current_task_name == "chat_msg":
+            self.chat_send_button.setEnabled(True)
+            self.chat_input.setEnabled(True)
+            self.chat_send_button.setText("Send")
+            self._chat_append("system", f"Error: {message}")
+            return  # Don't show popup for chat errors — just show in chat.
         self.append_log(f"Error: {message}")
         self._show_warning(f"{message}\n\n{traceback_text}")
 
@@ -1463,7 +1695,7 @@ class MlpTrainingStudio(QMainWindow):
         self._set_action_controls_enabled(True)
         self.stop_training_button.setEnabled(False)
         self.scan_data_button.setText("Scan Data")
-        if self.run_state_badge.text() in {"Training", "Transfer", "Searching", "Scanning", "Suggesting", "Checking"}:
+        if self.run_state_badge.text() in {"Training", "Transfer", "Searching", "Scanning", "Suggesting", "Checking", "Chat"}:
             self.run_state_badge.set_status("Idle")
 
     # ------------------------------------------------------------------
