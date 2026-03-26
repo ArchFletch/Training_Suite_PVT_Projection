@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
+    QDockWidget,
     QDoubleSpinBox,
     QFileDialog,
     QFrame,
@@ -274,6 +275,20 @@ class MlpTrainingStudio(QMainWindow):
         splitter.setSizes([760, 740])
         self.main_splitter = splitter
 
+        # Run Log as a dock widget inside the main window.
+        self.run_log_text_edit = QPlainTextEdit()
+        self.run_log_text_edit.setReadOnly(True)
+        self.run_log_text_edit.setMaximumBlockCount(4000)
+        self.run_log_text_edit.setStyleSheet(
+            'QPlainTextEdit { font-family: "Cascadia Code", "Consolas", monospace; font-size: 9.5pt; }'
+        )
+        run_log_dock = QDockWidget("Run Log", self)
+        run_log_dock.setWidget(self.run_log_text_edit)
+        run_log_dock.setAllowedAreas(
+            Qt.DockWidgetArea.BottomDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
+        )
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, run_log_dock)
+
     def _build_top_bar(self) -> QWidget:
         top_bar = QFrame()
         top_bar.setObjectName("TopBar")
@@ -341,8 +356,7 @@ class MlpTrainingStudio(QMainWindow):
         layout.setSpacing(10)
 
         layout.addWidget(self._build_metrics_card(), 0)
-        layout.addWidget(self._build_monitor_tabs(), 5)
-        layout.addWidget(self._build_run_log_card(), 1)
+        layout.addWidget(self._build_monitor_tabs(), 1)
         return container
 
     def _build_environment_card(self) -> QWidget:
@@ -424,68 +438,80 @@ class MlpTrainingStudio(QMainWindow):
         layout = QVBoxLayout(card)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
-        layout.addWidget(self._section_header("Data Sources", "Select the dataset files, cache, and output location"))
+        layout.addWidget(self._section_header("Data Sources", "Select your dataset folder and output location"))
 
         grid = QGridLayout()
         grid.setHorizontalSpacing(10)
         grid.setVerticalSpacing(8)
 
-        self.input_feature_path_edit = QLineEdit()
-        self.input_feature_path_edit.setPlaceholderText("Select input-feature file (optional for Cadence CSV datasets)")
-        self.input_feature_path_edit.textChanged.connect(self._autofill_run_name_and_cache)
-        self.browse_input_feature_button = self._make_button("Browse...", secondary=True)
-        self.browse_input_feature_button.clicked.connect(self.browse_input_feature_path)
-        self._add_path_row(grid, 0, "Input-Feature File", self.input_feature_path_edit, self.browse_input_feature_button)
-
-        self.ground_truth_data_folder_path_edit = QLineEdit()
-        self.ground_truth_data_folder_path_edit.setPlaceholderText("Select the folder containing ground-truth files (or dataset root for Cadence CSV)")
-        self.ground_truth_data_folder_path_edit.textChanged.connect(self._autofill_run_name_from_gt_dir)
-        self.browse_ground_truth_data_folder_button = self._make_button("Browse...", secondary=True)
-        self.browse_ground_truth_data_folder_button.clicked.connect(self.browse_ground_truth_data_dir)
-        self._add_path_row(grid, 1, "Ground-Truth Data Folder", self.ground_truth_data_folder_path_edit, self.browse_ground_truth_data_folder_button)
+        self.dataset_folder_edit = QLineEdit()
+        self.dataset_folder_edit.setPlaceholderText("Select the root folder containing your entire dataset")
+        self.dataset_folder_edit.textChanged.connect(self._autofill_run_name_from_dataset_folder)
+        self.browse_dataset_folder_button = self._make_button("Browse...", secondary=True)
+        self.browse_dataset_folder_button.clicked.connect(self._browse_dataset_folder)
+        self._add_path_row(grid, 0, "Dataset Folder", self.dataset_folder_edit, self.browse_dataset_folder_button)
 
         self.model_output_folder_path_edit = QLineEdit()
         self.model_output_folder_path_edit.setPlaceholderText("Select the output folder for runs, artifacts, and cache")
         self.model_output_folder_path_edit.textChanged.connect(self._on_output_folder_changed)
         self.browse_model_output_folder_button = self._make_button("Browse...", secondary=True)
         self.browse_model_output_folder_button.clicked.connect(self.browse_model_output_dir)
-        self._add_path_row(grid, 2, "Output Folder", self.model_output_folder_path_edit, self.browse_model_output_folder_button)
+        self._add_path_row(grid, 1, "Output Folder", self.model_output_folder_path_edit, self.browse_model_output_folder_button)
 
         self.run_name_edit = QLineEdit()
         self.run_name_edit.textChanged.connect(self._on_run_name_changed)
-        self._add_form_row(grid, 3, "Run Name", self.run_name_edit)
+        self._add_form_row(grid, 2, "Run Name", self.run_name_edit)
 
+        # Advanced: legacy explicit path fields + cache control.
         advanced = QWidget()
         advanced_grid = QGridLayout(advanced)
         advanced_grid.setContentsMargins(0, 0, 0, 0)
         advanced_grid.setHorizontalSpacing(10)
         advanced_grid.setVerticalSpacing(8)
+
+        self.input_feature_path_edit = QLineEdit()
+        self.input_feature_path_edit.setPlaceholderText("Override: explicit input-feature file (optional)")
+        self.input_feature_path_edit.textChanged.connect(self._autofill_run_name_and_cache)
+        self.browse_input_feature_button = self._make_button("Browse...", secondary=True)
+        self.browse_input_feature_button.clicked.connect(self.browse_input_feature_path)
+        self._add_path_row(advanced_grid, 0, "Input-Feature File", self.input_feature_path_edit, self.browse_input_feature_button)
+
+        self.ground_truth_data_folder_path_edit = QLineEdit()
+        self.ground_truth_data_folder_path_edit.setPlaceholderText("Override: explicit ground-truth data folder (optional)")
+        self.ground_truth_data_folder_path_edit.textChanged.connect(self._autofill_run_name_from_gt_dir)
+        self.browse_ground_truth_data_folder_button = self._make_button("Browse...", secondary=True)
+        self.browse_ground_truth_data_folder_button.clicked.connect(self.browse_ground_truth_data_dir)
+        self._add_path_row(advanced_grid, 1, "Ground-Truth Data Folder", self.ground_truth_data_folder_path_edit, self.browse_ground_truth_data_folder_button)
+
         self.cache_path_edit = QLineEdit()
         self.cache_path_edit.setPlaceholderText("Auto-managed inside the output folder if left blank")
         self.cache_path_edit.textEdited.connect(self._on_cache_path_edited)
         self.browse_cache_button = self._make_button("Browse...", secondary=True)
         self.browse_cache_button.clicked.connect(self.browse_cache_path)
-        self._add_path_row(advanced_grid, 0, "Cache File", self.cache_path_edit, self.browse_cache_button)
+        self._add_path_row(advanced_grid, 2, "Cache File", self.cache_path_edit, self.browse_cache_button)
 
         self.advanced_paths_section = CollapsibleSection("Advanced", advanced)
         layout.addLayout(grid)
-        layout.addWidget(self.advanced_paths_section)
+
+        # Scan button and schema status — right after the main fields, before Advanced.
+        button_row = QHBoxLayout()
+        self.scan_data_button = self._make_button("Scan Data")
+        self.scan_data_button.clicked.connect(self.scan_dataset)
+        button_row.addWidget(self.scan_data_button)
+        self.dataset_schema_status_badge = StatusBadge("Not Scanned")
+        button_row.addWidget(self.dataset_schema_status_badge)
+        button_row.addStretch()
+        layout.addLayout(button_row)
 
         metadata_grid = QGridLayout()
         metadata_grid.setHorizontalSpacing(10)
         metadata_grid.setVerticalSpacing(8)
         self.detected_dataset_readme_value = QLabel("Not detected yet")
         self.detected_dataset_readme_value.setWordWrap(True)
-        self.dataset_schema_status_badge = StatusBadge("Not Scanned")
         self._add_form_row(metadata_grid, 0, "Detected Dataset README", self.detected_dataset_readme_value)
-        self._add_form_row(metadata_grid, 1, "Dataset Schema", self.dataset_schema_status_badge)
         layout.addLayout(metadata_grid)
 
-        button_row = QHBoxLayout()
-        self.scan_data_button = self._make_button("Scan Data")
-        self.scan_data_button.clicked.connect(self.scan_dataset)
-        button_row.addWidget(self.scan_data_button)
-        layout.addLayout(button_row)
+        layout.addWidget(self.advanced_paths_section)
         return card
 
     def _build_dataset_preview_card(self) -> QWidget:
@@ -772,6 +798,26 @@ class MlpTrainingStudio(QMainWindow):
         transfer_layout.addWidget(self.transfer_frequency_mae_plot, 1)
         tabs.addTab(transfer_tab, "Transfer Results")
 
+        # Test Samples tab — shows prediction vs ground truth for test samples.
+        test_samples_scroll = QScrollArea()
+        test_samples_scroll.setWidgetResizable(True)
+        test_samples_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        test_samples_content = QWidget()
+        self.test_samples_layout = QVBoxLayout(test_samples_content)
+        self.test_samples_layout.setContentsMargins(12, 12, 12, 12)
+        self.test_samples_layout.setSpacing(12)
+        self.test_samples_placeholder = QLabel(
+            "Test sample plots will appear here after training completes.\n"
+            "Each plot compares predicted (dashed) vs true (solid) curves."
+        )
+        self.test_samples_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.test_samples_placeholder.setStyleSheet("color: #888; font-size: 11pt; padding: 40px;")
+        self.test_samples_layout.addWidget(self.test_samples_placeholder)
+        self.test_samples_layout.addStretch()
+        test_samples_scroll.setWidget(test_samples_content)
+        self._test_sample_plots: list[pg.PlotWidget] = []
+        tabs.addTab(test_samples_scroll, "Test Samples")
+
         chat_scroll = QScrollArea()
         chat_scroll.setWidgetResizable(True)
         chat_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
@@ -794,9 +840,17 @@ class MlpTrainingStudio(QMainWindow):
         action_row = QHBoxLayout()
         action_row.setSpacing(8)
 
-        self.chat_generate_button = self._make_button("Generate README", secondary=True)
-        self.chat_generate_button.clicked.connect(lambda: self._chat_send_message("Analyze my dataset and generate a README.md file"))
+        self.chat_generate_button = self._make_button("Set Up Dataset", secondary=True)
+        self.chat_generate_button.clicked.connect(lambda: self._chat_send_message(
+            "Scan my dataset folder, identify which files are input parameters and which are ground truth, "
+            "and generate a complete README.md with the correct schema so the training pipeline can load the data."
+        ))
         action_row.addWidget(self.chat_generate_button)
+
+        self.chat_save_loader_button = self._make_button("Save Loader", secondary=True)
+        self.chat_save_loader_button.clicked.connect(self._on_chat_save_loader)
+        self.chat_save_loader_button.setEnabled(False)
+        action_row.addWidget(self.chat_save_loader_button)
 
         self.chat_save_readme_button = self._make_button("Save Last README", secondary=True)
         self.chat_save_readme_button.clicked.connect(self._on_chat_save_readme)
@@ -821,6 +875,16 @@ class MlpTrainingStudio(QMainWindow):
         self.chat_send_button = self._make_button("Send")
         self.chat_send_button.clicked.connect(self._on_chat_send)
         input_row.addWidget(self.chat_send_button)
+
+        self.chat_stop_button = self._make_button("Stop")
+        self.chat_stop_button.setStyleSheet(
+            self.chat_stop_button.styleSheet()
+            + "\nQPushButton { background-color: #c0392b; color: white; }"
+        )
+        self.chat_stop_button.clicked.connect(self._on_chat_stop)
+        self.chat_stop_button.setVisible(False)
+        input_row.addWidget(self.chat_stop_button)
+
         layout.addLayout(input_row)
 
         # Chat display area — takes remaining space
@@ -831,38 +895,23 @@ class MlpTrainingStudio(QMainWindow):
             'QPlainTextEdit { font-family: "Cascadia Code", "Consolas", monospace; font-size: 10pt; }'
         )
         self.chat_display.setPlaceholderText(
-            "AI Assistant — ask questions about your dataset or request README generation.\n\n"
-            "Examples:\n"
-            "  - \"Analyze my dataset and generate a README\"\n"
-            "  - \"What parameters are in the log.txt?\"\n"
-            "  - \"Change ground_truth_parameters to only S11 and S21\"\n"
-            "  - \"The first frequency is not DC, set drop_first_frequency to false\"\n"
+            "AI Assistant — select a dataset folder, then chat here to set up data loading.\n\n"
+            "1. Set the Ground-Truth Data Folder (or any dataset root folder)\n"
+            "2. Click 'Generate README' or ask:\n"
+            "   - \"Set up my data for training\"\n"
+            "   - \"What files are in my dataset?\"\n"
+            "   - \"The tabular/ CSVs are input parameters, csv/ has S-param data\"\n"
+            "   - \"Change ground_truth_parameters to S11 and S12 only\"\n"
+            "3. Save the README, then click 'Scan Data'\n"
         )
         layout.addWidget(self.chat_display, 1)
 
         # Session state
         self._chat_session = None
         self._last_readme_content = None
+        self._last_loader_content = None
 
         return tab
-
-    def _build_run_log_card(self) -> QWidget:
-        card = CardFrame()
-        card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(10)
-        layout.addWidget(self._section_header("Run Log", "Streaming status messages and training milestones"))
-        self.run_log_text_edit = QPlainTextEdit()
-        self.run_log_text_edit.setReadOnly(True)
-        self.run_log_text_edit.setMaximumBlockCount(4000)
-        self.run_log_text_edit.setMinimumHeight(80)
-        self.run_log_text_edit.setStyleSheet(
-            self.run_log_text_edit.styleSheet()
-            + '\nQPlainTextEdit { font-family: "Cascadia Code", "Consolas", monospace; font-size: 9.5pt; }'
-        )
-        layout.addWidget(self.run_log_text_edit)
-        return card
 
     # ------------------------------------------------------------------
     # Defaults and persistence
@@ -1113,6 +1162,10 @@ class MlpTrainingStudio(QMainWindow):
         payload = self._require_data_paths()
         if payload is None:
             return
+        # Log which paths are being used so we can debug path issues.
+        self.append_log(f"Scan paths: dataset_root={payload.get('dataset_root', '')!r}, "
+                        f"input_feature={payload.get('input_feature_path', '')!r}, "
+                        f"gt_dir={payload.get('ground_truth_data_dir', '')!r}")
         self.last_scan_result = None
         self.dataset_schema_status_badge.set_status("Scanning")
         self.detected_dataset_readme_value.setText("Starting dataset scan...")
@@ -1224,6 +1277,11 @@ class MlpTrainingStudio(QMainWindow):
         self.current_task.stop()
         self.append_log("Stop requested. Waiting for the current stage to exit cleanly...")
         self.run_state_badge.set_status("Stopped")
+
+    def _browse_dataset_folder(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Select Dataset Folder", self.dataset_folder_edit.text())
+        if path:
+            self.dataset_folder_edit.setText(path)
 
     def browse_input_feature_path(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Select Input-Feature File", self.input_feature_path_edit.text(), "Text Files (*.txt);;All Files (*)")
@@ -1381,6 +1439,11 @@ class MlpTrainingStudio(QMainWindow):
 
     def _resolve_dataset_dir(self) -> Path | None:
         """Resolve the dataset root directory from the GUI path fields."""
+        # Prefer the new single-folder field.
+        dataset_dir = self.dataset_folder_edit.text().strip()
+        if dataset_dir:
+            return Path(dataset_dir)
+        # Fall back to legacy fields.
         gt_dir = self.ground_truth_data_folder_path_edit.text().strip()
         input_path = self.input_feature_path_edit.text().strip()
         if input_path and gt_dir:
@@ -1421,9 +1484,9 @@ class MlpTrainingStudio(QMainWindow):
 
         self._chat_append("user", message)
         self.chat_input.clear()
-        self.chat_send_button.setEnabled(False)
+        self.chat_send_button.setVisible(False)
+        self.chat_stop_button.setVisible(True)
         self.chat_input.setEnabled(False)
-        self.chat_send_button.setText("Thinking...")
 
         def _do_chat(*, progress_callback=None, should_stop=None):
             reply = session.send(message)
@@ -1439,16 +1502,21 @@ class MlpTrainingStudio(QMainWindow):
 
     def _on_chat_reply(self, result: dict) -> None:
         """Handle the AI response."""
-        self.chat_send_button.setEnabled(True)
+        self.chat_stop_button.setVisible(False)
+        self.chat_send_button.setVisible(True)
         self.chat_input.setEnabled(True)
-        self.chat_send_button.setText("Send")
         self.chat_input.setFocus()
 
         reply = result["reply"]
         self._chat_append("model", reply)
 
-        # Check if the reply contains a README — enable save button if so.
+        # Check if the reply contains a loader.py or README.
         if self._chat_session:
+            loader_code = self._chat_session.extract_loader(reply)
+            if loader_code:
+                self._last_loader_content = loader_code
+                self.chat_save_loader_button.setEnabled(True)
+                self._chat_append("system", "Loader detected in response. Click 'Save Loader' to write loader.py to disk.")
             readme = self._chat_session.extract_readme(reply)
             if readme:
                 self._last_readme_content = readme
@@ -1491,11 +1559,77 @@ class MlpTrainingStudio(QMainWindow):
             path = save_readme(str(dataset_dir), final)
             self.append_log(f"README.md saved to {path}")
             self._chat_append("system", f"README saved to {path}")
+
+            # Always update the dataset folder to where we saved the README.
+            self.dataset_folder_edit.setText(str(dataset_dir))
+            self.detected_dataset_readme_value.setText(str(path))
+
+            # Try to parse the schema for validation and auto-fill.
+            try:
+                from .dataset_schema import parse_dataset_readme
+                schema = parse_dataset_readme(path)
+                self.dataset_schema_status_badge.set_status("Valid")
+                self._chat_append("system", "Paths auto-filled. Click 'Scan Data' to build the cache and start training.")
+            except Exception as exc:
+                self.dataset_schema_status_badge.set_status("Error")
+                self._chat_append("system", f"README saved but schema parse failed: {exc}\nAsk me to fix it, e.g. 'fix the JSON schema'.")
+
             dialog.accept()
 
         save_btn.clicked.connect(_save)
         cancel_btn.clicked.connect(dialog.reject)
         dialog.exec()
+
+    def _on_chat_save_loader(self) -> None:
+        """Save the last loader.py extracted from chat to the dataset directory."""
+        if not getattr(self, "_last_loader_content", None):
+            self._show_warning("No loader code found in the chat history.")
+            return
+
+        dataset_dir = self._resolve_dataset_dir()
+        if not dataset_dir or not dataset_dir.is_dir():
+            self._show_warning("Set the data paths first so we know where to save loader.py.")
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Save loader.py")
+        dialog.resize(700, 500)
+        dlayout = QVBoxLayout(dialog)
+        dlayout.addWidget(QLabel(f"Saving to: {dataset_dir}/loader.py\nReview and edit if needed:"))
+        editor = QPlainTextEdit()
+        editor.setPlainText(self._last_loader_content)
+        editor.setFont(self.font())
+        dlayout.addWidget(editor)
+        btn_row = QHBoxLayout()
+        save_btn = QPushButton("Save loader.py")
+        cancel_btn = QPushButton("Cancel")
+        btn_row.addStretch()
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(save_btn)
+        dlayout.addLayout(btn_row)
+
+        def _save():
+            final = editor.toPlainText()
+            path = dataset_dir / "loader.py"
+            path.write_text(final, encoding="utf-8")
+            self.append_log(f"loader.py saved to {path}")
+            self._chat_append("system", f"Loader saved to {path}")
+            self.dataset_folder_edit.setText(str(dataset_dir))
+            dialog.accept()
+
+        save_btn.clicked.connect(_save)
+        cancel_btn.clicked.connect(dialog.reject)
+        dialog.exec()
+
+    def _on_chat_stop(self) -> None:
+        """Stop the current chat request."""
+        if self.current_task is not None and self.current_task_name == "chat_msg":
+            self.current_task.stop()
+            self.current_task = None
+        self.chat_stop_button.setVisible(False)
+        self.chat_send_button.setVisible(True)
+        self.chat_input.setEnabled(True)
+        self._chat_append("system", "Stopped.")
 
     def _on_chat_clear(self) -> None:
         """Clear chat history and display."""
@@ -1676,9 +1810,9 @@ class MlpTrainingStudio(QMainWindow):
         if self.current_task_name == "readme_gen":
             pass  # readme generation recovered
         if self.current_task_name == "chat_msg":
-            self.chat_send_button.setEnabled(True)
+            self.chat_stop_button.setVisible(False)
+            self.chat_send_button.setVisible(True)
             self.chat_input.setEnabled(True)
-            self.chat_send_button.setText("Send")
             self._chat_append("system", f"Error: {message}")
             return  # Don't show popup for chat errors — just show in chat.
         self.append_log(f"Error: {message}")
@@ -1733,12 +1867,15 @@ class MlpTrainingStudio(QMainWindow):
 
     def _on_scan_completed(self, result: dict[str, Any]) -> None:
         self.last_scan_result = result
+        self._sweep_label = result.get("sweep_label", "Frequency (GHz)")
         self.dataset_schema_status_badge.set_status(result.get("schema_status", "Valid"))
         self.detected_dataset_readme_value.setText(result.get("readme_path") or "Not found")
         self._fill_table(self.data_preview_table, result["preview_rows"])
         self._set_cache_path_value(result["cache_path"], manually_selected=self._cache_path_manually_selected)
         self.scan_data_button.setText("Scan Data")
         self.append_log(f"Dataset scan completed for {result['dataset_name']}.")
+        self._reset_baseline_plots()
+        self._reset_transfer_plots()
         self.validate_transfer_compatibility()
         self._refresh_transfer_note_text()
         self.run_progress_bar.setValue(100)
@@ -1797,6 +1934,8 @@ class MlpTrainingStudio(QMainWindow):
             self.last_baseline_summary = baseline
             self._apply_baseline_summary(baseline)
             self.append_log(f"Baseline run saved to {baseline['run_dir']}")
+            if baseline.get("test_sample_data"):
+                self._populate_test_sample_plots(baseline)
         if transfer:
             self.append_log(f"Self-transfer run saved to {transfer['run_dir']}")
         if baseline and transfer:
@@ -1805,7 +1944,10 @@ class MlpTrainingStudio(QMainWindow):
             self.append_log("Baseline training completed.")
         elif transfer:
             self.append_log("Self-transfer learning completed.")
-        if transfer is not None:
+        # Switch to Test Samples tab if we have test plots, otherwise show the training monitor.
+        if baseline and baseline.get("test_sample_data"):
+            self.monitor_tabs.setCurrentIndex(2)  # Test Samples tab
+        elif transfer is not None:
             self.monitor_tabs.setCurrentIndex(1)
         else:
             self.monitor_tabs.setCurrentIndex(0)
@@ -2249,12 +2391,17 @@ class MlpTrainingStudio(QMainWindow):
     def _build_baseline_train_config(self) -> TrainConfig:
         roots = make_run_roots(self.model_output_folder_path_edit.text().strip(), self.run_name_edit.text().strip())
         form = self._collect_baseline_form()
+        dataset_folder = self.dataset_folder_edit.text().strip()
         input_feat = self.input_feature_path_edit.text().strip()
         gt_dir = self.ground_truth_data_folder_path_edit.text().strip()
-        # For cadence_csv datasets the input-feature file is empty; use the
-        # ground-truth folder as data_root so the loader discovers everything
-        # from the README schema.
-        data_root = gt_dir if not input_feat else None
+        # When the new single-folder field is set, use it as data_root.
+        # Otherwise fall back to legacy fields.
+        if dataset_folder:
+            data_root = dataset_folder
+            input_feat = ""
+            gt_dir = ""
+        else:
+            data_root = gt_dir if not input_feat else None
         return TrainConfig(
             data_root=data_root,
             input_feature_path=input_feat or None,
@@ -2441,7 +2588,8 @@ class MlpTrainingStudio(QMainWindow):
         self.baseline_loss_plot.clear()
         self.baseline_frequency_mae_plot.clear()
         configure_plot_widget(self.baseline_loss_plot, title="Training Loss vs Epoch", x_label="Epoch", y_label="Loss")
-        configure_plot_widget(self.baseline_frequency_mae_plot, title="MAE over Frequency", x_label="Frequency (GHz)", y_label="MAE")
+        sweep = getattr(self, "_sweep_label", "Frequency (GHz)")
+        configure_plot_widget(self.baseline_frequency_mae_plot, title=f"MAE over {sweep}", x_label=sweep, y_label="MAE")
         colors = plot_color_cycle()
         self.baseline_train_curve = self.baseline_loss_plot.plot([], [], pen=pg.mkPen(colors[0], width=2.5), name="Train")
         self.baseline_val_curve = self.baseline_loss_plot.plot([], [], pen=pg.mkPen(colors[1], width=2.5), name="Validation")
@@ -2458,7 +2606,8 @@ class MlpTrainingStudio(QMainWindow):
         self._transfer_frequency_history.clear()
         self._transfer_frequency_items.clear()
         self.transfer_frequency_mae_plot.clear()
-        configure_plot_widget(self.transfer_frequency_mae_plot, title="MAE over Frequency by Transfer Iteration", x_label="Frequency (GHz)", y_label="MAE")
+        sweep = getattr(self, "_sweep_label", "Frequency (GHz)")
+        configure_plot_widget(self.transfer_frequency_mae_plot, title=f"MAE over {sweep} by Transfer Iteration", x_label=sweep, y_label="MAE")
 
     def _plot_search_tradeoff(self, trials: list[dict[str, Any]]) -> None:
         self._reset_search_plot()
@@ -2743,17 +2892,14 @@ class MlpTrainingStudio(QMainWindow):
         return cache_path
 
     def _require_data_paths(self) -> dict[str, str] | None:
+        dataset_folder = self.dataset_folder_edit.text().strip()
         input_feature_path = self.input_feature_path_edit.text().strip()
         ground_truth_data_dir = self.ground_truth_data_folder_path_edit.text().strip()
         model_output_dir = self.model_output_folder_path_edit.text().strip()
-        # The input-feature file is optional for cadence_csv datasets where
-        # design parameters are embedded in the CSV files.  When the field is
-        # empty the data loader will discover the format from the README.
-        if not input_feature_path and not ground_truth_data_dir:
-            self._show_warning("Select the ground-truth data folder (or both data paths).")
-            return None
-        if not ground_truth_data_dir:
-            self._show_warning("Select the ground-truth data folder first.")
+
+        # Need at least one data source: the new single-folder field OR the legacy fields.
+        if not dataset_folder and not input_feature_path and not ground_truth_data_dir:
+            self._show_warning("Select a dataset folder first.")
             return None
         if not model_output_dir:
             self._show_warning("Select the output folder first.")
@@ -2763,6 +2909,7 @@ class MlpTrainingStudio(QMainWindow):
             return None
         Path(model_output_dir).mkdir(parents=True, exist_ok=True)
         return {
+            "dataset_root": dataset_folder,
             "input_feature_path": input_feature_path,
             "ground_truth_data_dir": ground_truth_data_dir,
             "cache_path": self._ensure_cache_path(),
@@ -2770,18 +2917,54 @@ class MlpTrainingStudio(QMainWindow):
 
     def _autofill_run_name_and_cache(self) -> None:
         input_feature_path = self.input_feature_path_edit.text().strip()
-        if input_feature_path and (not self.run_name_edit.text().strip() or self.run_name_edit.text().strip() == "mlp_run"):
+        if input_feature_path and not self.dataset_folder_edit.text().strip():
             self.run_name_edit.setText(default_run_name(input_feature_path))
+        self._sync_auto_cache_path()
+        self._update_topbar_run_name()
+
+    def _autofill_run_name_from_dataset_folder(self) -> None:
+        """Auto-fill run name, detect README, and reset chat session when dataset folder changes."""
+        dataset_dir = self.dataset_folder_edit.text().strip()
+        if dataset_dir:
+            folder_name = Path(dataset_dir).name or Path(dataset_dir).stem
+            self.run_name_edit.setText(folder_name.replace(" ", "_").lower())
+        # Clear legacy fields when a dataset folder is selected to avoid confusion.
+        if dataset_dir:
+            self.input_feature_path_edit.clear()
+            self.ground_truth_data_folder_path_edit.clear()
+        # Check for existing README in the selected folder.
+        if dataset_dir:
+            d = Path(dataset_dir)
+            for readme_name in ("README.md", "README.txt"):
+                readme_path = d / readme_name
+                if readme_path.is_file():
+                    self.detected_dataset_readme_value.setText(str(readme_path))
+                    try:
+                        from .dataset_schema import parse_dataset_readme
+                        parse_dataset_readme(readme_path)
+                        self.dataset_schema_status_badge.set_status("Valid")
+                    except Exception:
+                        self.dataset_schema_status_badge.set_status("Error")
+                    break
+            else:
+                self.detected_dataset_readme_value.setText("No README found — use AI Assistant to generate one")
+                self.dataset_schema_status_badge.set_status("Not Scanned")
+        # Reset chat session so the next chat message rescans the new folder.
+        if self._chat_session is not None:
+            new_dir = Path(dataset_dir) if dataset_dir else None
+            if new_dir and (self._chat_session.dataset_dir is None or str(new_dir) != str(self._chat_session.dataset_dir)):
+                self._chat_session = None
+                self._last_readme_content = None
+                self.chat_save_readme_button.setEnabled(False)
         self._sync_auto_cache_path()
         self._update_topbar_run_name()
 
     def _autofill_run_name_from_gt_dir(self) -> None:
         # When the input-feature path is empty (cadence_csv), derive the run
         # name from the ground-truth folder instead.
-        if not self.input_feature_path_edit.text().strip():
+        if not self.input_feature_path_edit.text().strip() and not self.dataset_folder_edit.text().strip():
             gt_dir = self.ground_truth_data_folder_path_edit.text().strip()
-            current_name = self.run_name_edit.text().strip()
-            if gt_dir and (not current_name or current_name == "mlp_run"):
+            if gt_dir:
                 folder_name = Path(gt_dir).name or Path(gt_dir).stem
                 self.run_name_edit.setText(folder_name.replace(" ", "_").lower())
         self._sync_auto_cache_path()
@@ -2841,6 +3024,71 @@ class MlpTrainingStudio(QMainWindow):
         runtime_seconds = summary.get("runtime_seconds")
         if runtime_seconds is not None:
             self.metric_cards["elapsed"].set_value(self._format_seconds(runtime_seconds))
+
+    def _populate_test_sample_plots(self, summary: dict[str, Any]) -> None:
+        """Display prediction-vs-truth curves for test samples after training."""
+        # Clear previous plots.
+        for widget in self._test_sample_plots:
+            widget.setParent(None)
+            widget.deleteLater()
+        self._test_sample_plots.clear()
+        self.test_samples_placeholder.setVisible(False)
+
+        test_data = summary.get("test_sample_data")
+        if not test_data:
+            self.test_samples_placeholder.setText("No test sample data available.")
+            self.test_samples_placeholder.setVisible(True)
+            return
+
+        freq_ghz = test_data["freq_ghz"]
+        channel_names = test_data["channel_names"]
+        samples = test_data["samples"]  # list of {"index", "pred", "true"}
+
+        insert_pos = 0  # insert before the stretch at the end
+
+        for sample in samples:
+            sample_idx = sample["index"]
+            pred = sample["pred"]   # list of lists: [channel][freq]
+            true = sample["true"]
+
+            label = QLabel(f"Test Sample #{sample_idx}")
+            label.setStyleSheet("font-weight: bold; font-size: 11pt; margin-top: 8px;")
+            self.test_samples_layout.insertWidget(insert_pos, label)
+            self._test_sample_plots.append(label)
+            insert_pos += 1
+
+            # Create a grid of plots, one per channel.
+            num_channels = len(pred)
+            ncols = min(4, num_channels)
+            nrows = (num_channels + ncols - 1) // ncols
+            plot_height = 250
+            grid_widget = QWidget()
+            grid_widget.setMinimumHeight(plot_height * nrows + 20)
+            grid_layout = QGridLayout(grid_widget)
+            grid_layout.setContentsMargins(0, 0, 0, 0)
+            grid_layout.setSpacing(8)
+
+            for ch_idx in range(num_channels):
+                row, col = divmod(ch_idx, ncols)
+                pw = pg.PlotWidget()
+                pw.setMinimumHeight(plot_height)
+                ch_name = channel_names[ch_idx] if ch_idx < len(channel_names) else f"Ch{ch_idx}"
+                sweep = getattr(self, "_sweep_label", "Frequency (GHz)")
+                configure_plot_widget(pw, title=ch_name, x_label=sweep, y_label="Value")
+
+                true_pen = pg.mkPen(color="#2196F3", width=2)
+                pred_pen = pg.mkPen(color="#FF5722", width=2, style=Qt.PenStyle.DashLine)
+                pw.plot(freq_ghz, true[ch_idx], pen=true_pen, name="True")
+                pw.plot(freq_ghz, pred[ch_idx], pen=pred_pen, name="Pred")
+
+                pw.addLegend()
+
+                grid_layout.addWidget(pw, row, col)
+                self._test_sample_plots.append(pw)
+
+            self.test_samples_layout.insertWidget(insert_pos, grid_widget)
+            self._test_sample_plots.append(grid_widget)
+            insert_pos += 1
 
     def _update_topbar_run_name(self) -> None:
         run_name = self.run_name_edit.text().strip() or "Unconfigured run"

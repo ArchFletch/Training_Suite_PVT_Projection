@@ -47,10 +47,10 @@ class TrainConfig:
 
     # Optimization settings.
     seed: int = 42
-    batch_size: int = 16
-    epochs: int = 300
-    patience: int = 20
-    learning_rate: float = 1e-4
+    batch_size: int = 64
+    epochs: int = 500
+    patience: int = 50
+    learning_rate: float = 1e-3
     weight_decay: float = 1e-4
     gradient_clip: float = 1.0
 
@@ -67,7 +67,7 @@ class TrainConfig:
     dropout: float = 0.05
 
     # Loss and scheduler settings.
-    loss_function: str = "rmse"  # "rmse" or "mse"
+    loss_function: str = "mse"  # "mse" or "rmse"
     scheduler: str = "plateau"   # "plateau" or "cosine"
 
     # Runtime controls.
@@ -477,6 +477,11 @@ def run_baseline_trial(
             ylabel="Average MAE",
         )
 
+        # Generate test sample prediction-vs-truth plots.
+        test_sample_plot_paths, test_sample_data = _generate_test_sample_plots(
+            model, bundle, freq, device, amp, artifact_dir, num_samples=4,
+        )
+
         artifact_summary = {
             "run_dir": str(artifact_dir.resolve()),
             "loss_curve_path": str((artifact_dir / "loss_curve.png").resolve()),
@@ -484,6 +489,8 @@ def run_baseline_trial(
             f"average_{evaluation_split}_mae": float(evaluation_mae),
             f"{evaluation_split}_frequency_mae_plot_path": str(frequency_plot_path.resolve()),
             f"average_{evaluation_split}_mae_plot_path": str(average_mae_plot_path.resolve()),
+            "test_sample_plot_paths": test_sample_plot_paths,
+            "test_sample_data": test_sample_data,
         }
         result.update(artifact_summary)
         summary_path.write_text(json.dumps(result, indent=2))
@@ -588,6 +595,13 @@ def train_baseline(
         summary["channel_mae_with_units"] = result["channel_mae_with_units"]
     if "per_channel_mae" in result:
         summary["per_channel_mae"] = result["per_channel_mae"]
+    if "test_sample_data" in result:
+        summary["test_sample_data"] = result["test_sample_data"]
+    if "test_sample_plot_paths" in result:
+        summary["test_sample_plot_paths"] = result["test_sample_plot_paths"]
+    # Pass through history and runtime for GUI display.
+    summary["history"] = result.get("history", [])
+    summary["runtime_seconds"] = result.get("runtime_seconds")
     return summary
 
 
@@ -1439,4 +1453,124 @@ def _plot_band_curve(
     ax.legend()
     fig.tight_layout()
     fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
+def _generate_test_sample_plots(
+    model: nn.Module,
+    bundle: Any,
+    freq: torch.Tensor,
+    device: torch.device,
+    amp: bool,
+    artifact_dir: Path,
+    num_samples: int = 4,
+) -> tuple[list[str], dict]:
+    """Generate prediction-vs-truth plots for a few test samples.
+
+    Returns (plot_file_paths, test_sample_data) where test_sample_data contains
+    the raw arrays for GUI display.
+    """
+    model.eval()
+    from .data import _inverse_channel_transforms
+
+    loader = bundle.test_loader
+    preds_list: list[torch.Tensor] = []
+    trues_list: list[torch.Tensor] = []
+    with torch.no_grad():
+        for x, y in loader:
+            x_dev = x.to(device, non_blocking=True)
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
+                pred = model(x_dev, freq)
+            preds_list.append(pred.cpu())
+            trues_list.append(y)
+
+    pred_all = torch.cat(preds_list, dim=0).numpy()  # (N, C, F)
+    true_all = torch.cat(trues_list, dim=0).numpy()
+
+    # Denormalize.
+    if bundle.target_mean is not None and bundle.target_std is not None:
+        pred_all = pred_all * bundle.target_std + bundle.target_mean
+        true_all = true_all * bundle.target_std + bundle.target_mean
+    if bundle.channel_transforms and any(t for t in bundle.channel_transforms):
+        pred_all = _inverse_channel_transforms(pred_all, bundle.channel_transforms)
+        true_all = _inverse_channel_transforms(true_all, bundle.channel_transforms)
+
+    freq_ghz = bundle.frequency_ghz
+    channel_names = bundle.channel_names
+
+    # Pick samples evenly spaced through the test set.
+    n_test = pred_all.shape[0]
+    indices = np.linspace(0, n_test - 1, min(num_samples, n_test), dtype=int)
+
+    plot_dir = artifact_dir / "test_sample_plots"
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    saved_paths: list[str] = []
+
+    for sample_idx in indices:
+        path = plot_dir / f"test_sample_{int(sample_idx):04d}.png"
+        _plot_test_sample(
+            freq_ghz=freq_ghz,
+            pred=pred_all[sample_idx],
+            true=true_all[sample_idx],
+            channel_names=channel_names,
+            sample_idx=int(sample_idx),
+            path=path,
+        )
+        saved_paths.append(str(path.resolve()))
+
+    # Build data dict for GUI display.
+    test_sample_data = {
+        "freq_ghz": freq_ghz.tolist(),
+        "channel_names": list(channel_names),
+        "samples": [
+            {
+                "index": int(idx),
+                "pred": pred_all[idx].tolist(),   # [C][F]
+                "true": true_all[idx].tolist(),
+            }
+            for idx in indices
+        ],
+    }
+
+    return saved_paths, test_sample_data
+
+
+def _plot_test_sample(
+    freq_ghz: np.ndarray,
+    pred: np.ndarray,
+    true: np.ndarray,
+    channel_names: list[str],
+    sample_idx: int,
+    path: Path,
+) -> None:
+    """Plot predicted vs true curves for one test sample across all channels."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    num_channels = pred.shape[0]
+    ncols = min(4, num_channels)
+    nrows = (num_channels + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 3.5 * nrows), squeeze=False)
+
+    for ch_idx in range(num_channels):
+        row, col = divmod(ch_idx, ncols)
+        ax = axes[row][col]
+        ch_name = channel_names[ch_idx] if ch_idx < len(channel_names) else f"Ch{ch_idx}"
+        ax.plot(freq_ghz, true[ch_idx], label="True", linewidth=1.2, color="#2196F3")
+        ax.plot(freq_ghz, pred[ch_idx], label="Pred", linewidth=1.2, color="#FF5722", linestyle="--")
+        ax.set_title(ch_name, fontsize=10)
+        ax.set_xlabel("Freq (GHz)", fontsize=8)
+        ax.grid(True, alpha=0.3)
+        if ch_idx == 0:
+            ax.legend(fontsize=8)
+
+    for ch_idx in range(num_channels, nrows * ncols):
+        row, col = divmod(ch_idx, ncols)
+        axes[row][col].set_visible(False)
+
+    fig.suptitle(f"Test Sample #{sample_idx} — Predicted vs True", fontsize=12, y=1.02)
+    fig.tight_layout()
+    fig.savefig(path, dpi=160, bbox_inches="tight")
     plt.close(fig)
