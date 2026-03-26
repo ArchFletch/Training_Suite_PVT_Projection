@@ -32,7 +32,7 @@ def test_parse_dataset_readme_uses_parent_name_and_default_parts(tmp_path: Path)
     "sample_id_column": "sample_id"
   },
   "ground_truth": {
-    "format": "TouchStone",
+    "source": "per_sample",
     "file_extension": ".S2P",
     "ground_truth_parameters": ["S11"]
   }
@@ -47,7 +47,7 @@ def test_parse_dataset_readme_uses_parent_name_and_default_parts(tmp_path: Path)
     assert schema.dataset_name == "readme_defaults"
     assert schema.input_feature.columns == ("x", "sample_id")
     assert schema.input_feature.feature_columns == ("x",)
-    assert schema.ground_truth.format == "touchstone"
+    assert schema.ground_truth.source == "per_sample"
     assert schema.ground_truth.file_extension == ".s2p"
     assert schema.ground_truth.ground_truth_parts == ("re", "im")
     assert schema.ground_truth.channel_names == ["S11_re", "S11_im"]
@@ -68,7 +68,7 @@ def test_parse_dataset_readme_rejects_duplicate_columns(tmp_path: Path) -> None:
     "sample_id_column": "sample_id"
   },
   "ground_truth": {
-    "format": "touchstone",
+    "source": "per_sample",
     "file_extension": ".s2p",
     "ground_truth_parameters": ["S11"]
   }

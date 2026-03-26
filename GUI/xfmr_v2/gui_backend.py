@@ -72,8 +72,9 @@ def detect_environment(
 
 def scan_dataset(
     *,
-    input_feature_path: str,
-    ground_truth_data_dir: str,
+    input_feature_path: str = "",
+    ground_truth_data_dir: str = "",
+    dataset_root: str = "",
     cache_path: str,
     train_frac: float,
     val_frac: float,
@@ -85,17 +86,20 @@ def scan_dataset(
 ) -> dict[str, Any]:
     """Validate paths, build or reuse the cache, and summarize the dataset."""
 
-    # For cadence_csv datasets the input-feature file is not a separate file;
-    # the design parameters are embedded in the CSV ground-truth files.  When
-    # the user leaves the input-feature path empty, use the ground-truth
-    # directory as the data root so resolve_data_sources can discover the
-    # README and infer everything from there.
-    effective_data_root = None
-    effective_input_feature = input_feature_path or None
-    effective_ground_truth = ground_truth_data_dir or None
-    if not input_feature_path and ground_truth_data_dir:
-        effective_data_root = ground_truth_data_dir
+    # When dataset_root is set (new single-folder flow), it takes priority
+    # over legacy fields.  Legacy fields are only used when dataset_root is empty.
+    if dataset_root:
+        effective_data_root = dataset_root
+        effective_input_feature = None
         effective_ground_truth = None
+    elif not input_feature_path and ground_truth_data_dir:
+        effective_data_root = ground_truth_data_dir
+        effective_input_feature = None
+        effective_ground_truth = None
+    else:
+        effective_data_root = None
+        effective_input_feature = input_feature_path or None
+        effective_ground_truth = ground_truth_data_dir or None
 
     if progress_callback is not None:
         progress_callback(
@@ -103,6 +107,7 @@ def scan_dataset(
                 "phase": "scan",
                 "event": "started",
                 "message": "Validating dataset paths and preparing the cache.",
+                "dataset_root": dataset_root,
                 "input_feature_path": input_feature_path,
                 "ground_truth_data_dir": ground_truth_data_dir,
                 "cache_path": cache_path,
@@ -177,7 +182,7 @@ def scan_dataset(
         ("Declared Input-Feature Columns", _join_values(schema["input_feature"]["columns"])),
         ("Active Input-Feature Columns", _join_values(bundle.active_names)),
         ("Constant Fields Removed", _join_values(bundle.dropped_names) or "None"),
-        ("Ground-Truth Format", schema["ground_truth"]["format"]),
+        ("Loading Strategy", schema["ground_truth"]["source"]),
         ("Ground-Truth Parameters", _join_values(schema["ground_truth"].get("ground_truth_parameters", []))),
         ("Ground-Truth Parts", _join_values(schema["ground_truth"].get("ground_truth_parts", []))),
         ("Ground-Truth Channels", _join_values(bundle.channel_names)),
@@ -203,6 +208,7 @@ def scan_dataset(
             float(bundle.frequency_ghz.min()),
             float(bundle.frequency_ghz.max()),
         ],
+        "sweep_label": getattr(bundle, "sweep_label", "Frequency (GHz)"),
     }
     if progress_callback is not None:
         progress_callback(
@@ -374,8 +380,9 @@ def load_last_session() -> dict[str, Any] | None:
 
 def build_suggest_result(
     *,
-    input_feature_path: str,
-    ground_truth_data_dir: str,
+    input_feature_path: str = "",
+    ground_truth_data_dir: str = "",
+    dataset_root: str = "",
     cache_path: str,
     seed: int,
     train_frac: float,
@@ -386,12 +393,18 @@ def build_suggest_result(
 ) -> dict[str, Any]:
     """Thin GUI wrapper around the scan-only suggestion backend."""
 
-    effective_data_root = None
-    effective_input = input_feature_path or None
-    effective_gt = ground_truth_data_dir or None
-    if not input_feature_path and ground_truth_data_dir:
-        effective_data_root = ground_truth_data_dir
+    if dataset_root:
+        effective_data_root = dataset_root
+        effective_input = None
         effective_gt = None
+    elif not input_feature_path and ground_truth_data_dir:
+        effective_data_root = ground_truth_data_dir
+        effective_input = None
+        effective_gt = None
+    else:
+        effective_data_root = None
+        effective_input = input_feature_path or None
+        effective_gt = ground_truth_data_dir or None
 
     return suggest_initial_settings(
         SuggestConfig(

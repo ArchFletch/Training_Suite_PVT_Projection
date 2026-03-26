@@ -74,7 +74,7 @@ def synthetic_dataset(tmp_path: Path) -> dict[str, Path]:
             "sample_id_column": "sample_id",
         },
         "ground_truth": {
-            "format": "touchstone",
+            "source": "per_sample",
             "file_extension": ".s2p",
             "ground_truth_parameters": ["S11", "S12"],
             "ground_truth_parts": ["re", "im"],

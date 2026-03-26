@@ -79,7 +79,7 @@ def test_scan_dataset_rebuilds_auto_managed_mismatched_cache(monkeypatch: pytest
                     "columns": ["x", "y", "sample_id"],
                 },
                 "ground_truth": {
-                    "format": "touchstone",
+                    "source": "per_sample",
                     "ground_truth_parameters": ["S11"],
                     "ground_truth_parts": ["re", "im"],
                 },

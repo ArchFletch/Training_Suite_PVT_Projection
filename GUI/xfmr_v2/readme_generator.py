@@ -19,212 +19,493 @@ _SYSTEM_PROMPT = """\
 You are a dataset documentation assistant for a surrogate model training tool.
 
 Your job: given pre-analyzed facts about a dataset directory AND sample file
-content, produce a README.md file with a fenced ```json``` schema block.
+content, produce a README.md that accurately describes the dataset structure,
+geometric/input parameters, ground-truth data, and how to load it.
 
-## CRITICAL RULES — the parser is strict about these
+## CRITICAL RULES
 
-- `ground_truth_parts` MUST use EXACTLY these values: "re", "im", "mag", "db", "angle_deg"
-  Do NOT write "real", "imaginary", "magnitude", "phase", etc.
-- `columns` MUST have EXACTLY the number of entries matching the actual column count provided.
-  Do NOT add or remove columns. Use the pre-analyzed column count as ground truth.
-  If the log.txt has a header comment with column names (starting with #), use THOSE EXACT names.
-- `sample_id_column` MUST be one of the names in `columns`.
-- `feature_columns` MUST be a subset of `columns`. Exclude sample IDs, thread IDs, and batch IDs.
-  DO include constant columns (like na, nb, outa, outb, outbound) — the loader auto-drops them.
-- Only include fields documented below. Do NOT invent fields like "frequency_unit".
-- For `ground_truth_parameters`: use the LOWER-TRIANGULAR S-parameters for an N-port device.
-  For 2-port: S11, S12, S22 (3 params).
-  For 4-port: S11, S12, S13, S14, S22, S23, S24, S33, S34, S44 (10 params).
-  For 6-port: all Sij where j >= i (21 params).
-  Do NOT list only the first row (S11,S21,S31,S41). List ALL unique lower-triangular entries.
-  Note: S12=S21, S13=S31, etc. by reciprocity. Use the form Sij where i <= j.
+1. **Describe what you SEE, not what you assume.** The pre-analyzed facts tell
+   you the exact column names, file counts, directory structure, value ranges,
+   and array shapes. Use ONLY those facts. Never copy column names or parameters
+   from a different dataset.
+2. **Column names must come from the data.** If a tabular CSV header says
+   `NUM_TURNS,LINE_WIDTH,SPACING,WIDTH,TOTAL_LENGTH,R_OD,sample_name`, those
+   are the columns — not `rax, ray, rbx, rby` or any other names.
+3. **feature_columns** = the subset of columns that are geometric/design
+   parameters (inputs to the model). Exclude sample IDs, batch/thread IDs,
+   and file-name columns.
+4. **ground_truth_parameters**: for S-parameter data, list the LOWER-TRIANGULAR
+   unique entries.  For 2-port: S11, S12, S22.  For 4-port: S11, S12, S13,
+   S14, S22, S23, S24, S33, S34, S44.  Use form Sij where i <= j.
+5. **ground_truth_parts** MUST use EXACTLY these values where applicable:
+   "re", "im", "mag", "db", "angle_deg".
+6. **drop_first_frequency**: true ONLY if first frequency is exactly 0.0 Hz (DC).
+7. If the dataset has multiple templates/variants (e.g. different geometries
+   stored in separate subdirectories), describe ALL of them. Note which
+   parameters vary vs. which are constant per template.
 
-## Supported formats
+## Detecting the dataset format
 
-### 1. Touchstone (S-parameter .sNp files + log.txt)
-Directory has: `log.txt` (one Python list per line, optionally with a # header comment) and `SPData/` folder with `.sNp` files.
+Examine the pre-analyzed facts to determine what kind of dataset this is.
+Common patterns include (but are NOT limited to):
 
-GOLD-STANDARD EXAMPLE — follow this structure exactly for touchstone datasets:
-```json
-{
-  "dataset_name": "XFMR_2508_1x1_DiffXY",
-  "input_feature": {
-    "columns": [
-      "rax", "ray", "rbx", "rby", "na", "nb",
-      "wida", "widb", "gapa", "gapb",
-      "opena", "openb", "outa", "outb",
-      "exta", "extb", "dist", "ratio", "outbound",
-      "index", "batch"
-    ],
-    "feature_columns": [
-      "rax", "ray", "rbx", "rby", "na", "nb",
-      "wida", "widb",
-      "opena", "openb", "outa", "outb",
-      "exta", "extb", "dist", "ratio", "outbound"
-    ],
-    "sample_id_column": "index"
-  },
-  "ground_truth": {
-    "format": "touchstone",
-    "file_extension": ".s4p",
-    "ground_truth_parameters": [
-      "S11", "S12", "S13", "S14",
-      "S22", "S23", "S24",
-      "S33", "S34",
-      "S44"
-    ],
-    "ground_truth_parts": ["re", "im"],
-    "drop_first_frequency": false
-  }
-}
-```
+### inline (single CSV with all data)
+- A single CSV file contains ALL samples. Each sample spans multiple rows
+  (one per frequency point). Rows sharing the same feature-column values
+  form one sample.
+- `source`: "inline". Set `input_feature.file_path` to the CSV.
+- MUST set `frequency_column` to the name of the swept-axis column
+  (e.g. "freq (Hz)", "Freq_GHz", "VDIFF").
+- If the swept axis is NOT frequency, set `sweep_label` to a display label
+  (e.g. "VDIFF (mV)"). Defaults to "Frequency (GHz)" if omitted.
+- Feature columns are constant within a sample; GT columns vary per sweep point.
+- GT column names are auto-detected from common conventions (e.g.
+  `S11_re`, `s11_real`, `S11` for dB, `S11_phase` for angle_deg).
+- Special case: Cadence block-structured CSVs use `channel_files` dict and
+  `input_feature.source: "embedded"` with `parameter_keys`.
 
-Rules for touchstone:
-- `columns` count MUST match the pre-analyzed column count exactly.
-- If log.txt has a # header comment with column names, use those exact names for `columns`.
-- Otherwise, name columns by inspecting the data values (geometry params, IDs, etc.)
-- `feature_columns`: exclude sample IDs (index), thread/batch IDs. KEEP all geometry parameters
-  even if constant — the loader auto-drops constants. This ensures the schema stays valid if
-  a future dataset has non-constant values in those columns.
-- `sample_id_column`: the column whose values match filenames in SPData/ (0.s4p → value 0).
-  Usually the second-to-last column.
-- `ground_truth_parameters`: ALL unique lower-triangular S-parameters for the N-port device.
-  For 4-port (.s4p) → 10 params: S11,S12,S13,S14,S22,S23,S24,S33,S34,S44.
-  For 2-port (.s2p) → 3 params: S11,S12,S22.
-- `ground_truth_parts`: MUST be from ["re", "im", "mag", "db", "angle_deg"]. Typically ["re", "im"].
-- `drop_first_frequency`: true ONLY if the first frequency is exactly 0.0 Hz (DC).
-  If pre-analyzed first_frequency is > 0, set to false.
+### per_sample (one GT file per sample)
+- Separate GT file per sample (CSV or Touchstone `.sNp`) in a `data_dir/`.
+- Input features in a separate tabular CSV with `sample_id_column` for linking.
+- `source`: "per_sample". Set `file_extension` (e.g. ".csv", ".s2p").
+- For CSV files, optionally set `frequency_column`.
 
-### 2. Cadence CSV (block-structured simulation exports)
-Each CSV has parameter blocks separated by markers like "CS = ...", with swept data.
+### array (pre-packed numpy)
+- Pre-packed numpy array in a pickle file, shape (samples, frequencies, channels).
+- `source`: "array". Set `data_dir` to the pickle file path.
+- Include `frequency_start_hz` and `frequency_stop_hz` (in Hz).
 
-Example schema:
-```json
-{
-  "dataset_name": "CTLE_gain",
-  "input_feature": {
-    "columns": ["CS_fF", "LD_pH", "M", "RD", "RS", "MN"],
-    "feature_columns": ["CS_fF", "LD_pH", "M", "RD", "RS", "MN"],
-    "source": "embedded",
-    "parameter_keys": {
-      "CS": ["CS_fF", 1e15],
-      "LD": ["LD_pH", 1e12],
-      "M": ["M", 1],
-      "RD": ["RD", 1],
-      "RS": ["RS", 1],
-      "MN": ["MN", 1]
-    }
-  },
-  "ground_truth": {
-    "format": "cadence_csv",
-    "channel_files": {
-      "gain": "CTLE_gain_1000sample.csv"
-    },
-    "channel_units": {
-      "gain": "dB"
-    }
-  }
-}
-```
-
-Rules for cadence_csv:
-- `source`: always "embedded"
-- `parameter_keys`: map CSV key → [stored_name, scale]. Common scales: F→fF=1e15, H→pH=1e12.
-  For keys whose values have no SI suffix and are plain numbers (like M, RD, RS, MN), use scale=1.
-- `channel_files`: map channel name → CSV filename.
-- `channel_units`: physical unit of output extracted from the CSV header line (e.g. "dB", "deg", "V/sqrt(Hz)")
-- `channel_transforms`: set to "log10" ONLY if data spans many orders of magnitude (>1000x range). Otherwise omit entirely.
+### Other / mixed formats
+- Some datasets have layout images, GDS files, pixel arrays, port info, etc.
+- Describe ALL data modalities found in the directory.
 
 ## Output format
 
 Write a complete README.md with:
-1. A title (# Dataset Name)
-2. A brief description
-3. The fenced ```json``` schema block
-4. Any relevant notes about the dataset
+1. **Title** (# Dataset Name)
+2. **Description** — what this dataset contains, what device/circuit it models.
+3. **Templates/variants** — if multiple subdirectory groups exist, list them
+   with sample counts.
+4. **Input features** — table of geometric parameter names, descriptions,
+   units, and value ranges (from the pre-analyzed facts).
+5. **Ground truth** — what output data is stored, format, frequency range,
+   which S-parameters or channels, column names from the actual CSV headers.
+6. **Directory structure** — a tree showing the layout.
+7. **Data loading** — code snippet showing how to load the data.
+8. **Schema block** — a fenced ```json``` block describing the dataset schema
+   for the training pipeline. Use fields appropriate to the detected format.
+   The schema MUST include these path fields so the loader knows where to find files:
+   - `input_feature.file_path`: relative path from dataset root to the input-feature
+     file (e.g. `"log.txt"`, `"tabular/data.csv"`). Omit only for embedded formats.
+   - `ground_truth.data_dir`: relative path from dataset root to the directory
+     containing ground-truth files (e.g. `"SPData"`, `"csv/oct_l"`).
+9. **Notes** — any important caveats (constant columns, DC frequency, etc.)
 
 IMPORTANT: The JSON block MUST be valid JSON inside triple-backtick json fences.
+Do NOT copy examples from other datasets. Build the schema from the actual facts.
 """
 
 
 def _pre_analyze(directory: Path) -> dict:
-    """Extract hard facts from the dataset directory that the LLM must not guess."""
+    """Extract hard facts from the dataset directory that the LLM must not guess.
+
+    This function is format-agnostic: it inspects the directory tree and reports
+    whatever it finds (tabular CSVs with headers, per-sample data files, pickle
+    arrays, touchstone files, Cadence-style CSVs, GDS/image files, etc.) so
+    that the LLM can describe the dataset accurately regardless of its layout.
+    """
     facts: dict = {"directory": str(directory), "files": [], "subdirs": []}
 
     for f in sorted(directory.iterdir()):
         if f.is_dir():
-            sub_files = sorted(f.iterdir())
-            facts["subdirs"].append({
-                "name": f.name,
-                "file_count": len(sub_files),
-                "sample_extensions": [sf.suffix for sf in sub_files[:3]],
-            })
+            facts["subdirs"].append(_scan_subdir(f))
         else:
             facts["files"].append(f.name)
 
-    # Analyze log.txt if present.
+    # --- Analyze log.txt if present (touchstone workflow) ---
     log_path = directory / "log.txt"
     if log_path.exists():
-        header_comment = None
-        first_data_line = None
-        data_line_count = 0
-        with log_path.open(encoding="utf-8") as fh:
-            for raw in fh:
-                line = raw.strip()
-                if not line:
-                    continue
-                if line.startswith("#"):
-                    header_comment = line
-                    continue
-                if first_data_line is None:
-                    first_data_line = line
-                data_line_count += 1
-        try:
-            row = ast.literal_eval(first_data_line)
-            facts["log_txt"] = {
-                "total_lines": data_line_count,
-                "columns_per_row": len(row),
-                "first_row_values": row,
-                "constant_columns": _find_constant_columns(log_path, len(row)),
-            }
-            if header_comment:
-                facts["log_txt"]["header_comment"] = header_comment
-        except Exception:
-            facts["log_txt"] = {"total_lines": data_line_count, "first_line": first_data_line}
+        facts["log_txt"] = _analyze_log_txt(log_path)
 
-    # Analyze SPData if present.
+    # --- Analyze SPData if present (touchstone workflow) ---
     sp_dir = directory / "SPData"
     if sp_dir.is_dir():
-        sp_files = sorted(sp_dir.iterdir())
-        if sp_files:
-            ext = sp_files[0].suffix.lower()
-            port_match = re.fullmatch(r"\.s(\d+)p", ext)
-            ports = int(port_match.group(1)) if port_match else None
-            # Read first touchstone file header.
-            header_info = _read_touchstone_header(sp_files[0])
-            # Compute lower-triangular S-parameters for N-port.
-            lower_tri_params = []
-            if ports:
-                for i in range(1, ports + 1):
-                    for j in range(i, ports + 1):
-                        lower_tri_params.append(f"S{i}{j}")
-            facts["spdata"] = {
-                "file_count": len(sp_files),
-                "extension": ext,
-                "port_count": ports,
-                "lower_triangular_sparams": lower_tri_params,
-                "sample_ids": [int(sf.stem) for sf in sp_files[:5]],
-                **header_info,
-            }
+        facts["spdata"] = _analyze_spdata(sp_dir)
 
-    # Analyze CSV files if present.
+    # --- Analyze top-level CSV files ---
     csv_files = [f for f in directory.iterdir() if f.suffix.lower() == ".csv"]
     if csv_files:
         facts["csv_files"] = []
         for csv_path in sorted(csv_files)[:5]:
-            facts["csv_files"].append(_analyze_csv(csv_path))
+            facts["csv_files"].append(_analyze_csv_auto(csv_path))
+
+    # --- Analyze tabular CSV files in subdirectories ---
+    # Look for directories named "tabular" or CSV files with header rows in subdirs.
+    tabular_csvs = _find_tabular_csvs(directory)
+    if tabular_csvs:
+        facts["tabular_csvs"] = tabular_csvs
+
+    # --- Analyze pickle files ---
+    pkl_files = sorted(directory.rglob("*.pkl"))
+    if pkl_files:
+        facts["pkl_files"] = _analyze_pkl_files(pkl_files[:10])
+
+    # --- Analyze per-sample data directories ---
+    # Detect subdirectories that contain many similarly-named data files (CSVs, sNp, etc.)
+    per_sample_dirs = _find_per_sample_dirs(directory)
+    if per_sample_dirs:
+        facts["per_sample_dirs"] = per_sample_dirs
+
+    # --- Detect image / layout directories ---
+    image_dirs = _find_image_dirs(directory)
+    if image_dirs:
+        facts["image_dirs"] = image_dirs
+
+    # --- Detect port info ---
+    port_info = _find_port_info(directory)
+    if port_info:
+        facts["port_info"] = port_info
 
     return facts
+
+
+def _scan_subdir(d: Path, max_depth: int = 2) -> dict:
+    """Recursively scan a subdirectory up to max_depth levels."""
+    entries = sorted(d.iterdir())
+    files = [e for e in entries if e.is_file()]
+    dirs = [e for e in entries if e.is_dir()]
+    info: dict = {
+        "name": d.name,
+        "file_count": len(files),
+        "dir_count": len(dirs),
+    }
+    if files:
+        info["sample_extensions"] = list({f.suffix for f in files})
+    if dirs and max_depth > 1:
+        info["subdirs"] = [_scan_subdir(sd, max_depth - 1) for sd in dirs[:8]]
+    elif dirs:
+        info["subdir_names"] = [sd.name for sd in dirs]
+    return info
+
+
+def _analyze_log_txt(log_path: Path) -> dict:
+    """Analyze a log.txt file (touchstone workflow)."""
+    header_comment = None
+    first_data_line = None
+    data_line_count = 0
+    with log_path.open(encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line:
+                continue
+            if line.startswith("#"):
+                header_comment = line
+                continue
+            if first_data_line is None:
+                first_data_line = line
+            data_line_count += 1
+    try:
+        row = ast.literal_eval(first_data_line)
+        result: dict = {
+            "total_lines": data_line_count,
+            "columns_per_row": len(row),
+            "first_row_values": row,
+            "constant_columns": _find_constant_columns(log_path, len(row)),
+        }
+        if header_comment:
+            result["header_comment"] = header_comment
+        return result
+    except Exception:
+        return {"total_lines": data_line_count, "first_line": first_data_line}
+
+
+def _analyze_spdata(sp_dir: Path) -> dict:
+    """Analyze an SPData directory with touchstone files."""
+    sp_files = sorted(sp_dir.iterdir())
+    if not sp_files:
+        return {"file_count": 0}
+    ext = sp_files[0].suffix.lower()
+    port_match = re.fullmatch(r"\.s(\d+)p", ext)
+    ports = int(port_match.group(1)) if port_match else None
+    header_info = _read_touchstone_header(sp_files[0])
+    lower_tri_params = []
+    if ports:
+        for i in range(1, ports + 1):
+            for j in range(i, ports + 1):
+                lower_tri_params.append(f"S{i}{j}")
+    return {
+        "file_count": len(sp_files),
+        "extension": ext,
+        "port_count": ports,
+        "lower_triangular_sparams": lower_tri_params,
+        "sample_ids": [int(sf.stem) for sf in sp_files[:5]],
+        **header_info,
+    }
+
+
+def _analyze_csv_auto(csv_path: Path) -> dict:
+    """Analyze a CSV file, auto-detecting whether it's tabular or Cadence-style."""
+    # First check if it has a standard CSV header row.
+    try:
+        with csv_path.open(encoding="utf-8") as fh:
+            first_line = fh.readline().strip()
+            fh.readline()  # skip second line
+    except Exception:
+        return {"filename": csv_path.name, "error": "unreadable"}
+
+    # If the first line looks like a header (no numbers, comma-separated words)
+    # treat it as a tabular CSV.
+    if first_line and "=" not in first_line and not first_line.startswith("!"):
+        parts = first_line.split(",")
+        is_header = all(not _is_numeric(p.strip()) for p in parts) and len(parts) >= 2
+        if is_header:
+            return _analyze_tabular_csv(csv_path, first_line)
+
+    # Fall back to Cadence-style block analysis.
+    return _analyze_csv(csv_path)
+
+
+def _is_numeric(s: str) -> bool:
+    """Check if a string looks like a number."""
+    try:
+        float(s)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+def _analyze_tabular_csv(csv_path: Path, header_line: str) -> dict:
+    """Analyze a CSV file with a standard header row."""
+    columns = [c.strip() for c in header_line.split(",")]
+    row_count = 0
+    first_row_values: list[str] = []
+    with csv_path.open(encoding="utf-8") as fh:
+        fh.readline()  # skip header
+        for i, line in enumerate(fh):
+            if not line.strip():
+                continue
+            if i == 0:
+                first_row_values = [v.strip() for v in line.strip().split(",")]
+            row_count += 1
+    info: dict = {
+        "filename": csv_path.name,
+        "type": "tabular",
+        "columns": columns,
+        "column_count": len(columns),
+        "row_count": row_count,
+    }
+    if first_row_values:
+        info["first_row_values"] = first_row_values
+    return info
+
+
+def _find_tabular_csvs(directory: Path) -> list[dict]:
+    """Find CSV files with header rows in the directory tree (e.g. tabular/ subdir)."""
+    results = []
+    # Check common subdir names for tabular data.
+    for subdir_name in ("tabular", "params", "features", "metadata"):
+        subdir = directory / subdir_name
+        if subdir.is_dir():
+            for csv_path in sorted(subdir.glob("*.csv"))[:8]:
+                results.append(_analyze_tabular_csv_full(csv_path))
+    return results
+
+
+def _analyze_tabular_csv_full(csv_path: Path) -> dict:
+    """Deep analysis of a tabular CSV: columns, value ranges, constant columns."""
+    import numpy as np
+    info: dict = {"filename": csv_path.name, "path": str(csv_path.parent.name) + "/" + csv_path.name}
+    try:
+        with csv_path.open(encoding="utf-8") as fh:
+            header = fh.readline().strip()
+        columns = [c.strip() for c in header.split(",")]
+        info["columns"] = columns
+        info["column_count"] = len(columns)
+
+        # Read the data to find value ranges and constant columns.
+        rows = []
+        id_column_idx = None
+        with csv_path.open(encoding="utf-8") as fh:
+            fh.readline()  # skip header
+            for line in fh:
+                if not line.strip():
+                    continue
+                parts = line.strip().split(",")
+                row_numeric = []
+                for j, val in enumerate(parts):
+                    val = val.strip()
+                    if _is_numeric(val):
+                        row_numeric.append(float(val))
+                    else:
+                        row_numeric.append(float("nan"))
+                        if id_column_idx is None:
+                            id_column_idx = j
+                rows.append(row_numeric)
+
+        info["row_count"] = len(rows)
+        if rows:
+            arr = np.array(rows)
+            # Find numeric vs non-numeric columns.
+            numeric_cols = []
+            constant_cols = []
+            value_ranges = {}
+            for j, col_name in enumerate(columns):
+                if j < arr.shape[1]:
+                    col_data = arr[:, j]
+                    non_nan = col_data[~np.isnan(col_data)]
+                    if len(non_nan) > 0:
+                        numeric_cols.append(col_name)
+                        value_ranges[col_name] = {
+                            "min": float(non_nan.min()),
+                            "max": float(non_nan.max()),
+                        }
+                        if len(non_nan) > 1 and non_nan.std() < 1e-8:
+                            constant_cols.append(col_name)
+            info["numeric_columns"] = numeric_cols
+            info["value_ranges"] = value_ranges
+            if constant_cols:
+                info["constant_columns"] = constant_cols
+            if id_column_idx is not None and id_column_idx < len(columns):
+                info["id_column"] = columns[id_column_idx]
+    except Exception as e:
+        info["error"] = str(e)
+    return info
+
+
+def _analyze_pkl_files(pkl_paths: list[Path]) -> list[dict]:
+    """Analyze pickle files to report their types and shapes."""
+    results = []
+    for pkl_path in pkl_paths:
+        info: dict = {"filename": pkl_path.name, "path": str(pkl_path.relative_to(pkl_path.parent.parent))}
+        try:
+            import pickle
+            import numpy as np
+            with pkl_path.open("rb") as fh:
+                data = pickle.load(fh)
+            info["type"] = type(data).__name__
+            if hasattr(data, "shape"):
+                info["shape"] = list(data.shape)
+            elif isinstance(data, (list, tuple)):
+                info["length"] = len(data)
+            if isinstance(data, np.ndarray):
+                info["dtype"] = str(data.dtype)
+        except Exception as e:
+            info["error"] = str(e)
+        results.append(info)
+    return results
+
+
+def _find_per_sample_dirs(directory: Path) -> list[dict]:
+    """Find directories containing many per-sample data files."""
+    results = []
+    for subdir in sorted(directory.iterdir()):
+        if not subdir.is_dir():
+            continue
+        # Check for nested template dirs (e.g. csv/oct_l/, csv/rec_r/).
+        nested_dirs = [d for d in sorted(subdir.iterdir()) if d.is_dir()]
+        if nested_dirs:
+            for nested in nested_dirs[:6]:
+                info = _analyze_data_dir(nested, prefix=f"{subdir.name}/{nested.name}")
+                if info:
+                    results.append(info)
+        else:
+            info = _analyze_data_dir(subdir, prefix=subdir.name)
+            if info:
+                results.append(info)
+    return results
+
+
+def _analyze_data_dir(d: Path, prefix: str) -> dict | None:
+    """Analyze a directory of per-sample data files. Returns None if not a data dir."""
+    files = sorted(f for f in d.iterdir() if f.is_file())
+    if len(files) < 5:
+        return None
+
+    extensions = {}
+    for f in files:
+        ext = f.suffix.lower()
+        extensions[ext] = extensions.get(ext, 0) + 1
+    dominant_ext = max(extensions, key=extensions.get) if extensions else ""
+
+    info: dict = {
+        "path": prefix,
+        "file_count": len(files),
+        "dominant_extension": dominant_ext,
+    }
+
+    # Read the first file to get column info (for CSVs) or header info (for sNp).
+    first_file = files[0]
+    if dominant_ext == ".csv":
+        try:
+            with first_file.open(encoding="utf-8") as fh:
+                header = fh.readline().strip()
+                fh.readline()  # skip first data line
+                line_count = 2 + sum(1 for _ in fh)
+            columns = [c.strip() for c in header.split(",")]
+            if all(not _is_numeric(c) for c in columns):
+                info["csv_columns"] = columns
+                info["csv_column_count"] = len(columns)
+                info["rows_per_file"] = line_count - 1  # minus header
+        except Exception:
+            pass
+    elif re.fullmatch(r"\.s\d+p", dominant_ext):
+        info["touchstone_header"] = _read_touchstone_header(first_file)
+
+    return info
+
+
+def _find_image_dirs(directory: Path) -> list[dict]:
+    """Find directories containing image files (PNG, SVG, numpy, etc.)."""
+    image_exts = {".png", ".jpg", ".jpeg", ".svg", ".npy", ".npz", ".bmp", ".tif", ".tiff"}
+    results = []
+    for subdir in sorted(directory.iterdir()):
+        if not subdir.is_dir():
+            continue
+        # Check nested dirs (e.g. PNG/oct_l/).
+        nested_dirs = [d for d in sorted(subdir.iterdir()) if d.is_dir()]
+        if nested_dirs:
+            for nested in nested_dirs[:6]:
+                files = [f for f in nested.iterdir() if f.is_file() and f.suffix.lower() in image_exts]
+                if files:
+                    results.append({
+                        "path": f"{subdir.name}/{nested.name}",
+                        "file_count": len(files),
+                        "extension": files[0].suffix.lower(),
+                    })
+        else:
+            files = [f for f in subdir.iterdir() if f.is_file() and f.suffix.lower() in image_exts]
+            if files:
+                results.append({
+                    "path": subdir.name,
+                    "file_count": len(files),
+                    "extension": files[0].suffix.lower(),
+                })
+    return results
+
+
+def _find_port_info(directory: Path) -> list[dict]:
+    """Find port info files (CSVs with port coordinates)."""
+    results = []
+    port_dir = directory / "port_info"
+    if not port_dir.is_dir():
+        return results
+    for subdir in sorted(port_dir.iterdir()):
+        if subdir.is_dir():
+            csv_files = sorted(subdir.glob("*.csv"))
+            if csv_files:
+                try:
+                    with csv_files[0].open(encoding="utf-8") as fh:
+                        header = fh.readline().strip()
+                        first_row = fh.readline().strip()
+                    results.append({
+                        "path": f"port_info/{subdir.name}",
+                        "file_count": len(csv_files),
+                        "columns": header,
+                        "example": first_row,
+                    })
+                except Exception:
+                    pass
+    return results
 
 
 def _find_constant_columns(log_path: Path, ncols: int, max_rows: int = 100) -> list[int]:
@@ -349,40 +630,66 @@ def _analyze_csv(path: Path) -> dict:
     return info
 
 
-def _sample_files(directory: Path, max_lines: int = 20, max_files: int = 8) -> str:
-    """Read the first few lines of files for the LLM context."""
+_TEXT_EXTENSIONS = {".csv", ".txt", ".log", ".s2p", ".s3p", ".s4p", ".s6p", ".s8p", ".tsv"}
+
+
+def _sample_files(directory: Path, max_lines: int = 20, max_files: int = 12) -> str:
+    """Read the first few lines of files for the LLM context.
+
+    Handles nested directory structures (up to 2 levels deep) so that datasets
+    organized as e.g. ``csv/oct_l/sample_0.csv`` or ``tabular/data.csv`` are
+    properly sampled.
+    """
     parts: list[str] = []
-    files = sorted(directory.iterdir())
     sampled = 0
 
-    for f in files:
+    def _read_file(path: Path, label: str) -> bool:
+        nonlocal sampled
+        if sampled >= max_files:
+            return False
+        if path.suffix.lower() not in _TEXT_EXTENSIONS:
+            return False
+        parts.append(f"=== {label} (first {max_lines} lines) ===")
+        try:
+            with path.open(encoding="utf-8", errors="replace") as fh:
+                for i, line in enumerate(fh):
+                    if i >= max_lines:
+                        break
+                    parts.append(line.rstrip())
+        except Exception:
+            parts.append("(binary or unreadable)")
+        sampled += 1
+        return True
+
+    for entry in sorted(directory.iterdir()):
         if sampled >= max_files:
             break
-        if f.is_dir():
-            sub_files = sorted(f.iterdir())
-            if sub_files:
-                parts.append(f"=== {f.name}/{sub_files[0].name} (first {max_lines} lines) ===")
-                try:
-                    with sub_files[0].open(encoding="utf-8", errors="replace") as fh:
-                        for i, line in enumerate(fh):
-                            if i >= max_lines:
-                                break
-                            parts.append(line.rstrip())
-                except Exception:
-                    parts.append("(binary or unreadable)")
-                parts.append(f"... ({len(sub_files)} files in {f.name}/)")
-                sampled += 1
-        elif f.suffix.lower() in (".csv", ".txt", ".log", ".s2p", ".s3p", ".s4p", ".s6p", ".s8p"):
-            parts.append(f"=== {f.name} (first {max_lines} lines) ===")
-            try:
-                with f.open(encoding="utf-8", errors="replace") as fh:
-                    for i, line in enumerate(fh):
-                        if i >= max_lines:
-                            break
-                        parts.append(line.rstrip())
-            except Exception:
-                parts.append("(binary or unreadable)")
-            sampled += 1
+        if entry.is_file():
+            _read_file(entry, entry.name)
+        elif entry.is_dir():
+            # Check for nested subdirectories (e.g. csv/oct_l/, tabular/).
+            sub_entries = sorted(entry.iterdir())
+            sub_dirs = [e for e in sub_entries if e.is_dir()]
+            sub_files = [e for e in sub_entries if e.is_file()]
+
+            if sub_dirs:
+                # Nested structure: sample one file from each nested subdir.
+                for sd in sub_dirs[:4]:
+                    if sampled >= max_files:
+                        break
+                    nested_files = sorted(sd.iterdir())
+                    readable = [f for f in nested_files if f.is_file() and f.suffix.lower() in _TEXT_EXTENSIONS]
+                    if readable:
+                        label = f"{entry.name}/{sd.name}/{readable[0].name}"
+                        _read_file(readable[0], label)
+                        parts.append(f"... ({len(nested_files)} files in {entry.name}/{sd.name}/)")
+            elif sub_files:
+                # Flat subdir: sample the first readable file.
+                readable = [f for f in sub_files if f.suffix.lower() in _TEXT_EXTENSIONS]
+                if readable:
+                    label = f"{entry.name}/{readable[0].name}"
+                    _read_file(readable[0], label)
+                    parts.append(f"... ({len(sub_files)} files in {entry.name}/)")
 
     return "\n".join(parts)
 
@@ -510,9 +817,27 @@ def generate_readme(
 def _format_facts(facts: dict) -> str:
     """Format pre-analyzed facts as a readable string for the LLM prompt."""
     lines = []
+
+    # --- Directory overview ---
+    lines.append(f"Directory: {facts.get('directory', '?')}")
+    lines.append(f"Top-level files: {facts.get('files', [])}")
+    if facts.get("subdirs"):
+        lines.append("Top-level subdirectories:")
+        for sd in facts["subdirs"]:
+            detail = f"  {sd['name']}/ — {sd.get('file_count', 0)} files, {sd.get('dir_count', 0)} subdirs"
+            if sd.get("sample_extensions"):
+                detail += f", extensions: {sd['sample_extensions']}"
+            lines.append(detail)
+            if sd.get("subdirs"):
+                for nested in sd["subdirs"]:
+                    lines.append(f"    {nested['name']}/ — {nested.get('file_count', 0)} files")
+            elif sd.get("subdir_names"):
+                lines.append(f"    subdirs: {sd['subdir_names']}")
+
+    # --- Touchstone: log.txt ---
     if "log_txt" in facts:
         log = facts["log_txt"]
-        lines.append(f"log.txt: {log.get('total_lines', '?')} data lines, {log.get('columns_per_row', '?')} columns per row")
+        lines.append(f"\nlog.txt: {log.get('total_lines', '?')} data lines, {log.get('columns_per_row', '?')} columns per row")
         if "header_comment" in log:
             lines.append(f"  COLUMN NAMES (from header): {log['header_comment']}")
             lines.append(f"  USE THESE EXACT NAMES for 'columns' in the schema.")
@@ -521,9 +846,10 @@ def _format_facts(facts: dict) -> str:
         if "constant_columns" in log and log["constant_columns"]:
             lines.append(f"  Constant columns (indices): {log['constant_columns']}")
 
+    # --- Touchstone: SPData ---
     if "spdata" in facts:
         sp = facts["spdata"]
-        lines.append(f"SPData/: {sp['file_count']} files, extension={sp['extension']}, ports={sp.get('port_count', '?')}")
+        lines.append(f"\nSPData/: {sp['file_count']} files, extension={sp['extension']}, ports={sp.get('port_count', '?')}")
         lines.append(f"  Sample IDs: {sp.get('sample_ids', [])}")
         if sp.get("lower_triangular_sparams"):
             lines.append(f"  USE THESE EXACT ground_truth_parameters: {sp['lower_triangular_sparams']}")
@@ -535,21 +861,80 @@ def _format_facts(facts: dict) -> str:
         if "matrix_format" in sp:
             lines.append(f"  Matrix format: {sp['matrix_format']}, data format: {sp.get('data_format', '?')}")
 
-    if "csv_files" in facts:
-        for csv in facts["csv_files"]:
-            lines.append(f"CSV: {csv['filename']}")
-            if csv.get("header"):
-                lines.append(f"  Header: {csv['header'][:100]}")
-            if csv.get("parameter_keys"):
-                keys_str = ", ".join(f"{pk['key']}={pk['example_value']}" for pk in csv["parameter_keys"])
-                lines.append(f"  Parameters: {keys_str}")
-            lines.append(f"  Data points per sample: {csv.get('data_rows_in_first_block', '?')}")
-            if "value_min" in csv:
-                lines.append(f"  Value range: {csv['value_min']:.4e} to {csv['value_max']:.4e}")
-            if csv.get("dynamic_range"):
-                lines.append(f"  Dynamic range: {csv['dynamic_range']:.0f}x {'(RECOMMEND log10 transform)' if csv.get('recommend_log10') else ''}")
+    # --- Tabular CSV files (e.g. in tabular/ subdir) ---
+    if "tabular_csvs" in facts:
+        lines.append("\nTabular CSV files (geometric/input parameters):")
+        for tc in facts["tabular_csvs"]:
+            lines.append(f"  {tc.get('path', tc.get('filename', '?'))}: {tc.get('row_count', '?')} rows")
+            if tc.get("columns"):
+                lines.append(f"    COLUMNS: {tc['columns']}")
+                lines.append(f"    USE THESE EXACT column names for input features.")
+            if tc.get("numeric_columns"):
+                lines.append(f"    Numeric columns: {tc['numeric_columns']}")
+            if tc.get("constant_columns"):
+                lines.append(f"    Constant columns: {tc['constant_columns']}")
+            if tc.get("value_ranges"):
+                for col, vr in tc["value_ranges"].items():
+                    lines.append(f"    {col}: min={vr['min']}, max={vr['max']}")
+            if tc.get("id_column"):
+                lines.append(f"    ID/name column: {tc['id_column']}")
 
-    lines.append(f"All files/dirs: {facts.get('files', [])} + subdirs: {[s['name'] for s in facts.get('subdirs', [])]}")
+    # --- Top-level CSV files ---
+    if "csv_files" in facts:
+        lines.append("\nTop-level CSV files:")
+        for csv_info in facts["csv_files"]:
+            lines.append(f"  {csv_info.get('filename', '?')}")
+            if csv_info.get("type") == "tabular":
+                lines.append(f"    Type: tabular, columns: {csv_info.get('columns', [])}, rows: {csv_info.get('row_count', '?')}")
+            else:
+                if csv_info.get("header"):
+                    lines.append(f"    Header: {csv_info['header'][:120]}")
+                if csv_info.get("parameter_keys"):
+                    keys_str = ", ".join(f"{pk['key']}={pk['example_value']}" for pk in csv_info["parameter_keys"])
+                    lines.append(f"    Parameters: {keys_str}")
+                lines.append(f"    Data points per sample: {csv_info.get('data_rows_in_first_block', '?')}")
+                if "value_min" in csv_info:
+                    lines.append(f"    Value range: {csv_info['value_min']:.4e} to {csv_info['value_max']:.4e}")
+                if csv_info.get("dynamic_range"):
+                    lines.append(f"    Dynamic range: {csv_info['dynamic_range']:.0f}x {'(RECOMMEND log10 transform)' if csv_info.get('recommend_log10') else ''}")
+
+    # --- Pickle files ---
+    if "pkl_files" in facts:
+        lines.append("\nPickle files (pre-packed arrays):")
+        for pkl in facts["pkl_files"]:
+            detail = f"  {pkl.get('path', pkl.get('filename', '?'))}: type={pkl.get('type', '?')}"
+            if "shape" in pkl:
+                detail += f", shape={pkl['shape']}"
+            if "dtype" in pkl:
+                detail += f", dtype={pkl['dtype']}"
+            if "length" in pkl:
+                detail += f", length={pkl['length']}"
+            lines.append(detail)
+
+    # --- Per-sample data directories ---
+    if "per_sample_dirs" in facts:
+        lines.append("\nPer-sample data directories:")
+        for psd in facts["per_sample_dirs"]:
+            lines.append(f"  {psd['path']}/: {psd['file_count']} files ({psd.get('dominant_extension', '?')})")
+            if psd.get("csv_columns"):
+                lines.append(f"    CSV columns: {psd['csv_columns']}")
+                lines.append(f"    Rows per file: {psd.get('rows_per_file', '?')}")
+            if psd.get("touchstone_header"):
+                th = psd["touchstone_header"]
+                lines.append(f"    Touchstone: freq_unit={th.get('frequency_unit', '?')}, format={th.get('data_format', '?')}")
+
+    # --- Image directories ---
+    if "image_dirs" in facts:
+        lines.append("\nImage/layout directories:")
+        for imd in facts["image_dirs"]:
+            lines.append(f"  {imd['path']}/: {imd['file_count']} files ({imd.get('extension', '?')})")
+
+    # --- Port info ---
+    if "port_info" in facts:
+        lines.append("\nPort info:")
+        for pi in facts["port_info"]:
+            lines.append(f"  {pi['path']}/: {pi['file_count']} files, columns: {pi['columns']}, example: {pi['example']}")
+
     return "\n".join(lines)
 
 
@@ -565,51 +950,192 @@ def save_readme(directory: str | Path, content: str) -> Path:
 # ---------------------------------------------------------------------------
 
 _CHAT_SYSTEM_PROMPT = """\
-You are a helpful AI assistant embedded in a surrogate-model training GUI.
-Your primary role is to help users understand their datasets and generate
-correct README.md schema files so the training pipeline can load the data.
+You are an AI assistant embedded in a surrogate-model training GUI.
 
-You have access to pre-analyzed facts about the user's dataset directory.
-When the user asks you to generate or fix a README, use the exact same JSON
-schema format described below.
+The user has selected a dataset folder.  You have been given a detailed scan
+of every file and directory inside it — column names, array shapes, row counts,
+value ranges, and file previews.
 
-""" + _SYSTEM_PROMPT.split("## Output format")[0] + """\
-## Important behaviour rules
+Your job:
+1. **Understand** what the user's dataset contains by reading the scan facts.
+2. **Answer questions** about the dataset concisely.
+3. **Generate a README.md** with a valid JSON schema block when asked, so the
+   training pipeline can load the data automatically.
 
-- When the user asks you to generate a README, output the COMPLETE README.md
-  content (title, description, fenced json block, notes) inside a single
-  markdown code block fenced with ```readme ... ```.
-- When the user asks questions about their data, answer concisely based on
-  the pre-analyzed facts and file previews.
-- If the user asks you to fix or change specific fields, output the full
-  updated README.md (not just the changed part) inside ```readme ... ```.
-- Keep answers concise and focused on the dataset / README task.
+## How to identify file roles
+
+Look at the scan facts to determine:
+- **Input parameters**: A tabular file where each row is one sample and
+  columns are design/geometric parameters.  Typically few columns, many rows,
+  and a sample-ID column that links to the ground-truth files.
+- **Ground truth**: Simulation output data the model will predict.  Could be
+  per-sample CSV/touchstone files (many files, each with frequency-swept data),
+  Cadence-style block CSVs, or pre-packed numpy/pickle arrays.
+- **Layout**: Pixel/image representations of designs (PNG groups, GDS files,
+  numpy arrays with spatial shapes).
+- **Metadata**: Supporting data (port info, config files).
+
+Use ONLY the column names and structure from the scan facts.  NEVER copy
+column names or parameters from other datasets or examples.
+
+## Supported ground-truth formats for the schema
+
+The schema uses ``"source"`` (not ``"format"``) in the ground_truth block.
+Three loading strategies are supported:
+
+- ``"inline"``: single CSV with ALL samples.  Each sample spans multiple
+  rows (one per frequency point), grouped by identical feature-column values.
+  MUST set ``frequency_column``.  GT column names are auto-detected from
+  common conventions.  For Cadence block-structured
+  CSVs, use ``channel_files`` and ``input_feature.source: "embedded"``.
+- ``"per_sample"``: one GT file per sample in ``data_dir/``.  File type is
+  auto-detected from ``file_extension`` (``.csv``, ``.s2p``, ``.s4p``, etc.).
+  Input features in a separate tabular CSV with ``sample_id_column``.
+- ``"array"``: pre-packed numpy arrays in a pickle file.  Shape must be
+  (num_samples, num_frequencies, num_channels).  Set ``data_dir`` to the
+  pickle path.  MUST include ``frequency_start_hz`` / ``frequency_stop_hz``.
+
+## S-parameter rules
+
+For ground_truth_parameters, list the LOWER-TRIANGULAR unique S-parameters:
+- 2-port: S11, S12, S22
+- 4-port: S11, S12, S13, S14, S22, S23, S24, S33, S34, S44
+
+ground_truth_parts MUST use: "re", "im", "mag", "db", or "angle_deg".
+
+IMPORTANT: ground_truth_parameters + ground_truth_parts define the expected CSV
+column names.  For example, parameters=["S11"] + parts=["re","im"] means the
+loader will look for columns named "s11_real" and "s11_imag" (case-insensitive).
+Do NOT include scalar columns (like R, L, Q, inductance, resistance) in
+ground_truth_parameters — they don't have real/imaginary parts.  Only include
+parameters whose CSV columns follow the {param}_{part} naming pattern.
+
+## Generating loader.py (PREFERRED approach)
+
+Instead of a README with a JSON schema, you should generate a **loader.py**
+file that directly loads the data using Python.  This is more flexible and
+handles any file format.
+
+When the user asks to set up data loading, configure, or generate a loader,
+output a COMPLETE loader.py inside a code block fenced with ```python ... ```.
+
+The loader.py MUST define this function:
+
+```
+def load_dataset(dataset_root: str, max_samples: int | None = None) -> dict:
+    """Load the dataset and return standardized arrays.
+
+    Returns a dict with:
+        features:      np.ndarray (num_samples, num_features)
+        targets:        np.ndarray (num_samples, num_channels, num_sweep_points)
+        sweep_axis:     np.ndarray (num_sweep_points,)
+        feature_names:  list[str]
+        channel_names:  list[str]
+        channel_units:  list[str]   e.g. ["dB", "deg"]
+        sweep_label:    str         e.g. "Frequency (GHz)" or "VDIFF (mV)"
+        dataset_name:   str
+    """
+```
+
+Rules for loader.py:
+- Use ONLY: numpy, csv, re, json, pathlib, math, os.path, struct, io.
+- Do NOT import pandas, scipy, torch, or any other libraries.
+- Parse files using csv.DictReader, csv.reader, or manual line splitting.
+- Handle SI suffixes in Cadence files (e.g. '80.98f' = 80.98e-15).
+- targets must be shape (samples, channels, sweep_points).
+- If max_samples is not None, only load that many samples.
+- Include the dataset_name in the returned dict.
+
+Example for a Cadence-style dataset:
+
+```python
+import re
+import csv
+import numpy as np
+from pathlib import Path
+
+_SI = {'f':1e-15,'p':1e-12,'n':1e-9,'u':1e-6,'m':1e-3,'K':1e3,'M':1e6,'G':1e9,'T':1e12}
+def _parse_si(s):
+    s = s.strip()
+    if s and s[-1] in _SI: return float(s[:-1]) * _SI[s[-1]]
+    return float(s)
+
+def load_dataset(dataset_root, max_samples=None):
+    root = Path(dataset_root)
+    # ... parse files, extract features and targets ...
+    return {
+        "features": features,    # np.ndarray (N, num_features)
+        "targets": targets,       # np.ndarray (N, num_channels, num_sweep_points)
+        "sweep_axis": sweep,      # np.ndarray (num_sweep_points,)
+        "feature_names": [...],
+        "channel_names": [...],
+        "channel_units": [...],
+        "sweep_label": "Frequency (GHz)",
+        "dataset_name": "MyDataset",
+    }
+```
+
+## README generation (FALLBACK)
+
+If the user specifically asks for a README with a JSON schema instead of
+loader.py, output the COMPLETE README.md inside ```readme ... ```.
+
+The README must contain:
+1. A title and brief description
+2. A fenced ```json``` block with a valid schema containing:
+   - dataset_name
+   - input_feature: columns, feature_columns, sample_id_column, file_path
+   - ground_truth: source, ground_truth_parameters, ground_truth_parts,
+     file_extension, drop_first_frequency, data_dir
+3. Notes about the dataset
+
+## Rules
+
+- CRITICAL: Use ONLY column names from the scan facts.
+- CRITICAL: input_feature MUST include BOTH `columns` (ALL columns in the file,
+  in order) AND `feature_columns` (the subset used as model inputs).
+  `columns` is REQUIRED — the parser will reject the schema without it.
+- CRITICAL: Column names must be clean strings with NO brackets, quotes, or
+  punctuation from the raw file format.  If the scan shows values like
+  `[rax, ray, ...]` from a Python list, the column name is `rax` NOT `[rax`.
+  Strip any leading `[` or trailing `]` from column names.
+- When generating a README, output the COMPLETE content inside ```readme ... ```.
+- If the user asks you to fix or change fields, output the full updated README.
+- Keep answers concise and focused.
+- If you need information to decide (e.g. which file is input vs output),
+  ASK the user rather than guessing.
 """
 
 
 class ChatSession:
-    """Multi-turn conversation session with Gemini for dataset assistance."""
+    """Multi-turn conversation session with Gemini for dataset assistance.
+
+    Uses ``dataset_scanner`` to analyze the dataset directory and provides
+    the scan results as context for every conversation.
+    """
 
     def __init__(
         self,
         dataset_dir: str | Path | None = None,
         api_key: str | None = None,
-        model_name: str = "gemini-2.5-flash-lite",
+        model_name: str = "gemini-2.5-flash",
     ):
         self.model_name = model_name
         self.api_key = api_key or os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
         self.dataset_dir = Path(dataset_dir) if dataset_dir else None
         self.history: list[dict] = []  # [{"role": "user"/"model", "text": str}]
-        self._facts: dict | None = None
+        self._scan_context: str | None = None
         self._file_preview: str | None = None
 
     def set_dataset(self, dataset_dir: str | Path) -> str:
-        """Set or change the dataset directory. Returns a summary of what was found."""
+        """Scan the dataset directory. Returns a summary of what was found."""
+        from .dataset_scanner import scan_directory, format_scan_for_llm
+
         self.dataset_dir = Path(dataset_dir)
-        self._facts = _pre_analyze(self.dataset_dir)
+        scan = scan_directory(str(self.dataset_dir), max_depth=2)
+        self._scan_context = format_scan_for_llm(scan)
         self._file_preview = _sample_files(self.dataset_dir)
-        summary = _format_facts(self._facts)
-        return f"Dataset loaded: {self.dataset_dir.name}\n{summary}"
+        return f"Dataset loaded: {self.dataset_dir.name}\n{len(scan.files)} files/groups found."
 
     def send(self, user_message: str) -> str:
         """Send a message and get a response. Blocking call."""
@@ -621,16 +1147,16 @@ class ChatSession:
         if not self.api_key:
             return "Error: No Gemini API key configured. Set GOOGLE_API_KEY environment variable or enter it in Settings."
 
-        # Auto-analyze dataset on first message if not done yet.
-        if self._facts is None and self.dataset_dir and self.dataset_dir.is_dir():
+        # Auto-scan on first message if not done yet.
+        if self._scan_context is None and self.dataset_dir and self.dataset_dir.is_dir():
             self.set_dataset(self.dataset_dir)
 
-        # Build the context-enriched first user message.
+        # Build context block from scan results + file previews.
         context_block = ""
-        if self._facts:
+        if self._scan_context:
             context_block = (
-                f"\n\n[Dataset context — pre-analyzed facts]\n"
-                f"```\n{_format_facts(self._facts)}\n```\n\n"
+                f"\n\n[Dataset scan results]\n"
+                f"```\n{self._scan_context}\n```\n\n"
                 f"[Sample file content]\n{self._file_preview}\n\n"
             )
 
@@ -642,11 +1168,11 @@ class ChatSession:
                 parts=[genai.types.Part(text=msg["text"])],
             ))
 
-        # Add the new user message (with context on first message only).
+        # Attach context on first message, or when context hasn't been sent yet.
         enriched_message = user_message
         if not self.history and context_block:
             enriched_message = user_message + context_block
-        elif context_block and not any("Dataset context" in m["text"] for m in self.history):
+        elif context_block and not any("Dataset scan results" in m["text"] for m in self.history):
             enriched_message = user_message + context_block
 
         contents.append(genai.types.Content(
@@ -669,28 +1195,71 @@ class ChatSession:
         except Exception as e:
             reply = f"Error: {e}"
 
-        # Store in history (store enriched version so context is in history).
         self.history.append({"role": "user", "text": enriched_message})
         self.history.append({"role": "model", "text": reply})
 
         return reply
 
     def extract_readme(self, text: str) -> str | None:
-        """Extract README content from a ```readme ... ``` or ```json ... ``` fenced block in the response."""
-        import re
-        # Try ```readme first, then ```markdown, then look for the json schema block.
-        for pattern in [
-            r"```readme\s*\n(.*?)```",
-            r"```markdown\s*\n(.*?)```",
-        ]:
-            match = re.search(pattern, text, re.DOTALL)
-            if match:
-                return match.group(1).strip()
+        """Extract README content from a ```readme ... ``` fenced block.
+
+        The README itself contains nested fenced blocks (```json ... ```), so
+        we can't use a simple non-greedy match.  Instead, match the closing
+        ``` that appears on its own line (not followed by a language tag).
+        """
+        # Strategy: find the opening fence, then scan for the matching close.
+        for opener in ("```readme", "```markdown"):
+            start = text.find(opener)
+            if start == -1:
+                continue
+            # Skip past the opener line.
+            content_start = text.find("\n", start)
+            if content_start == -1:
+                continue
+            content_start += 1
+
+            # Walk through lines to find the matching closing ```.
+            # A closing ``` is a line that is exactly ``` (possibly with trailing whitespace),
+            # NOT followed by a language tag (like ```json).
+            depth = 0
+            pos = content_start
+            close_pos = None
+            while pos < len(text):
+                line_end = text.find("\n", pos)
+                if line_end == -1:
+                    line_end = len(text)
+                line = text[pos:line_end].strip()
+                if line.startswith("```") and len(line) > 3 and line[3:].strip().isalpha():
+                    # Opening a nested fence (e.g. ```json, ```python).
+                    depth += 1
+                elif line == "```":
+                    if depth > 0:
+                        depth -= 1
+                    else:
+                        # This is our closing fence.
+                        close_pos = pos
+                        break
+                pos = line_end + 1
+
+            if close_pos is not None:
+                return text[content_start:close_pos].strip()
+
         # Fallback: if the response contains a ```json block with "dataset_name",
-        # it's likely the full README.
+        # treat the entire response as the README.
         if '"dataset_name"' in text and "```json" in text:
-            # Return the full text as-is (it's already a README).
             return text.strip()
+        return None
+
+    def extract_loader(self, text: str) -> str | None:
+        """Extract loader.py content from a ```python ... ``` fenced block.
+
+        Only returns content if it contains 'def load_dataset'.
+        """
+        pattern = re.compile(r"```python\s*\n(.*?)```", re.DOTALL)
+        for match in pattern.finditer(text):
+            code = match.group(1).strip()
+            if "def load_dataset" in code:
+                return code
         return None
 
     def clear(self) -> None:
