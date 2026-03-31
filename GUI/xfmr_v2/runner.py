@@ -47,10 +47,10 @@ class TrainConfig:
 
     # Optimization settings.
     seed: int = 42
-    batch_size: int = 64
-    epochs: int = 500
-    patience: int = 50
-    learning_rate: float = 1e-3
+    batch_size: int = 16
+    epochs: int = 300
+    patience: int = 20
+    learning_rate: float = 1e-4
     weight_decay: float = 1e-4
     gradient_clip: float = 1.0
 
@@ -67,7 +67,7 @@ class TrainConfig:
     dropout: float = 0.05
 
     # Loss and scheduler settings.
-    loss_function: str = "mse"  # "mse" or "rmse"
+    loss_function: str = "rmse"  # "rmse" or "mse"
     scheduler: str = "plateau"   # "plateau" or "cosine"
 
     # Runtime controls.

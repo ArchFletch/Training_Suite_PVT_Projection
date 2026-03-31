@@ -108,7 +108,7 @@ exactly one role.
 4. If files in a directory have columns like freq, s11_real, s11_imag, or if
    touchstone files exist, those are ground_truth.
 5. Numpy/pickle arrays with 3D shape [N, freq, channels] are ground_truth.
-   Arrays with shape [N, H, W] where H and W are similar are layout.
+   Arrays with shape [N, H, W] are layout.
 6. For input_parameters entries, also specify which columns are features
    (exclude ID/name columns) and which column is the sample ID.
 7. Be concise.  Respond ONLY with valid JSON, no markdown fences.
@@ -146,7 +146,7 @@ def classify_dataset(
     scan: ScanResult,
     *,
     api_key: str | None = None,
-    model_name: str = "gemini-2.5-flash-lite",
+    model_name: str = "gemini-3-flash-preview",
 ) -> ClassificationResult:
     """Use an LLM to classify every file/group in *scan* into a role.
 

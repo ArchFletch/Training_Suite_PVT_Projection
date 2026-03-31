@@ -1,0 +1,4 @@
+CTLE:
+Train CTLE gain, take cs,ld,m,rd,rs,mn as input, gain is the ground truth,x-axis is 
+frequency, just drop VCM row, the dataset consisted of repeated construtions, 
+input parameters followed by 501 sweep points
