@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import pyqtgraph as pg
-from PySide6.QtCore import QObject, Qt, Signal, Slot
+from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -493,23 +493,12 @@ class MlpTrainingStudio(QMainWindow):
         self.advanced_paths_section = CollapsibleSection("Advanced", advanced)
         layout.addLayout(grid)
 
-        # Scan button and schema status — right after the main fields, before Advanced.
+        # Schema status badge — right after the main fields, before Advanced.
         button_row = QHBoxLayout()
-        self.scan_data_button = self._make_button("Scan Data")
-        self.scan_data_button.clicked.connect(self.scan_dataset)
-        button_row.addWidget(self.scan_data_button)
         self.dataset_schema_status_badge = StatusBadge("Not Scanned")
         button_row.addWidget(self.dataset_schema_status_badge)
         button_row.addStretch()
         layout.addLayout(button_row)
-
-        metadata_grid = QGridLayout()
-        metadata_grid.setHorizontalSpacing(10)
-        metadata_grid.setVerticalSpacing(8)
-        self.detected_dataset_readme_value = QLabel("Not detected yet")
-        self.detected_dataset_readme_value.setWordWrap(True)
-        self._add_form_row(metadata_grid, 0, "Detected Dataset README", self.detected_dataset_readme_value)
-        layout.addLayout(metadata_grid)
 
         layout.addWidget(self.advanced_paths_section)
         return card
@@ -818,11 +807,7 @@ class MlpTrainingStudio(QMainWindow):
         self._test_sample_plots: list[pg.PlotWidget] = []
         tabs.addTab(test_samples_scroll, "Test Samples")
 
-        chat_scroll = QScrollArea()
-        chat_scroll.setWidgetResizable(True)
-        chat_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-        chat_scroll.setWidget(self._build_chat_tab())
-        tabs.addTab(chat_scroll, "AI Assistant")
+        tabs.addTab(self._build_chat_tab(), "AI Assistant")
 
         self.monitor_tabs = tabs
         self._reset_baseline_plots()
@@ -841,21 +826,13 @@ class MlpTrainingStudio(QMainWindow):
         action_row.setSpacing(8)
 
         self.chat_generate_button = self._make_button("Set Up Dataset", secondary=True)
-        self.chat_generate_button.clicked.connect(lambda: self._chat_send_message(
-            "Scan my dataset folder, identify which files are input parameters and which are ground truth, "
-            "and generate a complete README.md with the correct schema so the training pipeline can load the data."
-        ))
+        self.chat_generate_button.clicked.connect(self._on_chat_setup_dataset)
         action_row.addWidget(self.chat_generate_button)
 
-        self.chat_save_loader_button = self._make_button("Save Loader", secondary=True)
-        self.chat_save_loader_button.clicked.connect(self._on_chat_save_loader)
-        self.chat_save_loader_button.setEnabled(False)
-        action_row.addWidget(self.chat_save_loader_button)
-
-        self.chat_save_readme_button = self._make_button("Save Last README", secondary=True)
-        self.chat_save_readme_button.clicked.connect(self._on_chat_save_readme)
-        self.chat_save_readme_button.setEnabled(False)
-        action_row.addWidget(self.chat_save_readme_button)
+        self.chat_run_loader_button = self._make_button("Run & Cache", secondary=True)
+        self.chat_run_loader_button.clicked.connect(self._on_chat_run_loader)
+        self.chat_run_loader_button.setEnabled(False)
+        action_row.addWidget(self.chat_run_loader_button)
 
         self.chat_clear_button = self._make_button("Clear Chat", secondary=True)
         self.chat_clear_button.clicked.connect(self._on_chat_clear)
@@ -1168,8 +1145,7 @@ class MlpTrainingStudio(QMainWindow):
                         f"gt_dir={payload.get('ground_truth_data_dir', '')!r}")
         self.last_scan_result = None
         self.dataset_schema_status_badge.set_status("Scanning")
-        self.detected_dataset_readme_value.setText("Starting dataset scan...")
-        self.scan_data_button.setText("Scanning...")
+        pass  # scan progress is shown via metric cards
         self._fill_table(self.data_preview_table, [("Status", "Scanning dataset and preparing cache...")])
         self._start_task(
             scan_dataset,
@@ -1476,13 +1452,26 @@ class MlpTrainingStudio(QMainWindow):
             return
         self._chat_send_message(message)
 
+    def _on_chat_setup_dataset(self) -> None:
+        """Handle the 'Set Up Dataset' button click."""
+        self._chat_send_message(
+            "Scan my dataset folder, identify which files are input parameters and which are ground truth, "
+            "and generate a loader.py with a load_dataset() function that loads the data into standardized numpy arrays."
+        )
+
     def _chat_send_message(self, message: str) -> None:
         """Send a message to the chat session in a background thread."""
+        dataset_dir = self._resolve_dataset_dir()
+        if not dataset_dir or not dataset_dir.is_dir():
+            self._show_warning("Please select a dataset folder first.")
+            return
         session = self._get_chat_session()
         if session is None:
+            # User cancelled API key dialog — already shown a dialog, nothing more to do.
             return
 
         self._chat_append("user", message)
+        self.append_log(f"[AI Assistant] Sending message to Gemini ({session.model_name})...")
         self.chat_input.clear()
         self.chat_send_button.setVisible(False)
         self.chat_stop_button.setVisible(True)
@@ -1515,13 +1504,11 @@ class MlpTrainingStudio(QMainWindow):
             loader_code = self._chat_session.extract_loader(reply)
             if loader_code:
                 self._last_loader_content = loader_code
-                self.chat_save_loader_button.setEnabled(True)
-                self._chat_append("system", "Loader detected in response. Click 'Save Loader' to write loader.py to disk.")
+                self.chat_run_loader_button.setEnabled(True)
+                self._chat_append("system", "Loader code detected. Click 'Run & Cache' to load the data.")
             readme = self._chat_session.extract_readme(reply)
             if readme:
                 self._last_readme_content = readme
-                self.chat_save_readme_button.setEnabled(True)
-                self._chat_append("system", "README detected in response. Click 'Save Last README' to write it to disk.")
 
     def _on_chat_save_readme(self) -> None:
         """Save the last README extracted from chat to the dataset directory."""
@@ -1562,7 +1549,6 @@ class MlpTrainingStudio(QMainWindow):
 
             # Always update the dataset folder to where we saved the README.
             self.dataset_folder_edit.setText(str(dataset_dir))
-            self.detected_dataset_readme_value.setText(str(path))
 
             # Try to parse the schema for validation and auto-fill.
             try:
@@ -1580,52 +1566,123 @@ class MlpTrainingStudio(QMainWindow):
         cancel_btn.clicked.connect(dialog.reject)
         dialog.exec()
 
-    def _on_chat_save_loader(self) -> None:
-        """Save the last loader.py extracted from chat to the dataset directory."""
+    def _on_chat_run_loader(self) -> None:
+        """Execute the LLM-generated loader code in memory and cache the result."""
+        from .data import build_cache_from_loader
+
         if not getattr(self, "_last_loader_content", None):
             self._show_warning("No loader code found in the chat history.")
             return
 
         dataset_dir = self._resolve_dataset_dir()
         if not dataset_dir or not dataset_dir.is_dir():
-            self._show_warning("Set the data paths first so we know where to save loader.py.")
+            self._show_warning("Set the data paths first.")
             return
 
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Save loader.py")
-        dialog.resize(700, 500)
-        dlayout = QVBoxLayout(dialog)
-        dlayout.addWidget(QLabel(f"Saving to: {dataset_dir}/loader.py\nReview and edit if needed:"))
-        editor = QPlainTextEdit()
-        editor.setPlainText(self._last_loader_content)
-        editor.setFont(self.font())
-        dlayout.addWidget(editor)
-        btn_row = QHBoxLayout()
-        save_btn = QPushButton("Save loader.py")
-        cancel_btn = QPushButton("Cancel")
-        btn_row.addStretch()
-        btn_row.addWidget(cancel_btn)
-        btn_row.addWidget(save_btn)
-        dlayout.addLayout(btn_row)
+        cache_path = self._ensure_cache_path()
+        self._chat_append("system", "Running loader code...")
 
-        def _save():
-            final = editor.toPlainText()
-            path = dataset_dir / "loader.py"
-            path.write_text(final, encoding="utf-8")
-            self.append_log(f"loader.py saved to {path}")
-            self._chat_append("system", f"Loader saved to {path}")
-            self.dataset_folder_edit.setText(str(dataset_dir))
-            dialog.accept()
+        def _run(progress_callback=None, should_stop=None):
+            return build_cache_from_loader(
+                loader_code=self._last_loader_content,
+                dataset_root=str(dataset_dir),
+                cache_path=cache_path,
+                progress_callback=progress_callback,
+            )
 
-        save_btn.clicked.connect(_save)
-        cancel_btn.clicked.connect(dialog.reject)
-        dialog.exec()
+        self._start_task(
+            _run,
+            kwargs={},
+            task_name="loader_run",
+            busy_state="Loading",
+            on_result=self._on_loader_run_completed,
+        )
+
+    def _on_loader_run_completed(self, result: dict[str, Any]) -> None:
+        """Handle successful loader execution — treat like a scan result."""
+        from .data import load_split_bundle
+
+        cache_path = result["cache_path"]
+        self._set_cache_path_value(cache_path, manually_selected=False)
+
+        bundle = load_split_bundle(
+            cache_path=cache_path, batch_size=16, seed=42,
+            train_frac=0.8, val_frac=0.1, pin_memory=False,
+        )
+
+        schema = result.get("dataset_schema", {})
+        preview_rows = [
+            ("Samples", str(result["num_samples"])),
+            ("Channels", str(result["num_channels"])),
+            ("Sweep Points", str(result["num_frequencies"])),
+            ("Dataset Name", result["dataset_name"]),
+            ("Cache Status", result["status"]),
+        ]
+
+        scan_result = {
+            "status": "ok",
+            "cache_summary": result,
+            "schema_status": "Valid (loader)",
+            "dataset_name": result["dataset_name"],
+            "readme_path": "",
+            "dataset_root": result["dataset_root"],
+            "input_feature_path": "",
+            "ground_truth_data_dir": result["ground_truth_data_dir"],
+            "cache_path": cache_path,
+            "schema": schema,
+            "preview_rows": preview_rows,
+            "active_input_feature_names": bundle.active_names,
+            "dropped_input_feature_names": bundle.dropped_names,
+            "frequency_count": result["num_frequencies"],
+            "frequency_range_ghz": [
+                float(bundle.frequency_ghz.min()),
+                float(bundle.frequency_ghz.max()),
+            ],
+            "sweep_label": getattr(bundle, "sweep_label", "Frequency (GHz)"),
+        }
+        self._on_scan_completed(scan_result)
+        msg = (f"Data loaded and cached: {result['num_samples']} samples, "
+               f"{result['num_channels']} channels, {result['num_frequencies']} sweep points.")
+
+        # Show validation warnings if any.
+        warnings = result.get("validation_warnings", [])
+        if warnings:
+            warning_text = "\n".join(f"  - {w}" for w in warnings)
+            self._chat_append("system",
+                              f"{msg}\n\nData validation warnings:\n{warning_text}")
+            self.append_log(f"[Run & Cache] {msg} (with warnings)")
+        else:
+            self._chat_append("system", f"{msg} Ready to train.")
+            self.append_log(f"[Run & Cache] {msg}")
 
     def _on_chat_stop(self) -> None:
         """Stop the current chat request."""
         if self.current_task is not None and self.current_task_name == "chat_msg":
-            self.current_task.stop()
+            task = self.current_task
+            # Disconnect signals on the runner so the stale response is ignored.
+            if task.runner is not None:
+                try:
+                    task.runner.signals.result.disconnect()
+                    task.runner.signals.error.disconnect()
+                except (RuntimeError, TypeError):
+                    pass
+            # Request the worker to stop.
+            task.stop()
+            # Retire the old thread safely so it isn't destroyed while running.
+            if task.thread is not None:
+                thread = task.thread
+                try:
+                    thread.finished.disconnect(self._handle_task_finished)
+                except (RuntimeError, TypeError):
+                    pass
+                if not hasattr(self, "_retiring_threads"):
+                    self._retiring_threads: list[QThread] = []
+                self._retiring_threads.append(thread)
+                thread.finished.connect(lambda t=thread: self._retire_thread(t))
             self.current_task = None
+            self.current_task_name = "idle"
+            self._set_action_controls_enabled(True)
+            self.run_state_badge.set_status("Idle")
         self.chat_stop_button.setVisible(False)
         self.chat_send_button.setVisible(True)
         self.chat_input.setEnabled(True)
@@ -1637,7 +1694,8 @@ class MlpTrainingStudio(QMainWindow):
             self._chat_session.clear()
         self.chat_display.clear()
         self._last_readme_content = None
-        self.chat_save_readme_button.setEnabled(False)
+        self._last_loader_content = None
+        self.chat_run_loader_button.setEnabled(False)
 
     def browse_cache_path(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "Select Cache File", self.cache_path_edit.text(), "NumPy Cache (*.npz)")
@@ -1805,8 +1863,7 @@ class MlpTrainingStudio(QMainWindow):
         self.run_state_badge.set_status("Error")
         if self.current_task_name == "scan":
             self.dataset_schema_status_badge.set_status("Error")
-            self.detected_dataset_readme_value.setText("Scan failed. See the run log for details.")
-            self.scan_data_button.setText("Scan Data")
+            pass
         if self.current_task_name == "readme_gen":
             pass  # readme generation recovered
         if self.current_task_name == "chat_msg":
@@ -1815,15 +1872,57 @@ class MlpTrainingStudio(QMainWindow):
             self.chat_input.setEnabled(True)
             self._chat_append("system", f"Error: {message}")
             return  # Don't show popup for chat errors — just show in chat.
+        if self.current_task_name == "loader_run":
+            self._chat_append("system", f"Loader failed: {message}")
+            self.append_log(f"[Run & Cache] Error: {message}")
+            return
         self.append_log(f"Error: {message}")
         self._show_warning(f"{message}\n\n{traceback_text}")
+
+    def _force_clear_task_state(self) -> None:
+        """Reset task bookkeeping so a new task can start immediately.
+
+        This is needed when an error or result callback wants to chain into a
+        follow-up task (e.g. auto-sending loader errors to the LLM).  The Qt
+        ``finished`` signal travels through ``thread.quit → thread.finished``
+        and arrives asynchronously, so ``current_task`` is still set when the
+        error/result callback fires.  Clearing it here avoids the "A task is
+        already running" guard in ``_start_task``.
+
+        The old thread is kept alive until it finishes quitting — dropping
+        the reference too early causes "QThread destroyed while still running".
+        """
+        old_task = self.current_task
+        if old_task is not None and old_task.thread is not None:
+            thread = old_task.thread
+            # Disconnect the old finished handler so it doesn't clobber the
+            # new task's bookkeeping when it finally fires.
+            try:
+                thread.finished.disconnect(self._handle_task_finished)
+            except (RuntimeError, TypeError):
+                pass
+            # Keep old thread alive until it actually finishes, then clean up.
+            if not hasattr(self, "_retiring_threads"):
+                self._retiring_threads: list[QThread] = []
+            self._retiring_threads.append(thread)
+            thread.finished.connect(lambda t=thread: self._retire_thread(t))
+        self.current_task = None
+        self.current_task_name = "idle"
+        self._set_action_controls_enabled(True)
+        self.stop_training_button.setEnabled(False)
+
+    def _retire_thread(self, thread: QThread) -> None:
+        """Remove a finished thread from the retirement list."""
+        try:
+            self._retiring_threads.remove(thread)
+        except ValueError:
+            pass
 
     def _handle_task_finished(self) -> None:
         self.current_task = None
         self.current_task_name = "idle"
         self._set_action_controls_enabled(True)
         self.stop_training_button.setEnabled(False)
-        self.scan_data_button.setText("Scan Data")
         if self.run_state_badge.text() in {"Training", "Transfer", "Searching", "Scanning", "Suggesting", "Checking", "Chat"}:
             self.run_state_badge.set_status("Idle")
 
@@ -1869,10 +1968,8 @@ class MlpTrainingStudio(QMainWindow):
         self.last_scan_result = result
         self._sweep_label = result.get("sweep_label", "Frequency (GHz)")
         self.dataset_schema_status_badge.set_status(result.get("schema_status", "Valid"))
-        self.detected_dataset_readme_value.setText(result.get("readme_path") or "Not found")
         self._fill_table(self.data_preview_table, result["preview_rows"])
         self._set_cache_path_value(result["cache_path"], manually_selected=self._cache_path_manually_selected)
-        self.scan_data_button.setText("Scan Data")
         self.append_log(f"Dataset scan completed for {result['dataset_name']}.")
         self._reset_baseline_plots()
         self._reset_transfer_plots()
@@ -1976,14 +2073,10 @@ class MlpTrainingStudio(QMainWindow):
         if event == "started":
             self.run_progress_bar.setValue(0)
             self.metric_cards["secondary_progress"].set_value("Preparing dataset paths")
-            self.detected_dataset_readme_value.setText("Validating dataset paths...")
-            self.scan_data_button.setText("Scanning...")
             return
 
         if event == "schema_ready":
             self.run_progress_bar.setValue(max(self.run_progress_bar.value(), 5))
-            readme_path = payload.get("readme_path")
-            self.detected_dataset_readme_value.setText(str(readme_path) if readme_path else "README schema not found yet")
             dataset_name = payload.get("dataset_name")
             if dataset_name:
                 self.metric_cards["secondary_progress"].set_value(str(dataset_name))
@@ -1994,7 +2087,6 @@ class MlpTrainingStudio(QMainWindow):
             self.run_progress_bar.setValue(max(self.run_progress_bar.value(), 10))
             if total_samples is not None:
                 self.metric_cards["secondary_progress"].set_value(f"{int(total_samples)} input rows loaded")
-                self.detected_dataset_readme_value.setText(f"Queued {int(total_samples)} samples for cache building...")
             return
 
         if event == "cache_build_started":
@@ -2002,7 +2094,6 @@ class MlpTrainingStudio(QMainWindow):
             total_samples = payload.get("total_samples")
             if total_samples is not None:
                 self.metric_cards["secondary_progress"].set_value(f"0/{int(total_samples)} ground-truth files")
-                self.detected_dataset_readme_value.setText(f"Building cache from {int(total_samples)} samples...")
             return
 
         if event == "cache_overwrite_started":
@@ -2011,19 +2102,15 @@ class MlpTrainingStudio(QMainWindow):
             if cache_path:
                 cache_name = Path(str(cache_path)).name
                 self.metric_cards["secondary_progress"].set_value(cache_name)
-                self.detected_dataset_readme_value.setText(f"Rebuilding auto-managed cache {cache_name}...")
             return
 
         if event == "cache_progress":
             completed_samples = payload.get("completed_samples")
             total_samples = payload.get("total_samples")
             if completed_samples is not None and total_samples:
-                percent = int(100.0 * int(completed_samples) / max(int(total_samples), 1))
                 scan_progress = 15 + int(70.0 * int(completed_samples) / max(int(total_samples), 1))
                 self.run_progress_bar.setValue(max(self.run_progress_bar.value(), min(scan_progress, 85)))
                 self.metric_cards["secondary_progress"].set_value(f"{int(completed_samples)}/{int(total_samples)} ground-truth files")
-                self.detected_dataset_readme_value.setText(f"Building cache: {int(completed_samples)}/{int(total_samples)} samples loaded...")
-                self.scan_data_button.setText(f"Scanning... {percent}%")
             return
 
         if event == "cache_existing":
@@ -2032,8 +2119,6 @@ class MlpTrainingStudio(QMainWindow):
             frequency_count = payload.get("frequency_count")
             if total_samples is not None and frequency_count is not None:
                 self.metric_cards["secondary_progress"].set_value(f"{int(total_samples)} samples | {int(frequency_count)} freq")
-            self.detected_dataset_readme_value.setText("Existing cache matches this dataset.")
-            self.scan_data_button.setText("Scanning... cached")
             return
 
         if event == "cache_write_started":
@@ -2041,7 +2126,6 @@ class MlpTrainingStudio(QMainWindow):
             cache_path = payload.get("cache_path")
             if cache_path:
                 self.metric_cards["secondary_progress"].set_value(Path(str(cache_path)).name)
-                self.detected_dataset_readme_value.setText(f"Writing cache to {Path(str(cache_path)).name}...")
             return
 
         if event == "cache_saved":
@@ -2049,14 +2133,11 @@ class MlpTrainingStudio(QMainWindow):
             cache_path = payload.get("cache_path")
             if cache_path:
                 self.metric_cards["secondary_progress"].set_value(Path(str(cache_path)).name)
-                self.detected_dataset_readme_value.setText(f"Cache saved to {Path(str(cache_path)).name}.")
             return
 
         if event == "split_loading_started":
             self.run_progress_bar.setValue(max(self.run_progress_bar.value(), 97))
             self.metric_cards["secondary_progress"].set_value("Preparing train / val / test loaders")
-            self.detected_dataset_readme_value.setText("Preparing train, validation, and test splits...")
-            self.scan_data_button.setText("Scanning... finalizing")
             return
 
         if event == "completed":
@@ -2065,7 +2146,6 @@ class MlpTrainingStudio(QMainWindow):
             frequency_count = payload.get("frequency_count")
             if dataset_name and frequency_count is not None:
                 self.metric_cards["secondary_progress"].set_value(f"{dataset_name} | {int(frequency_count)} freq")
-            self.scan_data_button.setText("Scan Data")
 
     def _update_suggest_progress(self, payload: dict[str, Any]) -> None:
         event = payload.get("event")
@@ -2549,7 +2629,6 @@ class MlpTrainingStudio(QMainWindow):
             self.load_config_button,
             self.save_config_button,
             self.recheck_hardware_button,
-            self.scan_data_button,
             self.suggest_initial_settings_button,
             self.start_baseline_button,
             self.start_transfer_button,
@@ -2932,31 +3011,17 @@ class MlpTrainingStudio(QMainWindow):
         if dataset_dir:
             self.input_feature_path_edit.clear()
             self.ground_truth_data_folder_path_edit.clear()
-        # Check for existing README in the selected folder.
         if dataset_dir:
-            d = Path(dataset_dir)
-            for readme_name in ("README.md", "README.txt"):
-                readme_path = d / readme_name
-                if readme_path.is_file():
-                    self.detected_dataset_readme_value.setText(str(readme_path))
-                    try:
-                        from .dataset_schema import parse_dataset_readme
-                        parse_dataset_readme(readme_path)
-                        self.dataset_schema_status_badge.set_status("Valid")
-                    except Exception:
-                        self.dataset_schema_status_badge.set_status("Error")
-                    break
-            else:
-                self.detected_dataset_readme_value.setText("No README found — use AI Assistant to generate one")
-                self.dataset_schema_status_badge.set_status("Not Scanned")
+            self.dataset_schema_status_badge.set_status("Not Scanned")
         # Reset chat session so the next chat message rescans the new folder.
         if self._chat_session is not None:
             new_dir = Path(dataset_dir) if dataset_dir else None
             if new_dir and (self._chat_session.dataset_dir is None or str(new_dir) != str(self._chat_session.dataset_dir)):
                 self._chat_session = None
                 self._last_readme_content = None
-                self.chat_save_readme_button.setEnabled(False)
-        self._sync_auto_cache_path()
+                self._last_loader_content = None
+                self.chat_run_loader_button.setEnabled(False)
+                self._sync_auto_cache_path()
         self._update_topbar_run_name()
 
     def _autofill_run_name_from_gt_dir(self) -> None:

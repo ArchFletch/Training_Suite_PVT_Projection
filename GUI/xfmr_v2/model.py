@@ -51,7 +51,7 @@ class MLP(nn.Module):
         dim = in_dim
         # Build `depth - 1` hidden blocks, then end with a final linear projection.
         for _ in range(depth - 1):
-            layers += [nn.Linear(dim, hidden), nn.LayerNorm(hidden), nn.GELU()]
+            layers += [nn.Linear(dim, hidden), nn.SiLU()]
             if dropout > 0.0:
                 layers.append(nn.Dropout(dropout))
             dim = hidden

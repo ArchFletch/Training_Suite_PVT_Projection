@@ -97,302 +97,259 @@ class SplitBundle:
 
 
 # ---------------------------------------------------------------------------
-# LLM-generated loader execution
+# LLM-generated loader execution (in-memory, no files saved to disk)
 # ---------------------------------------------------------------------------
-# Allowed modules for the sandboxed loader environment.
 _LOADER_ALLOWED_MODULES = {
     "csv", "re", "json", "math", "struct", "io", "os.path",
     "numpy", "pathlib",
 }
 
 
-def _try_run_llm_loader(
-    dataset_root: Path,
-    max_samples: int | None,
-    emit,
-) -> dict[str, Any] | None:
-    """Try to execute a loader.py in the dataset root.
+def run_loader_code(
+    code: str,
+    dataset_root: str | Path,
+    max_samples: int | None = None,
+) -> dict[str, Any]:
+    """Execute LLM-generated loader code in memory and return standardized arrays.
 
-    The loader.py must define a ``load_dataset(root, max_samples=None)``
-    function that returns a dict with at least::
+    The code must define ``load_dataset(dataset_root, max_samples=None)``
+    returning a dict with at least ``features``, ``targets``, ``sweep_axis``.
 
-        {
-            "features":      np.ndarray,  # (num_samples, num_features)
-            "targets":       np.ndarray,  # (num_samples, num_channels, num_sweep_points)
-            "sweep_axis":    np.ndarray,  # (num_sweep_points,)
-        }
-
-    Optional keys: ``feature_names``, ``channel_names``, ``target_names``,
-    ``channel_units``, ``sweep_label``, ``dataset_name``.
-
-    Returns None if loader.py does not exist or fails.
+    Raises ValueError on any failure (compilation, execution, validation).
     """
-    loader_path = dataset_root / "loader.py"
-    if not loader_path.is_file():
-        return None
-
-    emit("loader_detected", f"Found loader.py in {dataset_root.name}.")
-
-    code = loader_path.read_text(encoding="utf-8")
-
-    # Build a restricted execution environment.
     import importlib
-    safe_globals: dict[str, Any] = {"__builtins__": {
-        # Safe builtins only.
-        "range": range, "len": len, "int": int, "float": float, "str": str,
-        "bool": bool, "list": list, "dict": dict, "tuple": tuple, "set": set,
-        "enumerate": enumerate, "zip": zip, "map": map, "filter": filter,
-        "sorted": sorted, "reversed": reversed, "min": min, "max": max,
-        "sum": sum, "abs": abs, "round": round, "any": any, "all": all,
-        "isinstance": isinstance, "type": type, "hasattr": hasattr,
-        "getattr": getattr, "setattr": setattr,
-        "print": print, "open": open,
-        "ValueError": ValueError, "KeyError": KeyError, "TypeError": TypeError,
-        "IndexError": IndexError, "FileNotFoundError": FileNotFoundError,
-        "Exception": Exception, "StopIteration": StopIteration,
-        "None": None, "True": True, "False": False,
-        "__import__": __import__,
-    }}
+    import builtins
 
-    # Pre-import allowed modules.
+    # Use standard builtins — the code is LLM-generated and user-approved.
+    safe_globals: dict[str, Any] = {"__builtins__": builtins}
+
     for mod_name in _LOADER_ALLOWED_MODULES:
         try:
             safe_globals[mod_name.split(".")[0]] = importlib.import_module(mod_name)
         except ImportError:
             pass
-    # numpy shorthand
     safe_globals["np"] = safe_globals.get("numpy")
     safe_globals["Path"] = Path
 
     try:
-        exec(compile(code, str(loader_path), "exec"), safe_globals)
+        exec(compile(code, "<loader>", "exec"), safe_globals)
     except Exception as exc:
-        emit("loader_error", f"loader.py compilation failed: {exc}")
-        return None
+        raise ValueError(f"Loader code compilation failed: {exc}") from exc
 
     load_fn = safe_globals.get("load_dataset")
     if load_fn is None:
-        emit("loader_error", "loader.py must define a 'load_dataset' function.")
-        return None
+        raise ValueError("Loader code must define a 'load_dataset' function.")
 
     try:
-        emit("loader_running", "Executing loader.py ...")
         result = load_fn(str(dataset_root), max_samples=max_samples)
     except Exception as exc:
-        emit("loader_error", f"loader.py execution failed: {exc}")
-        return None
+        raise ValueError(f"Loader execution failed: {exc}") from exc
 
-    # Validate the result.
     required = {"features", "targets", "sweep_axis"}
     missing = required - set(result.keys())
     if missing:
-        emit("loader_error", f"loader.py result missing keys: {missing}")
-        return None
+        raise ValueError(f"Loader result missing keys: {missing}")
 
     features = np.asarray(result["features"], dtype=np.float32)
     targets = np.asarray(result["targets"], dtype=np.float32)
     sweep = np.asarray(result["sweep_axis"], dtype=np.float32)
 
     if features.ndim != 2:
-        emit("loader_error", f"features must be 2D (samples, features), got shape {features.shape}")
-        return None
+        raise ValueError(f"features must be 2D (samples, features), got shape {features.shape}")
     if targets.ndim == 2:
-        # (samples, sweep_points) -> (samples, 1, sweep_points)
         targets = targets[:, np.newaxis, :]
     if targets.ndim != 3:
-        emit("loader_error", f"targets must be 2D or 3D, got shape {targets.shape}")
-        return None
-
-    emit("loader_done",
-         f"loader.py returned {features.shape[0]} samples, "
-         f"{targets.shape[1]} channels, {targets.shape[2]} sweep points.")
+        raise ValueError(f"targets must be 2D or 3D, got shape {targets.shape}")
 
     result["features"] = features
     result["targets"] = targets
     result["sweep_axis"] = sweep
+
+    # --- Validate the loaded data ---
+    warnings = _validate_loader_output(features, targets, sweep, result)
+    if warnings:
+        result["validation_warnings"] = warnings
+
     return result
 
 
-# Public cache and split API.
-def build_cache(
-    data_root: str | Path | None = DATA_ROOT,
-    cache_path: str | Path = CACHE_PATH,
-    overwrite: bool = False,
-    max_samples: int | None = None,
-    input_feature_path: str | Path | None = None,
-    ground_truth_data_dir: str | Path | None = None,
-    progress_callback=None,
-    should_stop=None,
-) -> dict[str, Any]:
-    """Read one dataset once and save a compact local cache."""
+def _validate_loader_output(
+    features: np.ndarray,
+    targets: np.ndarray,
+    sweep: np.ndarray,
+    result: dict[str, Any],
+) -> list[str]:
+    """Check for common data loading issues. Returns a list of warning strings."""
+    warnings: list[str] = []
+    num_samples = features.shape[0]
+    num_channels = targets.shape[1]
+    num_sweep = targets.shape[2]
 
-    def emit(event: str, message: str, **payload: Any) -> None:
-        if progress_callback is None:
-            return
-        progress_callback(
-            {
-                "phase": "scan",
-                "event": event,
-                "message": message,
-                **payload,
-            }
+    # 1. Sample count sanity
+    if num_samples < 2:
+        warnings.append(
+            f"Only {num_samples} sample(s) loaded. This is likely a parsing error — "
+            f"check that sample boundaries are detected correctly."
         )
 
-    dataset_root_path = Path(data_root) if data_root not in (None, "") else None
+    # 2. NaN / Inf check
+    nan_features = np.isnan(features).sum()
+    nan_targets = np.isnan(targets).sum()
+    inf_targets = np.isinf(targets).sum()
+    if nan_features > 0:
+        warnings.append(f"Features contain {nan_features} NaN values.")
+    if nan_targets > 0:
+        warnings.append(f"Targets contain {nan_targets} NaN values.")
+    if inf_targets > 0:
+        warnings.append(f"Targets contain {inf_targets} Inf values.")
+
+    # 3. Extreme target values (likely parser bug or simulator error)
+    target_absmax = float(np.abs(targets).max())
+    target_p99 = float(np.percentile(np.abs(targets), 99))
+    if target_absmax > 10 * target_p99 and target_p99 > 0:
+        warnings.append(
+            f"Target max |{target_absmax:.2f}| is >10x the 99th percentile |{target_p99:.2f}|. "
+            f"This suggests extreme outliers or parser errors."
+        )
+
+    # 4. Constant targets (all same value for a channel)
+    for ch in range(num_channels):
+        ch_std = float(targets[:, ch, :].std())
+        ch_name = result.get("channel_names", [f"ch{ch}"])[ch] if ch < len(result.get("channel_names", [])) else f"ch{ch}"
+        if ch_std < 1e-10:
+            warnings.append(f"Channel '{ch_name}' has zero variance — all values are identical.")
+
+    # 5. Sweep axis issues
+    if len(sweep) < 2:
+        warnings.append(f"Sweep axis has only {len(sweep)} point(s).")
+    elif not np.all(np.diff(sweep) > 0) and not np.all(np.diff(sweep) < 0):
+        warnings.append("Sweep axis is not monotonically increasing or decreasing.")
+
+    # 6. Suspiciously many sweep points per sample (likely merged samples)
+    if num_sweep > 10000:
+        warnings.append(
+            f"Each sample has {num_sweep} sweep points — this is unusually high. "
+            f"Check that sample boundaries are being detected correctly."
+        )
+
+    # 7. Feature variance check
+    for i in range(features.shape[1]):
+        col = features[:, i]
+        if col.max() == col.min() and num_samples > 1:
+            fname = result.get("feature_names", [f"x{i}"])[i] if i < len(result.get("feature_names", [])) else f"x{i}"
+            warnings.append(f"Feature '{fname}' is constant (value={col[0]:.6g}) — will be dropped during training.")
+
+    return warnings
+
+
+# Public cache and split API.
+def load_existing_cache(
+    cache_path: str | Path,
+    progress_callback=None,
+) -> dict[str, Any]:
+    """Load an existing .npz cache and return its summary metadata.
+
+    This does NOT build a cache from raw data.  Use ``build_cache_from_loader``
+    to create a new cache via LLM-generated loader code.
+    """
+    def emit(event: str, message: str, **payload: Any) -> None:
+        if progress_callback is not None:
+            progress_callback({"phase": "scan", "event": event, "message": message, **payload})
+
     cache_path = Path(cache_path)
     meta_path = cache_path.with_suffix(".json")
 
-    # ---------- Strategy 0: LLM-generated loader.py ----------
-    # If the dataset root contains a loader.py, execute it directly.
-    # This bypasses all schema parsing and format-specific loaders.
-    loader_result = None
-    if dataset_root_path is not None:
-        loader_result = _try_run_llm_loader(dataset_root_path, max_samples, emit)
-
-    if loader_result is not None:
-        features = loader_result["features"]
-        targets = loader_result["targets"]
-        frequency_hz = loader_result["sweep_axis"]
-        feature_names = loader_result.get("feature_names", [f"x{i}" for i in range(features.shape[1])])
-        channel_names_list = loader_result.get("channel_names", [f"ch{i}" for i in range(targets.shape[1])])
-        target_names = loader_result.get("target_names", channel_names_list)
-        channel_unit_list = loader_result.get("channel_units", [""] * len(channel_names_list))
-        channel_transform_list = loader_result.get("channel_transforms", [""] * len(channel_names_list))
-        sweep_label = loader_result.get("sweep_label", "Frequency (GHz)")
-        dataset_name = loader_result.get("dataset_name", dataset_root_path.name)
-
-        # Build a minimal schema for cache metadata compatibility.
-        schema = DatasetSchema(
-            dataset_name=dataset_name,
-            input_feature=InputFeatureSchema(
-                columns=tuple(feature_names),
-                feature_columns=tuple(feature_names),
-                file_path="loader.py",
-            ),
-            ground_truth=Ground_TruthSchema(
-                source="loader",
-                ground_truth_parameters=tuple(target_names),
-                sweep_label=sweep_label,
-            ),
-            readme_path=dataset_root_path / "loader.py",
-        )
-        sources = DataSources(
-            dataset_root=dataset_root_path,
-            input_feature_path=dataset_root_path / "loader.py",
-            ground_truth_data_dir=dataset_root_path,
-        )
-    else:
-        # ---------- Strategy 1 & 2: Schema-based loading ----------
-        schema = None
-        has_explicit_paths = (
-            input_feature_path not in (None, "")
-            or ground_truth_data_dir not in (None, "")
+    if not cache_path.exists():
+        raise FileNotFoundError(
+            f"Cache file not found: {cache_path}\n"
+            "Use the AI Assistant to generate a loader, then click 'Run & Cache'."
         )
 
-        if not has_explicit_paths and dataset_root_path is not None:
-            schema = _try_load_schema_from_root(dataset_root_path)
-            if schema is not None and (schema.input_feature.file_path or schema.ground_truth.data_dir):
-                sources = resolve_data_sources_from_schema(dataset_root_path, schema)
-            else:
-                sources = resolve_data_sources(data_root=data_root)
-        else:
-            sources = resolve_data_sources(
-                data_root=data_root,
-                input_feature_path=input_feature_path,
-                ground_truth_data_dir=ground_truth_data_dir,
-            )
-
-        if schema is None:
-            schema = _load_dataset_schema_from_sources(sources)
-        if schema is None:
-            raise FileNotFoundError(
-                "No loader.py or README schema found. "
-                "Use the AI Assistant to generate a loader for your dataset."
-            )
-        emit(
-            "schema_ready",
-            f"Loaded dataset schema for {schema.dataset_name}.",
-            dataset_name=schema.dataset_name,
-            readme_path=str(schema.readme_path) if schema.readme_path is not None else None,
-        )
-
-    # Reuse an existing cache when both the data paths and the schema match.
-    if cache_path.exists() and not overwrite:
+    with np.load(cache_path, allow_pickle=False) as data:
+        summary = {
+            "status": "existing",
+            "cache_path": str(cache_path.resolve()),
+            "num_samples": int(data["features"].shape[0]),
+            "num_features": int(data["features"].shape[1]),
+            "num_channels": int(data["targets"].shape[1]),
+            "num_frequencies": int(data["frequency_hz"].shape[0]),
+        }
+        # Read metadata from the .json sidecar if available.
         if meta_path.exists():
-            existing_meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            if not _cache_matches_sources(existing_meta, sources, schema):
-                raise ValueError(
-                    "Cache path already exists for different data sources or schema metadata. "
-                    "Choose another cache path or pass overwrite=True."
-                )
-        with np.load(cache_path, allow_pickle=False) as data:
-            summary = {
-                "status": "existing",
-                "cache_path": str(cache_path.resolve()),
-                **_cache_source_metadata(sources, schema),
-                "num_samples": int(data["features"].shape[0]),
-                "num_frequencies": int(data["frequency_hz"].shape[0]),
-            }
-        emit(
-            "cache_existing",
-            f"Using existing cache {cache_path.name}.",
-            cache_path=summary["cache_path"],
-            total_samples=summary["num_samples"],
-            frequency_count=summary["num_frequencies"],
-        )
-        return summary
-
-    # If loader.py already produced the arrays, skip format-specific dispatch.
-    if loader_result is None:
-        src = schema.ground_truth.source
-        if src == "inline":
-            if schema.ground_truth.channel_files:
-                features, targets, frequency_hz = _build_cadence_csv_arrays(
-                    sources, schema, max_samples, emit,
-                )
-            else:
-                features, targets, frequency_hz = _build_inline_arrays(
-                    sources, schema, max_samples, emit,
-                )
-        elif src == "per_sample":
-            features, targets, frequency_hz = _build_per_sample_arrays(
-                sources, schema, max_samples, emit,
-            )
-        elif src == "array":
-            features, targets, frequency_hz = _build_numpy_array(
-                sources, schema, max_samples, emit,
-            )
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            summary["dataset_name"] = meta.get("dataset_name", cache_path.stem)
+            summary["dataset_root"] = meta.get("dataset_root", "")
+            summary["input_feature_path"] = meta.get("input_feature_path", "")
+            summary["ground_truth_data_dir"] = meta.get("ground_truth_data_dir", "")
+            summary["readme_path"] = meta.get("readme_path", "")
+            summary["dataset_schema"] = meta.get("dataset_schema", {})
         else:
-            raise ValueError(f"Unsupported ground-truth source: {src!r}")
+            summary["dataset_name"] = cache_path.stem
+            summary["dataset_root"] = ""
+            summary["input_feature_path"] = ""
+            summary["ground_truth_data_dir"] = ""
+            summary["readme_path"] = ""
+            summary["dataset_schema"] = {}
 
-        # Build per-channel unit and transform lists from schema.
-        _PART_UNITS = {"db": "dB", "angle_deg": "deg", "mag": "", "re": "", "im": "", "raw": ""}
-        unit_map = schema.ground_truth.channel_unit_map
-        transform_map = schema.ground_truth.channel_transform_map
-        channel_names_list = schema.ground_truth.channel_names
-        gt_parts = list(schema.ground_truth.ground_truth_parts)
-        channel_unit_list = []
-        for i, ch in enumerate(channel_names_list):
-            explicit = unit_map.get(ch, "")
-            if explicit:
-                channel_unit_list.append(explicit)
-            else:
-                part = gt_parts[i % len(gt_parts)] if gt_parts else ""
-                channel_unit_list.append(_PART_UNITS.get(part, ""))
-        channel_transform_list = [transform_map.get(ch, "") for ch in channel_names_list]
-        targets = _apply_channel_transforms(targets, channel_transform_list)
-        sweep_label = schema.ground_truth.sweep_label or "Frequency (GHz)"
-        feature_names = list(schema.input_feature.feature_columns)
-        target_names = list(schema.ground_truth.ground_truth_parameters)
+    emit("cache_existing", f"Loaded existing cache: {summary['num_samples']} samples.",
+         cache_path=summary["cache_path"],
+         total_samples=summary["num_samples"],
+         frequency_count=summary["num_frequencies"])
+    return summary
 
-    total_samples = int(features.shape[0])
+
+def build_cache_from_loader(
+    loader_code: str,
+    dataset_root: str | Path,
+    cache_path: str | Path,
+    max_samples: int | None = None,
+    progress_callback=None,
+) -> dict[str, Any]:
+    """Execute LLM-generated loader code in memory and save the result as a cache.
+
+    This is the primary entry point for the LLM-based loading flow. The code
+    runs once in memory, produces standardized arrays, and saves them to the
+    cache. No files are written to the dataset directory.
+    """
+    def emit(event: str, message: str, **payload: Any) -> None:
+        if progress_callback is not None:
+            progress_callback({"phase": "scan", "event": event, "message": message, **payload})
+
+    emit("loader_running", "Executing AI-generated loader code...")
+    result = run_loader_code(loader_code, dataset_root, max_samples)
+
+    features = result["features"]
+    targets = result["targets"]
+    frequency_hz = result["sweep_axis"]
+    feature_names = result.get("feature_names", [f"x{i}" for i in range(features.shape[1])])
+    channel_names_list = result.get("channel_names", [f"ch{i}" for i in range(targets.shape[1])])
+    target_names = result.get("target_names", channel_names_list)
+    channel_unit_list = result.get("channel_units", [""] * len(channel_names_list))
+    channel_transform_list = result.get("channel_transforms", [""] * len(channel_names_list))
+    sweep_label = result.get("sweep_label", "Frequency (GHz)")
+    dataset_name = result.get("dataset_name", Path(dataset_root).name)
+
+    # Check for data issues before caching.
+    validation_warnings = result.get("validation_warnings", [])
+    if validation_warnings:
+        warning_text = "\n".join(f"  - {w}" for w in validation_warnings)
+        emit("loader_warning",
+             f"Data validation warnings:\n{warning_text}")
+        # Block caching if there are critical issues (e.g. only 1 sample).
+        if features.shape[0] < 2:
+            raise ValueError(
+                f"Loader produced only {features.shape[0]} sample(s). "
+                f"This is almost certainly a parsing bug.\n"
+                f"Validation warnings:\n{warning_text}"
+            )
+
+    emit("loader_done",
+         f"Loaded {features.shape[0]} samples, {targets.shape[1]} channels, "
+         f"{targets.shape[2]} sweep points.")
+
+    cache_path = Path(cache_path)
+    meta_path = cache_path.with_suffix(".json")
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    emit(
-        "cache_write_started",
-        f"Writing cache to {cache_path.name}.",
-        cache_path=str(cache_path.resolve()),
-        total_samples=total_samples,
-    )
 
     np.savez_compressed(
         cache_path,
@@ -410,20 +367,26 @@ def build_cache(
     summary = {
         "status": "created",
         "cache_path": str(cache_path.resolve()),
-        **_cache_source_metadata(sources, schema),
-        "num_samples": total_samples,
+        "dataset_root": str(Path(dataset_root).resolve()),
+        "dataset_name": dataset_name,
+        "input_feature_path": "",
+        "ground_truth_data_dir": str(Path(dataset_root).resolve()),
+        "readme_path": "",
+        "dataset_schema": {
+            "input_feature": {"columns": feature_names, "feature_columns": feature_names},
+            "ground_truth": {
+                "source": "loader",
+                "ground_truth_parameters": target_names,
+                "ground_truth_parts": ["raw"],
+            },
+        },
+        "num_samples": int(features.shape[0]),
         "num_features": int(features.shape[1]),
         "num_channels": int(targets.shape[1]),
         "num_frequencies": int(targets.shape[2]),
     }
     meta_path.write_text(json.dumps(summary, indent=2))
-    emit(
-        "cache_saved",
-        f"Saved cache {cache_path.name}.",
-        cache_path=summary["cache_path"],
-        total_samples=summary["num_samples"],
-        frequency_count=summary["num_frequencies"],
-    )
+    emit("cache_saved", f"Cache saved: {features.shape[0]} samples.", cache_path=str(cache_path.resolve()))
     return summary
 
 
@@ -434,17 +397,17 @@ def ensure_cache(
     input_feature_path: str | Path | None = None,
     ground_truth_data_dir: str | Path | None = None,
 ) -> Path:
-    """Return a ready-to-use cache path."""
-    # This helper exists so callers that only need a cache path do not have to care
-    # whether the cache already existed or had to be created just now.
-    build_cache(
-        data_root=data_root,
-        cache_path=cache_path,
-        max_samples=max_samples,
-        input_feature_path=input_feature_path,
-        ground_truth_data_dir=ground_truth_data_dir,
-    )
-    return Path(cache_path)
+    """Return a ready-to-use cache path.
+
+    The cache must already exist (created via ``build_cache_from_loader``).
+    """
+    p = Path(cache_path)
+    if not p.exists():
+        raise FileNotFoundError(
+            f"Cache not found: {p}\n"
+            "Use the AI Assistant 'Run & Cache' to create a cache first."
+        )
+    return p
 
 
 # Source and schema resolution helpers.
@@ -645,9 +608,16 @@ def load_split_bundle(
     # This is critical for multi-channel outputs with different scales (e.g. gain
     # in dB and phase in degrees).
     train_y = targets[split["train"]]
-    target_mean = train_y.mean(axis=0).astype(np.float32)   # (channels, freq)
-    target_std = train_y.std(axis=0).astype(np.float32)     # (channels, freq)
-    target_std[target_std < 1e-8] = 1.0
+    target_mean = train_y.mean(axis=0).astype(np.float64)
+    target_std = train_y.std(axis=0).astype(np.float64)
+    # Clamp near-zero std per frequency point to prevent extreme normalized values.
+    # Use per-channel global std as the floor so no frequency point gets blown up.
+    for ch in range(target_std.shape[0]):
+        ch_global_std = float(train_y[:, ch, :].std())
+        floor = max(ch_global_std * 0.01, 1e-30)  # 1% of global std
+        target_std[ch][target_std[ch] < floor] = floor
+    target_mean = target_mean.astype(np.float32)
+    target_std = target_std.astype(np.float32)
     y = (targets - target_mean) / target_std
 
     train_loader = _make_loader(x, y, split["train"], batch_size=batch_size, shuffle=True, pin_memory=pin_memory)

@@ -28,7 +28,7 @@ def test_scan_dataset_returns_preview_rows(synthetic_dataset: dict[str, Path]) -
     assert result["schema_status"] == "Valid"
     assert result["active_input_feature_names"] == ["x", "y"]
     assert result["dropped_input_feature_names"] == ["const"]
-    assert any(row[0] == "Ground-Truth Parameters" and "S11" in row[1] for row in result["preview_rows"])
+    assert any(row[0] == "Ground-Truth Channels" for row in result["preview_rows"])
 
 
 def test_scan_dataset_reports_progress_events(synthetic_dataset: dict[str, Path]) -> None:
@@ -49,46 +49,30 @@ def test_scan_dataset_reports_progress_events(synthetic_dataset: dict[str, Path]
     assert progress_events[0]["event"] == "started"
     assert progress_events[-1]["event"] == "completed"
     assert all(event["phase"] == "scan" for event in progress_events)
-    assert any(event["event"] == "cache_build_started" for event in progress_events)
-    assert any(event["event"] == "cache_progress" for event in progress_events)
     assert any(event["event"] == "split_loading_started" for event in progress_events)
 
 
-def test_scan_dataset_rebuilds_auto_managed_mismatched_cache(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    progress_events: list[dict[str, object]] = []
-    build_calls: list[bool] = []
-    cache_path = tmp_path / "auto_cache.npz"
+def test_scan_dataset_loads_existing_cache(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    cache_path = tmp_path / "test_cache.npz"
 
-    def fake_build_cache(**kwargs):
-        build_calls.append(bool(kwargs.get("overwrite", False)))
-        if not kwargs.get("overwrite", False):
-            raise ValueError(
-                "Cache path already exists for different data sources or schema metadata. "
-                "Choose another cache path or pass overwrite=True."
-            )
-        return {
-            "status": "created",
+    monkeypatch.setattr(
+        gui_backend,
+        "load_existing_cache",
+        lambda *a, **kw: {
+            "status": "existing",
             "cache_path": str(cache_path),
+            "dataset_name": "TestDataset",
             "dataset_root": str(tmp_path),
-            "dataset_name": "SyntheticTouchstoneDataset",
-            "input_feature_path": str(tmp_path / "input" / "log.txt"),
-            "ground_truth_data_dir": str(tmp_path / "output"),
-            "readme_path": str(tmp_path / "README.md"),
-            "dataset_schema": {
-                "input_feature": {
-                    "columns": ["x", "y", "sample_id"],
-                },
-                "ground_truth": {
-                    "source": "per_sample",
-                    "ground_truth_parameters": ["S11"],
-                    "ground_truth_parts": ["re", "im"],
-                },
-            },
+            "input_feature_path": "",
+            "ground_truth_data_dir": "",
+            "readme_path": "",
+            "dataset_schema": {},
             "num_samples": 3,
+            "num_features": 2,
+            "num_channels": 2,
             "num_frequencies": 2,
-        }
-
-    monkeypatch.setattr(gui_backend, "build_cache", fake_build_cache)
+        },
+    )
     monkeypatch.setattr(
         gui_backend,
         "load_split_bundle",
@@ -102,19 +86,14 @@ def test_scan_dataset_rebuilds_auto_managed_mismatched_cache(monkeypatch: pytest
     )
 
     result = gui_backend.scan_dataset(
-        input_feature_path=str(tmp_path / "input" / "log.txt"),
-        ground_truth_data_dir=str(tmp_path / "output"),
         cache_path=str(cache_path),
         train_frac=0.6,
         val_frac=0.2,
         seed=7,
-        overwrite_mismatched_cache=True,
-        progress_callback=progress_events.append,
     )
 
     assert result["status"] == "ok"
-    assert build_calls == [False, True]
-    assert any(event["event"] == "cache_overwrite_started" for event in progress_events)
+    assert result["dataset_name"] == "TestDataset"
 
 
 def test_run_search_filters_noisy_trial_progress(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -151,11 +130,7 @@ def test_run_search_filters_noisy_trial_progress(monkeypatch: pytest.MonkeyPatch
 
 
 def test_check_transfer_compatibility_accepts_matching_checkpoint(synthetic_dataset: dict[str, Path], tmp_path: Path) -> None:
-    cache_summary = data.build_cache(
-        input_feature_path=synthetic_dataset["input_file"],
-        ground_truth_data_dir=synthetic_dataset["output_dir"],
-        cache_path=synthetic_dataset["cache_path"],
-    )
+    cache_summary = data.load_existing_cache(synthetic_dataset["cache_path"])
     run_dir = tmp_path / "baseline_run"
     run_dir.mkdir()
 

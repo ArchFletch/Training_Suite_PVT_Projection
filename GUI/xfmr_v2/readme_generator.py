@@ -649,15 +649,28 @@ def _sample_files(directory: Path, max_lines: int = 20, max_files: int = 12) -> 
             return False
         if path.suffix.lower() not in _TEXT_EXTENSIONS:
             return False
-        parts.append(f"=== {label} (first {max_lines} lines) ===")
+        # Read both head and tail so the LLM sees the full range of value
+        # formats (e.g. SI-suffixed values that only appear at extremes).
         try:
             with path.open(encoding="utf-8", errors="replace") as fh:
-                for i, line in enumerate(fh):
-                    if i >= max_lines:
-                        break
-                    parts.append(line.rstrip())
+                all_lines = fh.readlines()
         except Exception:
+            parts.append(f"=== {label} ===")
             parts.append("(binary or unreadable)")
+            sampled += 1
+            return True
+        total = len(all_lines)
+        half = max_lines // 2
+        if total <= max_lines:
+            parts.append(f"=== {label} ({total} lines, complete) ===")
+            parts.extend(line.rstrip() for line in all_lines)
+        else:
+            parts.append(f"=== {label} (first {half} + last {half} of {total} lines) ===")
+            for line in all_lines[:half]:
+                parts.append(line.rstrip())
+            parts.append(f"... ({total - max_lines} lines omitted) ...")
+            for line in all_lines[-half:]:
+                parts.append(line.rstrip())
         sampled += 1
         return True
 
@@ -717,7 +730,7 @@ def _validate_readme(readme_text: str) -> str | None:
 def generate_readme(
     directory: str | Path,
     api_key: str | None = None,
-    model_name: str = "gemini-2.5-flash-lite",
+    model_name: str = "gemini-3-flash-preview",
     max_retries: int = 2,
     progress_callback=None,
 ) -> str:
@@ -1021,27 +1034,26 @@ output a COMPLETE loader.py inside a code block fenced with ```python ... ```.
 
 The loader.py MUST define this function:
 
-```
-def load_dataset(dataset_root: str, max_samples: int | None = None) -> dict:
-    """Load the dataset and return standardized arrays.
-
-    Returns a dict with:
-        features:      np.ndarray (num_samples, num_features)
-        targets:        np.ndarray (num_samples, num_channels, num_sweep_points)
-        sweep_axis:     np.ndarray (num_sweep_points,)
-        feature_names:  list[str]
-        channel_names:  list[str]
-        channel_units:  list[str]   e.g. ["dB", "deg"]
-        sweep_label:    str         e.g. "Frequency (GHz)" or "VDIFF (mV)"
-        dataset_name:   str
-    """
-```
+  def load_dataset(dataset_root: str, max_samples: int | None = None) -> dict:
+      # Load the dataset and return standardized arrays.
+      # Returns a dict with:
+      #   features:      np.ndarray (num_samples, num_features)
+      #   targets:       np.ndarray (num_samples, num_channels, num_sweep_points)
+      #   sweep_axis:    np.ndarray (num_sweep_points,)
+      #   feature_names: list[str]
+      #   channel_names: list[str]
+      #   channel_units: list[str]   e.g. ["dB", "deg"]
+      #   sweep_label:   str         e.g. "Frequency (GHz)" or "VDIFF (mV)"
+      #   dataset_name:  str
 
 Rules for loader.py:
 - Use ONLY: numpy, csv, re, json, pathlib, math, os.path, struct, io.
 - Do NOT import pandas, scipy, torch, or any other libraries.
 - Parse files using csv.DictReader, csv.reader, or manual line splitting.
 - Handle SI suffixes in Cadence files (e.g. '80.98f' = 80.98e-15).
+  IMPORTANT: SI suffixes can appear on ANY numeric value — input parameters,
+  frequencies, AND output/target values (e.g. gain '935.509m' = 0.935509 dB).
+  Always use the SI parser for ALL numeric fields, never plain float().
 - targets must be shape (samples, channels, sweep_points).
 - If max_samples is not None, only load that many samples.
 - Include the dataset_name in the returned dict.
@@ -1118,7 +1130,7 @@ class ChatSession:
         self,
         dataset_dir: str | Path | None = None,
         api_key: str | None = None,
-        model_name: str = "gemini-2.5-flash",
+        model_name: str = "gemini-3-flash-preview",
     ):
         self.model_name = model_name
         self.api_key = api_key or os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")

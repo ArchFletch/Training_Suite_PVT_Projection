@@ -22,13 +22,10 @@ import numpy as np
 import torch
 
 from .app_paths import current_runtime_paths
-from .data import build_cache, load_split_bundle
+from .data import load_existing_cache, load_split_bundle
 from .runner import TrainConfig, TransferConfig, run_self_transfer, train_baseline
 from .search import SearchConfig, quick_hyperparameter_search
 from .suggest import SuggestConfig, suggest_initial_settings
-
-_CACHE_MISMATCH_ERROR = "Cache path already exists for different data sources or schema metadata."
-
 
 def detect_environment(
     *,
@@ -72,89 +69,41 @@ def detect_environment(
 
 def scan_dataset(
     *,
-    input_feature_path: str = "",
-    ground_truth_data_dir: str = "",
-    dataset_root: str = "",
     cache_path: str,
     train_frac: float,
     val_frac: float,
     seed: int,
     max_samples: int | None = None,
-    overwrite_mismatched_cache: bool = False,
     progress_callback=None,
     should_stop=None,
+    # Legacy params — kept for signature compat but ignored.
+    input_feature_path: str = "",
+    ground_truth_data_dir: str = "",
+    dataset_root: str = "",
+    overwrite_mismatched_cache: bool = False,
 ) -> dict[str, Any]:
-    """Validate paths, build or reuse the cache, and summarize the dataset."""
+    """Load an existing cache and summarize the dataset for the GUI.
 
-    # When dataset_root is set (new single-folder flow), it takes priority
-    # over legacy fields.  Legacy fields are only used when dataset_root is empty.
-    if dataset_root:
-        effective_data_root = dataset_root
-        effective_input_feature = None
-        effective_ground_truth = None
-    elif not input_feature_path and ground_truth_data_dir:
-        effective_data_root = ground_truth_data_dir
-        effective_input_feature = None
-        effective_ground_truth = None
-    else:
-        effective_data_root = None
-        effective_input_feature = input_feature_path or None
-        effective_ground_truth = ground_truth_data_dir or None
+    New caches are created via ``build_cache_from_loader`` (the 'Run & Cache'
+    button).  This function only loads caches that already exist.
+    """
+    if progress_callback is not None:
+        progress_callback(
+            {"phase": "scan", "event": "started",
+             "message": "Loading cached dataset.",
+             "cache_path": cache_path}
+        )
+
+    cache_summary = load_existing_cache(cache_path, progress_callback)
 
     if progress_callback is not None:
         progress_callback(
-            {
-                "phase": "scan",
-                "event": "started",
-                "message": "Validating dataset paths and preparing the cache.",
-                "dataset_root": dataset_root,
-                "input_feature_path": input_feature_path,
-                "ground_truth_data_dir": ground_truth_data_dir,
-                "cache_path": cache_path,
-            }
+            {"phase": "scan", "event": "split_loading_started",
+             "message": "Preparing train, validation, and test splits.",
+             "cache_path": cache_summary["cache_path"],
+             "cache_status": cache_summary["status"]}
         )
-    try:
-        cache_summary = build_cache(
-            data_root=effective_data_root,
-            input_feature_path=effective_input_feature,
-            ground_truth_data_dir=effective_ground_truth,
-            cache_path=cache_path,
-            max_samples=max_samples,
-            progress_callback=progress_callback,
-            should_stop=should_stop,
-        )
-    except ValueError as exc:
-        if not overwrite_mismatched_cache or _CACHE_MISMATCH_ERROR not in str(exc):
-            raise
-        if progress_callback is not None:
-            progress_callback(
-                {
-                    "phase": "scan",
-                    "event": "cache_overwrite_started",
-                    "message": "Rebuilding the auto-managed cache for the selected data sources.",
-                    "cache_path": cache_path,
-                }
-            )
-        cache_summary = build_cache(
-            data_root=effective_data_root,
-            input_feature_path=effective_input_feature,
-            ground_truth_data_dir=effective_ground_truth,
-            cache_path=cache_path,
-            overwrite=True,
-            max_samples=max_samples,
-            progress_callback=progress_callback,
-            should_stop=should_stop,
-        )
-    if progress_callback is not None:
-        progress_callback(
-            {
-                "phase": "scan",
-                "event": "split_loading_started",
-                "message": "Preparing train, validation, and test splits from the cache.",
-                "cache_path": cache_summary["cache_path"],
-                "cache_status": cache_summary["status"],
-            }
-        )
+
     bundle = load_split_bundle(
         cache_path=cache_path,
         batch_size=16,
@@ -165,26 +114,16 @@ def scan_dataset(
         pin_memory=False,
     )
 
-    schema = cache_summary["dataset_schema"]
-    detected_readme = cache_summary.get("readme_path")
+    schema = cache_summary.get("dataset_schema", {})
     preview_rows = [
         ("Samples", str(cache_summary["num_samples"])),
         ("Training Samples", str(len(bundle.split_indices["train"]))),
         ("Validation Samples", str(len(bundle.split_indices["val"]))),
         ("Test Samples", str(len(bundle.split_indices["test"]))),
-        ("Frequency Points", str(cache_summary["num_frequencies"])),
-        (
-            "Frequency Range",
-            f"{bundle.frequency_ghz.min():.6f} to {bundle.frequency_ghz.max():.6f} GHz",
-        ),
-        ("Dataset Name", cache_summary["dataset_name"]),
-        ("Detected Dataset README", detected_readme or "Not found"),
-        ("Declared Input-Feature Columns", _join_values(schema["input_feature"]["columns"])),
+        ("Sweep Points", str(cache_summary["num_frequencies"])),
+        ("Dataset Name", cache_summary.get("dataset_name", "")),
         ("Active Input-Feature Columns", _join_values(bundle.active_names)),
         ("Constant Fields Removed", _join_values(bundle.dropped_names) or "None"),
-        ("Loading Strategy", schema["ground_truth"]["source"]),
-        ("Ground-Truth Parameters", _join_values(schema["ground_truth"].get("ground_truth_parameters", []))),
-        ("Ground-Truth Parts", _join_values(schema["ground_truth"].get("ground_truth_parts", []))),
         ("Ground-Truth Channels", _join_values(bundle.channel_names)),
         ("Cache Status", cache_summary["status"]),
     ]
@@ -193,11 +132,11 @@ def scan_dataset(
         "status": "ok",
         "cache_summary": cache_summary,
         "schema_status": "Valid",
-        "dataset_name": cache_summary["dataset_name"],
-        "readme_path": detected_readme,
-        "dataset_root": cache_summary["dataset_root"],
-        "input_feature_path": cache_summary["input_feature_path"],
-        "ground_truth_data_dir": cache_summary["ground_truth_data_dir"],
+        "dataset_name": cache_summary.get("dataset_name", ""),
+        "readme_path": "",
+        "dataset_root": cache_summary.get("dataset_root", ""),
+        "input_feature_path": cache_summary.get("input_feature_path", ""),
+        "ground_truth_data_dir": cache_summary.get("ground_truth_data_dir", ""),
         "cache_path": cache_summary["cache_path"],
         "schema": schema,
         "preview_rows": preview_rows,

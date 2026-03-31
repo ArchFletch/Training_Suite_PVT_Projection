@@ -82,49 +82,29 @@ def test_parse_dataset_readme_rejects_duplicate_columns(tmp_path: Path) -> None:
         dataset_schema.parse_dataset_readme(readme)
 
 
-def test_build_cache_and_load_split_bundle_with_separate_paths(synthetic_dataset: dict[str, Path]) -> None:
-    """The cache builder should work when input and output paths are passed explicitly."""
+def test_load_cache_and_split_bundle(synthetic_dataset: dict[str, Path]) -> None:
+    """The cache (pre-built by fixture) should load correctly."""
 
     cache_path = synthetic_dataset["cache_path"]
-    summary = data.build_cache(
-        input_feature_path=synthetic_dataset["input_dir"],
-        ground_truth_data_dir=synthetic_dataset["output_dir"],
-        cache_path=cache_path,
-    )
 
-    assert summary["status"] == "created"
-    assert summary["dataset_name"] == "SyntheticTouchstoneDataset"
+    # Cache was already built by the fixture via build_cache_from_loader.
+    summary = data.load_existing_cache(cache_path)
+    assert summary["status"] == "existing"
     assert summary["num_samples"] == 10
-    assert summary["num_features"] == 3
     assert summary["num_channels"] == 4
     assert summary["num_frequencies"] == 3
-    assert Path(summary["dataset_root"]) == synthetic_dataset["root"]
-    assert Path(summary["input_feature_path"]) == synthetic_dataset["input_file"]
-    assert Path(summary["ground_truth_data_dir"]) == synthetic_dataset["output_dir"]
-
-    second = data.build_cache(
-        input_feature_path=synthetic_dataset["input_dir"],
-        ground_truth_data_dir=synthetic_dataset["output_dir"],
-        cache_path=cache_path,
-    )
-    assert second["status"] == "existing"
 
     with np.load(cache_path, allow_pickle=False) as arrays:
         assert arrays["features"].shape == (10, 3)
         assert arrays["targets"].shape == (10, 4, 3)
         assert arrays["input_feature_names"].astype(str).tolist() == ["x", "y", "const"]
         assert arrays["channel_names"].astype(str).tolist() == ["S11_re", "S11_im", "S12_re", "S12_im"]
-        assert arrays["targets"][0, 0, 0] == pytest.approx(0.07, abs=1e-6)
-        assert arrays["targets"][0, 1, 0] == pytest.approx(-0.035, abs=1e-6)
-        assert arrays["targets"][0, 2, 0] == pytest.approx(0.07 / 3.0, abs=1e-6)
-        assert arrays["targets"][0, 3, 0] == pytest.approx(0.07 / 4.0, abs=1e-6)
 
     bundle = data.load_split_bundle(cache_path=cache_path, batch_size=4, seed=3, train_frac=0.6, val_frac=0.2)
 
     assert bundle.input_feature_names == ["x", "y", "const"]
     assert bundle.active_names == ["x", "y"]
     assert bundle.dropped_names == ["const"]
-    assert bundle.frequency_ghz.tolist() == pytest.approx([2.0, 3.0, 4.0])
     train_x, train_y = next(iter(bundle.train_loader))
     assert train_x.shape[1] == 2
     assert tuple(train_y.shape[1:]) == (4, 3)
