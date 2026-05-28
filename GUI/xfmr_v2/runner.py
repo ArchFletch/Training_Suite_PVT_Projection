@@ -27,7 +27,7 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from .data import CACHE_PATH, DATA_ROOT, ensure_cache, load_split_bundle, normalize_frequency, split_indices
-from .model import CTLEMultiTaskMLP, FlatMLPNet, SpectralNet
+from .model import CTLEMultiTaskMLP, FlatMLPNet
 from .progress import ProgressCallback, RunCancelled, StopChecker, emit_progress, request_stop
 
 
@@ -59,11 +59,9 @@ class TrainConfig:
     val_frac: float = 0.1
 
     # Model architecture settings.
-    model_type: str = "SpectralNet"  # "SpectralNet" or "FlatMLP"
-    latent_dim: int = 128
+    model_type: str = "FlatMLP"  # "FlatMLP" or "CTLE_MLP"
     width: int = 512
     depth: int = 5
-    fourier_bands: int = 16
     dropout: float = 0.05
 
     # Loss and scheduler settings.
@@ -136,7 +134,7 @@ class TransferConfig:
     device: str | None = None
 
 
-MODEL_TYPES = ("SpectralNet", "FlatMLP", "CTLE_MLP")
+MODEL_TYPES = ("FlatMLP", "CTLE_MLP")
 
 
 def resolve_device(spec: str | None) -> torch.device:
@@ -163,8 +161,6 @@ def resolve_device(spec: str | None) -> torch.device:
 
 def build_model(model_type: str, *, num_frequencies: int, **kwargs: Any) -> nn.Module:
     """Instantiate a model by name, forwarding architecture kwargs."""
-    if model_type == "SpectralNet":
-        return SpectralNet(**kwargs)
     if model_type == "FlatMLP":
         return FlatMLPNet(num_frequencies=num_frequencies, **kwargs)
     if model_type == "CTLE_MLP":
@@ -316,10 +312,8 @@ def run_baseline_trial(
             num_frequencies=len(bundle.frequency_ghz),
             input_feature_dim=len(bundle.active_names),
             ground_truth_channels=len(bundle.channel_names),
-            latent_dim=config.latent_dim,
             width=config.width,
             depth=config.depth,
-            fourier_bands=config.fourier_bands,
             dropout=config.dropout,
         ).to(device)
         loss_fn = _build_loss_fn(config.loss_function)
@@ -773,14 +767,12 @@ def run_self_transfer(
 
         # Rebuild the model shape from the saved config. A few legacy field names are
         # still accepted here so older checkpoints remain loadable.
-        saved_model_type = cfg.get("model_type", "SpectralNet")
+        saved_model_type = cfg.get("model_type", "FlatMLP")
         model_kwargs = {
             "input_feature_dim": len(active_names),
             "ground_truth_channels": len(checkpoint["target_channel_names"]),
-            "latent_dim": int(cfg["latent_dim"]),
-            "width": int(cfg["branch_width"] if "branch_width" in cfg else cfg["width"]),
-            "depth": int(cfg["branch_depth"] if "branch_depth" in cfg else cfg["depth"]),
-            "fourier_bands": int(cfg["fourier_bands"]),
+            "width": int(cfg["width"]),
+            "depth": int(cfg["depth"]),
             "dropout": float(cfg["dropout"]),
         }
         base_state = clone_state(
@@ -1222,7 +1214,7 @@ def _train_band(
     should_stop: StopChecker | None = None,
     event_context: dict[str, Any] | None = None,
     run_start_time: float | None = None,
-    model_type: str = "SpectralNet",
+    model_type: str = "FlatMLP",
     num_frequencies: int = 0,
 ) -> dict[str, torch.Tensor]:
     # Each band fine-tunes a fresh model instance starting from `init_state`.

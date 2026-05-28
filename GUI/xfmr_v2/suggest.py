@@ -323,10 +323,8 @@ def _suggest_baseline(
 ) -> dict[str, Any]:
     # These ordered tiers make the heuristic easier to reason about than a fully
     # continuous formula because the output lands on familiar, hand-checked values.
-    latent_tiers = [48, 64, 96, 128, 160]
     width_tiers = [128, 192, 256, 384, 512, 768]
     depth_tiers = [3, 4, 5, 6]
-    band_tiers = [8, 12, 16, 20, 24]
     batch_tiers = [8, 16, 32, 64]
     lr_tiers = [7e-5, 1e-4, 2e-4]
     dropout_tiers = [0.02, 0.05, 0.10, 0.15]
@@ -334,24 +332,18 @@ def _suggest_baseline(
     epoch_tiers = [200, 300, 400]
     patience_tiers = [15, 20, 30]
 
+    # Anchor width directly to the ground-truth effective rank, then adjust for
+    # richer inputs or more complex spectra.
     if ground_truth_rank <= 24:
-        latent_dim = 48
+        width = 192
     elif ground_truth_rank <= 48:
-        latent_dim = 64
+        width = 256
     elif ground_truth_rank <= 80:
-        latent_dim = 96
+        width = 384
     elif ground_truth_rank <= 128:
-        latent_dim = 128
+        width = 512
     else:
-        latent_dim = 160
-    if capacity_tier == "conservative":
-        latent_dim = _shift_tier(latent_tiers, latent_dim, -1)
-    elif capacity_tier == "aggressive" and spectral_tier == "high":
-        latent_dim = _shift_tier(latent_tiers, latent_dim, 1)
-
-    # Width grows roughly with latent dimension, then gets adjusted for richer inputs
-    # or more complex spectra.
-    width = _nearest_tier(width_tiers, latent_dim * 4)
+        width = 768
     width_shift = 0
     if capacity_tier == "conservative":
         width_shift -= 1
@@ -373,15 +365,6 @@ def _suggest_baseline(
         depth = 3
     else:
         depth = 4
-
-    if spectral_tier == "low":
-        fourier_bands = 8 if frequency_point_count < 300 else 12
-    elif spectral_tier == "medium":
-        fourier_bands = 12 if frequency_point_count < 300 else 16
-    else:
-        fourier_bands = 16 if frequency_point_count < 300 else 20
-    if frequency_point_count >= 800 and spectral_tier == "high":
-        fourier_bands = 24
 
     if overfit_risk == "high":
         dropout = 0.15
@@ -443,10 +426,8 @@ def _suggest_baseline(
         gradient_clip=defaults.gradient_clip,
         train_frac=request.train_frac,
         val_frac=request.val_frac,
-        latent_dim=latent_dim,
         width=width,
         depth=depth,
-        fourier_bands=fourier_bands,
         dropout=dropout,
         use_amp=bool(gpu_info["available"]),
         max_samples=request.max_samples,
@@ -455,10 +436,8 @@ def _suggest_baseline(
     ranges = {
         # Expose nearby alternatives so the quick-search module can explore around
         # the heuristic recommendation without rebuilding its own search space logic.
-        "latent_dim": _neighbor_range(latent_tiers, latent_dim),
         "width": _neighbor_range(width_tiers, width),
         "depth": _neighbor_range(depth_tiers, depth),
-        "fourier_bands": _neighbor_range(band_tiers, fourier_bands),
         "batch_size": _neighbor_range(batch_tiers, batch_size),
         "learning_rate": _neighbor_range(lr_tiers, learning_rate),
         "dropout": _neighbor_range(dropout_tiers, dropout),
@@ -467,10 +446,8 @@ def _suggest_baseline(
         "patience": _neighbor_range(patience_tiers, patience),
     }
     rationale = {
-        "latent_dim": f"Ground-truth effective rank is {ground_truth_rank}, so latent capacity is anchored near that scale.",
-        "width": f"Width is tied to latent dimension and adjusted for {capacity_tier} capacity with {spectral_tier} spectral complexity.",
+        "width": f"Width is anchored to the ground-truth effective rank ({ground_truth_rank}) and adjusted for {capacity_tier} capacity with {spectral_tier} spectral complexity.",
         "depth": f"Depth {depth} balances train-set size {train_count} with {spectral_tier} spectral complexity.",
-        "fourier_bands": f"Frequency encoding uses {fourier_bands} bands for {frequency_point_count} frequency points and {spectral_tier} curve complexity.",
         "batch_size": _batch_rationale(batch_size, gpu_info, width, frequency_point_count),
         "learning_rate": f"Learning rate {learning_rate:.1e} is a stable starting point for a {width}-wide, depth-{depth} network.",
         "dropout": f"Dropout {dropout:.2f} reflects an estimated {overfit_risk} overfit risk.",
@@ -479,7 +456,6 @@ def _suggest_baseline(
         "patience": f"Patience {patience} pairs with the suggested epoch budget to stop early if validation plateaus.",
     }
     quick_search_hints = {
-        "latent_dim": ranges["latent_dim"]["candidates"],
         "width": ranges["width"]["candidates"],
         "depth": ranges["depth"]["candidates"],
         "learning_rate": ranges["learning_rate"]["candidates"],
@@ -617,11 +593,6 @@ def _candidate_span(ordered_values: list[Any], value: Any) -> dict[str, list[Any
     start = max(idx - 1, 0)
     stop = min(idx + 1, len(ordered_values) - 1)
     return {"candidates": ordered_values[start : stop + 1]}
-
-
-def _nearest_tier(ordered_values: list[int], value: float) -> int:
-    # Snap a continuous heuristic value to the nearest hand-picked tier.
-    return min(ordered_values, key=lambda candidate: abs(candidate - value))
 
 
 def _shift_tier(ordered_values: list[Any], value: Any, shift: int) -> Any:

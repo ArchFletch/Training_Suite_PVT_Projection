@@ -76,7 +76,7 @@ class SplitBundle:
     input_feature_mean: np.ndarray
     input_feature_std: np.ndarray
     # Frequency axis in three different forms: raw Hz, GHz for display, and normalized
-    # coordinates for the frequency trunk network.
+    # coordinates fed to the model.
     frequency_hz: np.ndarray
     frequency_ghz: np.ndarray
     frequency_norm: np.ndarray
@@ -97,7 +97,7 @@ class SplitBundle:
 
 
 # ---------------------------------------------------------------------------
-# LLM-generated loader execution (in-memory, no files saved to disk)
+# Loader-code execution (in-memory, no files saved to disk)
 # ---------------------------------------------------------------------------
 _LOADER_ALLOWED_MODULES = {
     "csv", "re", "json", "math", "struct", "io", "os.path",
@@ -110,7 +110,7 @@ def run_loader_code(
     dataset_root: str | Path,
     max_samples: int | None = None,
 ) -> dict[str, Any]:
-    """Execute LLM-generated loader code in memory and return standardized arrays.
+    """Execute loader code in memory and return standardized arrays.
 
     The code must define ``load_dataset(dataset_root, max_samples=None)``
     returning a dict with at least ``features``, ``targets``, ``sweep_axis``.
@@ -120,7 +120,7 @@ def run_loader_code(
     import importlib
     import builtins
 
-    # Use standard builtins — the code is LLM-generated and user-approved.
+    # Use standard builtins — the loader code is user-provided and trusted.
     safe_globals: dict[str, Any] = {"__builtins__": builtins}
 
     for mod_name in _LOADER_ALLOWED_MODULES:
@@ -250,7 +250,7 @@ def load_existing_cache(
     """Load an existing .npz cache and return its summary metadata.
 
     This does NOT build a cache from raw data.  Use ``build_cache_from_loader``
-    to create a new cache via LLM-generated loader code.
+    to create a new cache from a ``loader.py``.
     """
     def emit(event: str, message: str, **payload: Any) -> None:
         if progress_callback is not None:
@@ -262,7 +262,7 @@ def load_existing_cache(
     if not cache_path.exists():
         raise FileNotFoundError(
             f"Cache file not found: {cache_path}\n"
-            "Use the AI Assistant to generate a loader, then click 'Run & Cache'."
+            "Build the cache first before it can be loaded."
         )
 
     with np.load(cache_path, allow_pickle=False) as data:
@@ -305,9 +305,9 @@ def build_cache_from_loader(
     max_samples: int | None = None,
     progress_callback=None,
 ) -> dict[str, Any]:
-    """Execute LLM-generated loader code in memory and save the result as a cache.
+    """Execute loader code in memory and save the result as a cache.
 
-    This is the primary entry point for the LLM-based loading flow. The code
+    This is the primary entry point for the loader-based loading flow. The code
     runs once in memory, produces standardized arrays, and saves them to the
     cache. No files are written to the dataset directory.
     """
@@ -405,7 +405,7 @@ def ensure_cache(
     if not p.exists():
         raise FileNotFoundError(
             f"Cache not found: {p}\n"
-            "Use the AI Assistant 'Run & Cache' to create a cache first."
+            "Build the cache first."
         )
     return p
 
@@ -690,7 +690,7 @@ def split_indices(num_samples: int, train_frac: float, val_frac: float, seed: in
 
 
 def normalize_frequency(frequency_ghz: np.ndarray) -> np.ndarray:
-    """Map frequency to [-1, 1] for the trunk network."""
+    """Map frequency to [-1, 1] for the model's frequency input."""
     lo, hi = float(frequency_ghz.min()), float(frequency_ghz.max())
     if np.isclose(lo, hi):
         return np.zeros_like(frequency_ghz, dtype=np.float32)

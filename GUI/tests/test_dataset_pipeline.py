@@ -143,7 +143,7 @@ def test_suggest_initial_settings_reports_schema_driven_diagnostics(
     assert result["suggested_baseline_config"]["input_feature_path"] == str(synthetic_dataset["input_dir"])
     assert result["suggested_baseline_config"]["ground_truth_data_dir"] == str(synthetic_dataset["output_dir"])
     assert result["suggested_baseline_config"]["use_amp"] is False
-    assert result["quick_search_hints"]["latent_dim"]
+    assert result["quick_search_hints"]["width"]
 
 
 def test_normalize_objective_accepts_aliases() -> None:
@@ -173,10 +173,8 @@ def test_quick_hyperparameter_search_ranks_trials_and_writes_outputs(
         gradient_clip=1.0,
         train_frac=0.8,
         val_frac=0.1,
-        latent_dim=64,
         width=192,
         depth=4,
-        fourier_bands=12,
         dropout=0.10,
         use_amp=False,
         max_samples=24,
@@ -187,10 +185,8 @@ def test_quick_hyperparameter_search_ranks_trials_and_writes_outputs(
         "confidence_reason": "synthetic search suggestion",
         "suggested_baseline_config": asdict(base_config),
         "suggested_baseline_ranges": {
-            "latent_dim": {"selected": 64, "candidates": [48, 64, 96]},
             "width": {"selected": 192, "candidates": [128, 192, 256]},
             "depth": {"selected": 4, "candidates": [3, 4, 5]},
-            "fourier_bands": {"selected": 12, "candidates": [8, 12, 16]},
             "batch_size": {"selected": 16, "candidates": [8, 16, 32]},
             "learning_rate": {"selected": 1e-4, "candidates": [7e-5, 1e-4, 2e-4]},
             "dropout": {"selected": 0.10, "candidates": [0.05, 0.10, 0.15]},

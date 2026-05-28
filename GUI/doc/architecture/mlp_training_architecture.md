@@ -10,7 +10,7 @@ Implementation-oriented architecture for the core training workflow.
 - `data.py`: raw-data loading, cache creation, split preparation
 - `suggest.py`: scan-only heuristics
 - `search.py`: bounded quick search around a suggested baseline
-- `model.py`: spectral branch/trunk model
+- `model.py`: feed-forward models (FlatMLP, CTLE multi-task MLP)
 - `runner.py`: baseline and transfer execution, evaluation, artifact writing
 - CLI wrappers: thin command entrypoints
 

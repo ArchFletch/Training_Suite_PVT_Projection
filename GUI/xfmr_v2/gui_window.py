@@ -10,7 +10,7 @@ from typing import Any
 
 import pyqtgraph as pg
 from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
-from PySide6.QtGui import QCloseEvent, QKeyEvent
+from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -23,7 +23,6 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
-    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -38,7 +37,6 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
-    QTextEdit,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -119,39 +117,6 @@ class _NoScrollComboBox(QComboBox):
             event.ignore()
         else:
             super().wheelEvent(event)
-
-
-class _ChatInput(QTextEdit):
-    """Multi-line text input that sends on Enter and inserts newlines on Shift+Enter."""
-
-    submitted = Signal()
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.setAcceptRichText(False)
-        self.setPlaceholderText("Type a message... (Enter to send, Shift+Enter for new line)")
-        self.setMinimumHeight(36)
-        self.setMaximumHeight(120)
-        # Start compact; grows with content up to max.
-        self.document().contentsChanged.connect(self._adjust_height)
-
-    def _adjust_height(self) -> None:
-        doc_height = int(self.document().size().height()) + 12
-        self.setFixedHeight(max(36, min(doc_height, 120)))
-
-    def keyPressEvent(self, event: QKeyEvent) -> None:
-        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and not event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
-            event.accept()
-            self.submitted.emit()
-            return
-        super().keyPressEvent(event)
-
-    def text(self) -> str:
-        return self.toPlainText()
-
-    def clear(self) -> None:
-        super().clear()
-        self.setFixedHeight(36)
 
 
 class _LicenseStateBridge(QObject):
@@ -632,18 +597,15 @@ class MlpTrainingStudio(QMainWindow):
 
         self.baseline_model_type_combo_box = _NoScrollComboBox()
         self.baseline_model_type_combo_box.addItems(list(MODEL_TYPES))
-        self.baseline_model_type_combo_box.setCurrentText("SpectralNet")
-        self.baseline_model_type_combo_box.currentTextChanged.connect(self._on_model_type_changed)
+        self.baseline_model_type_combo_box.setCurrentText("FlatMLP")
         self.baseline_epochs_spin_box = self._make_int_spin(1, 5000, 300)
         self.baseline_patience_spin_box = self._make_int_spin(1, 1000, 20)
         self.baseline_batch_size_spin_box = self._make_int_spin(1, 4096, 16)
         self.baseline_learning_rate_spin_box = self._make_float_spin(1e-6, 1.0, 1e-4, decimals=6, step=1e-5, scientific=True)
         self.baseline_weight_decay_spin_box = self._make_float_spin(0.0, 1.0, 1e-4, decimals=6, step=1e-5, scientific=True)
         self.baseline_gradient_clip_spin_box = self._make_float_spin(0.0, 100.0, 1.0, decimals=3, step=0.1)
-        self.baseline_latent_dim_spin_box = self._make_int_spin(8, 4096, 128)
         self.baseline_width_spin_box = self._make_int_spin(16, 8192, 512)
         self.baseline_depth_spin_box = self._make_int_spin(1, 20, 5)
-        self.baseline_fourier_bands_spin_box = self._make_int_spin(1, 256, 16)
         self.baseline_dropout_spin_box = self._make_float_spin(0.0, 0.95, 0.05, decimals=3, step=0.01)
         self.baseline_loss_function_combo_box = _NoScrollComboBox()
         self.baseline_loss_function_combo_box.addItems(list(LOSS_FUNCTIONS))
@@ -667,10 +629,8 @@ class MlpTrainingStudio(QMainWindow):
             ("Learning Rate", self.baseline_learning_rate_spin_box),
             ("Weight Decay", self.baseline_weight_decay_spin_box),
             ("Gradient Clip", self.baseline_gradient_clip_spin_box),
-            ("Latent Dimension", self.baseline_latent_dim_spin_box),
             ("Network Width", self.baseline_width_spin_box),
             ("Network Depth", self.baseline_depth_spin_box),
-            ("Fourier Bands", self.baseline_fourier_bands_spin_box),
             ("Dropout", self.baseline_dropout_spin_box),
             ("Loss Function", self.baseline_loss_function_combo_box),
             ("LR Scheduler", self.baseline_scheduler_combo_box),
@@ -856,87 +816,10 @@ class MlpTrainingStudio(QMainWindow):
         self._test_sample_plots: list[pg.PlotWidget] = []
         tabs.addTab(test_samples_scroll, "Test Samples")
 
-        tabs.addTab(self._build_chat_tab(), "AI Assistant")
-
         self.monitor_tabs = tabs
         self._reset_baseline_plots()
         self._reset_transfer_plots()
         return tabs
-
-    def _build_chat_tab(self) -> QWidget:
-        """Build the AI Assistant chat tab for interactive README generation."""
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
-
-        # Action buttons row — at the top so always visible
-        action_row = QHBoxLayout()
-        action_row.setSpacing(8)
-
-        self.chat_generate_button = self._make_button("Set Up Dataset", secondary=True)
-        self.chat_generate_button.clicked.connect(self._on_chat_setup_dataset)
-        action_row.addWidget(self.chat_generate_button)
-
-        self.chat_run_loader_button = self._make_button("Run & Cache", secondary=True)
-        self.chat_run_loader_button.clicked.connect(self._on_chat_run_loader)
-        self.chat_run_loader_button.setEnabled(False)
-        action_row.addWidget(self.chat_run_loader_button)
-
-        self.chat_clear_button = self._make_button("Clear Chat", secondary=True)
-        self.chat_clear_button.clicked.connect(self._on_chat_clear)
-        action_row.addWidget(self.chat_clear_button)
-
-        action_row.addStretch()
-        layout.addLayout(action_row)
-
-        # Input row
-        input_row = QHBoxLayout()
-        input_row.setSpacing(8)
-        self.chat_input = _ChatInput()
-        self.chat_input.submitted.connect(self._on_chat_send)
-        input_row.addWidget(self.chat_input, 1)
-
-        self.chat_send_button = self._make_button("Send")
-        self.chat_send_button.clicked.connect(self._on_chat_send)
-        input_row.addWidget(self.chat_send_button)
-
-        self.chat_stop_button = self._make_button("Stop")
-        self.chat_stop_button.setStyleSheet(
-            self.chat_stop_button.styleSheet()
-            + "\nQPushButton { background-color: #c0392b; color: white; }"
-        )
-        self.chat_stop_button.clicked.connect(self._on_chat_stop)
-        self.chat_stop_button.setVisible(False)
-        input_row.addWidget(self.chat_stop_button)
-
-        layout.addLayout(input_row)
-
-        # Chat display area — takes remaining space
-        self.chat_display = QPlainTextEdit()
-        self.chat_display.setReadOnly(True)
-        self.chat_display.setMaximumBlockCount(10000)
-        self.chat_display.setStyleSheet(
-            'QPlainTextEdit { font-family: "Cascadia Code", "Consolas", monospace; font-size: 10pt; }'
-        )
-        self.chat_display.setPlaceholderText(
-            "AI Assistant — select a dataset folder, then chat here to set up data loading.\n\n"
-            "1. Set the Ground-Truth Data Folder (or any dataset root folder)\n"
-            "2. Click 'Generate README' or ask:\n"
-            "   - \"Set up my data for training\"\n"
-            "   - \"What files are in my dataset?\"\n"
-            "   - \"The tabular/ CSVs are input parameters, csv/ has S-param data\"\n"
-            "   - \"Change ground_truth_parameters to S11 and S12 only\"\n"
-            "3. Save the README, then click 'Scan Data'\n"
-        )
-        layout.addWidget(self.chat_display, 1)
-
-        # Session state
-        self._chat_session = None
-        self._last_readme_content = None
-        self._last_loader_content = None
-
-        return tab
 
     # ------------------------------------------------------------------
     # Defaults and persistence
@@ -1310,429 +1193,6 @@ class MlpTrainingStudio(QMainWindow):
         if path:
             self.model_output_folder_path_edit.setText(path)
 
-    def _open_generate_readme_dialog(self) -> None:
-        import os
-        from .readme_generator import generate_readme, save_readme
-
-        # Determine the dataset ROOT directory.  For touchstone datasets the user
-        # typically sets input-feature=log.txt and ground-truth=SPData/, so the
-        # dataset root is the common parent.  For cadence_csv the ground-truth
-        # folder IS the root.
-        gt_dir = self.ground_truth_data_folder_path_edit.text().strip()
-        input_path = self.input_feature_path_edit.text().strip()
-        if input_path and gt_dir:
-            # Both set → use common parent (e.g. parent of log.txt and SPData/)
-            dataset_dir = str(Path(os.path.commonpath([
-                str(Path(input_path).parent),
-                str(Path(gt_dir)),
-            ])))
-        elif input_path:
-            dataset_dir = str(Path(input_path).parent)
-        elif gt_dir:
-            dataset_dir = gt_dir
-        else:
-            self._show_warning("Select the data paths first so the AI knows which directory to analyze.")
-            return
-        if not Path(dataset_dir).is_dir():
-            self._show_warning(f"Directory not found: {dataset_dir}")
-            return
-
-        # Check for existing README.
-        readme_path = Path(dataset_dir) / "README.md"
-        if readme_path.exists():
-            reply = QMessageBox.question(
-                self,
-                "README already exists",
-                f"A README.md already exists in:\n{dataset_dir}\n\nOverwrite it?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if reply != QMessageBox.StandardButton.Yes:
-                return
-
-        # Use cached key, env var, or prompt once and remember for the session.
-        import os
-        api_key = getattr(self, "_gemini_api_key", None) or os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-        if not api_key:
-            api_key, ok = QInputDialog.getText(
-                self,
-                "Gemini API Key",
-                "Enter your Google Gemini API key\n(get one at aistudio.google.com):\n\nThe key will be remembered for this session.",
-                QLineEdit.EchoMode.Password,
-            )
-            if not ok or not api_key.strip():
-                return
-            api_key = api_key.strip()
-        self._gemini_api_key = api_key
-
-        # Run generation in background.
-        self.append_log(f"Generating README for {dataset_dir} ...")
-
-        def _do_generate(*, progress_callback=None, should_stop=None):
-            content = generate_readme(dataset_dir, api_key=api_key, progress_callback=progress_callback)
-            return {"content": content, "directory": dataset_dir}
-
-        self._start_task(
-            _do_generate,
-            kwargs={},
-            task_name="readme_gen",
-            busy_state="Generating",
-            on_result=self._on_readme_generated,
-        )
-
-    def _on_readme_generated(self, result: dict) -> None:
-        from .readme_generator import save_readme
-
-        content = result["content"]
-        directory = result["directory"]
-
-        # Show preview dialog for user to review/edit before saving.
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Generated README — Review & Save")
-        dialog.resize(700, 500)
-        dlayout = QVBoxLayout(dialog)
-        dlayout.addWidget(QLabel("Review the generated README.md below. Edit if needed, then click Save."))
-        editor = QPlainTextEdit()
-        editor.setPlainText(content)
-        editor.setFont(self.font())
-        dlayout.addWidget(editor)
-        btn_row = QHBoxLayout()
-        save_btn = QPushButton("Save README.md")
-        cancel_btn = QPushButton("Cancel")
-        btn_row.addStretch()
-        btn_row.addWidget(cancel_btn)
-        btn_row.addWidget(save_btn)
-        dlayout.addLayout(btn_row)
-
-        def _save():
-            final_content = editor.toPlainText()
-            path = save_readme(directory, final_content)
-            self.append_log(f"README.md saved to {path}")
-            dialog.accept()
-
-        save_btn.clicked.connect(_save)
-        cancel_btn.clicked.connect(dialog.reject)
-        dialog.exec()
-
-    # ------------------------------------------------------------------
-    # AI Chat handlers
-    # ------------------------------------------------------------------
-    def _get_chat_session(self):
-        """Get or create the ChatSession, resolving the dataset dir and API key."""
-        from .readme_generator import ChatSession
-
-        if self._chat_session is None:
-            api_key = getattr(self, "_gemini_api_key", None) or os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-            if not api_key:
-                api_key, ok = QInputDialog.getText(
-                    self,
-                    "Gemini API Key",
-                    "Enter your Google Gemini API key\n(get one at aistudio.google.com):\n\nThe key will be remembered for this session.",
-                    QLineEdit.EchoMode.Password,
-                )
-                if not ok or not api_key.strip():
-                    return None
-                api_key = api_key.strip()
-                self._gemini_api_key = api_key
-
-            dataset_dir = self._resolve_dataset_dir()
-            self._chat_session = ChatSession(
-                dataset_dir=dataset_dir,
-                api_key=api_key,
-            )
-        else:
-            # Update dataset dir if it changed.
-            new_dir = self._resolve_dataset_dir()
-            if new_dir and (self._chat_session.dataset_dir is None or str(new_dir) != str(self._chat_session.dataset_dir)):
-                summary = self._chat_session.set_dataset(new_dir)
-                self._chat_append("system", f"Dataset updated: {summary}")
-
-        return self._chat_session
-
-    def _resolve_dataset_dir(self) -> Path | None:
-        """Resolve the dataset root directory from the GUI path fields."""
-        # Prefer the new single-folder field.
-        dataset_dir = self.dataset_folder_edit.text().strip()
-        if dataset_dir:
-            return Path(dataset_dir)
-        # Fall back to legacy fields.
-        gt_dir = self.ground_truth_data_folder_path_edit.text().strip()
-        input_path = self.input_feature_path_edit.text().strip()
-        if input_path and gt_dir:
-            return Path(os.path.commonpath([
-                str(Path(input_path).parent),
-                str(Path(gt_dir)),
-            ]))
-        elif input_path:
-            return Path(input_path).parent
-        elif gt_dir:
-            return Path(gt_dir)
-        return None
-
-    def _chat_append(self, role: str, text: str) -> None:
-        """Append a message to the chat display."""
-        if role == "user":
-            self.chat_display.appendPlainText(f"\n>> You: {text}")
-        elif role == "system":
-            self.chat_display.appendPlainText(f"\n[System] {text}")
-        else:
-            self.chat_display.appendPlainText(f"\nAI: {text}")
-        # Auto-scroll to bottom.
-        scrollbar = self.chat_display.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
-
-    def _on_chat_send(self) -> None:
-        """Handle Enter or Send button click."""
-        message = self.chat_input.text().strip()
-        if not message:
-            return
-        self._chat_send_message(message)
-
-    def _on_chat_setup_dataset(self) -> None:
-        """Handle the 'Set Up Dataset' button click."""
-        self._chat_send_message(
-            "Scan my dataset folder, identify which files are input parameters and which are ground truth, "
-            "and generate a loader.py with a load_dataset() function that loads the data into standardized numpy arrays."
-        )
-
-    def _chat_send_message(self, message: str) -> None:
-        """Send a message to the chat session in a background thread."""
-        dataset_dir = self._resolve_dataset_dir()
-        if not dataset_dir or not dataset_dir.is_dir():
-            self._show_warning("Please select a dataset folder first.")
-            return
-        session = self._get_chat_session()
-        if session is None:
-            # User cancelled API key dialog — already shown a dialog, nothing more to do.
-            return
-
-        self._chat_append("user", message)
-        self.append_log(f"[AI Assistant] Sending message to Gemini ({session.model_name})...")
-        self.chat_input.clear()
-        self.chat_send_button.setVisible(False)
-        self.chat_stop_button.setVisible(True)
-        self.chat_input.setEnabled(False)
-
-        def _do_chat(*, progress_callback=None, should_stop=None):
-            reply = session.send(message)
-            return {"reply": reply}
-
-        self._start_task(
-            _do_chat,
-            kwargs={},
-            task_name="chat_msg",
-            busy_state="Chat",
-            on_result=self._on_chat_reply,
-        )
-
-    def _on_chat_reply(self, result: dict) -> None:
-        """Handle the AI response."""
-        self.chat_stop_button.setVisible(False)
-        self.chat_send_button.setVisible(True)
-        self.chat_input.setEnabled(True)
-        self.chat_input.setFocus()
-
-        reply = result["reply"]
-        self._chat_append("model", reply)
-
-        # Check if the reply contains a loader.py or README.
-        if self._chat_session:
-            loader_code = self._chat_session.extract_loader(reply)
-            if loader_code:
-                self._last_loader_content = loader_code
-                self.chat_run_loader_button.setEnabled(True)
-                self._chat_append("system", "Loader code detected. Click 'Run & Cache' to load the data.")
-            readme = self._chat_session.extract_readme(reply)
-            if readme:
-                self._last_readme_content = readme
-
-    def _on_chat_save_readme(self) -> None:
-        """Save the last README extracted from chat to the dataset directory."""
-        from .readme_generator import save_readme
-
-        if not self._last_readme_content:
-            self._show_warning("No README content found in the chat history.")
-            return
-
-        dataset_dir = self._resolve_dataset_dir()
-        if not dataset_dir or not dataset_dir.is_dir():
-            self._show_warning("Set the data paths first so we know where to save the README.")
-            return
-
-        # Show preview dialog.
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Save README from Chat")
-        dialog.resize(700, 500)
-        dlayout = QVBoxLayout(dialog)
-        dlayout.addWidget(QLabel(f"Saving to: {dataset_dir}/README.md\nReview and edit if needed:"))
-        editor = QPlainTextEdit()
-        editor.setPlainText(self._last_readme_content)
-        editor.setFont(self.font())
-        dlayout.addWidget(editor)
-        btn_row = QHBoxLayout()
-        save_btn = QPushButton("Save README.md")
-        cancel_btn = QPushButton("Cancel")
-        btn_row.addStretch()
-        btn_row.addWidget(cancel_btn)
-        btn_row.addWidget(save_btn)
-        dlayout.addLayout(btn_row)
-
-        def _save():
-            final = editor.toPlainText()
-            path = save_readme(str(dataset_dir), final)
-            self.append_log(f"README.md saved to {path}")
-            self._chat_append("system", f"README saved to {path}")
-
-            # Always update the dataset folder to where we saved the README.
-            self.dataset_folder_edit.setText(str(dataset_dir))
-
-            # Try to parse the schema for validation and auto-fill.
-            try:
-                from .dataset_schema import parse_dataset_readme
-                schema = parse_dataset_readme(path)
-                self.dataset_schema_status_badge.set_status("Valid")
-                self._chat_append("system", "Paths auto-filled. Click 'Scan Data' to build the cache and start training.")
-            except Exception as exc:
-                self.dataset_schema_status_badge.set_status("Error")
-                self._chat_append("system", f"README saved but schema parse failed: {exc}\nAsk me to fix it, e.g. 'fix the JSON schema'.")
-
-            dialog.accept()
-
-        save_btn.clicked.connect(_save)
-        cancel_btn.clicked.connect(dialog.reject)
-        dialog.exec()
-
-    def _on_chat_run_loader(self) -> None:
-        """Execute the LLM-generated loader code in memory and cache the result."""
-        from .data import build_cache_from_loader
-
-        if not getattr(self, "_last_loader_content", None):
-            self._show_warning("No loader code found in the chat history.")
-            return
-
-        dataset_dir = self._resolve_dataset_dir()
-        if not dataset_dir or not dataset_dir.is_dir():
-            self._show_warning("Set the data paths first.")
-            return
-
-        cache_path = self._ensure_cache_path()
-        self._chat_append("system", "Running loader code...")
-
-        def _run(progress_callback=None, should_stop=None):
-            return build_cache_from_loader(
-                loader_code=self._last_loader_content,
-                dataset_root=str(dataset_dir),
-                cache_path=cache_path,
-                progress_callback=progress_callback,
-            )
-
-        self._start_task(
-            _run,
-            kwargs={},
-            task_name="loader_run",
-            busy_state="Loading",
-            on_result=self._on_loader_run_completed,
-        )
-
-    def _on_loader_run_completed(self, result: dict[str, Any]) -> None:
-        """Handle successful loader execution — treat like a scan result."""
-        from .data import load_split_bundle
-
-        cache_path = result["cache_path"]
-        self._set_cache_path_value(cache_path, manually_selected=False)
-
-        bundle = load_split_bundle(
-            cache_path=cache_path, batch_size=16, seed=42,
-            train_frac=0.8, val_frac=0.1, pin_memory=False,
-        )
-
-        schema = result.get("dataset_schema", {})
-        preview_rows = [
-            ("Samples", str(result["num_samples"])),
-            ("Channels", str(result["num_channels"])),
-            ("Sweep Points", str(result["num_frequencies"])),
-            ("Dataset Name", result["dataset_name"]),
-            ("Cache Status", result["status"]),
-        ]
-
-        scan_result = {
-            "status": "ok",
-            "cache_summary": result,
-            "schema_status": "Valid (loader)",
-            "dataset_name": result["dataset_name"],
-            "readme_path": "",
-            "dataset_root": result["dataset_root"],
-            "input_feature_path": "",
-            "ground_truth_data_dir": result["ground_truth_data_dir"],
-            "cache_path": cache_path,
-            "schema": schema,
-            "preview_rows": preview_rows,
-            "active_input_feature_names": bundle.active_names,
-            "dropped_input_feature_names": bundle.dropped_names,
-            "frequency_count": result["num_frequencies"],
-            "frequency_range_ghz": [
-                float(bundle.frequency_ghz.min()),
-                float(bundle.frequency_ghz.max()),
-            ],
-            "sweep_label": getattr(bundle, "sweep_label", "Frequency (GHz)"),
-        }
-        self._on_scan_completed(scan_result)
-        msg = (f"Data loaded and cached: {result['num_samples']} samples, "
-               f"{result['num_channels']} channels, {result['num_frequencies']} sweep points.")
-
-        # Show validation warnings if any.
-        warnings = result.get("validation_warnings", [])
-        if warnings:
-            warning_text = "\n".join(f"  - {w}" for w in warnings)
-            self._chat_append("system",
-                              f"{msg}\n\nData validation warnings:\n{warning_text}")
-            self.append_log(f"[Run & Cache] {msg} (with warnings)")
-        else:
-            self._chat_append("system", f"{msg} Ready to train.")
-            self.append_log(f"[Run & Cache] {msg}")
-
-    def _on_chat_stop(self) -> None:
-        """Stop the current chat request."""
-        if self.current_task is not None and self.current_task_name == "chat_msg":
-            task = self.current_task
-            # Disconnect signals on the runner so the stale response is ignored.
-            if task.runner is not None:
-                try:
-                    task.runner.signals.result.disconnect()
-                    task.runner.signals.error.disconnect()
-                except (RuntimeError, TypeError):
-                    pass
-            # Request the worker to stop.
-            task.stop()
-            # Retire the old thread safely so it isn't destroyed while running.
-            if task.thread is not None:
-                thread = task.thread
-                try:
-                    thread.finished.disconnect(self._handle_task_finished)
-                except (RuntimeError, TypeError):
-                    pass
-                if not hasattr(self, "_retiring_threads"):
-                    self._retiring_threads: list[QThread] = []
-                self._retiring_threads.append(thread)
-                thread.finished.connect(lambda t=thread: self._retire_thread(t))
-            self.current_task = None
-            self.current_task_name = "idle"
-            self._set_action_controls_enabled(True)
-            self.run_state_badge.set_status("Idle")
-        self.chat_stop_button.setVisible(False)
-        self.chat_send_button.setVisible(True)
-        self.chat_input.setEnabled(True)
-        self._chat_append("system", "Stopped.")
-
-    def _on_chat_clear(self) -> None:
-        """Clear chat history and display."""
-        if self._chat_session:
-            self._chat_session.clear()
-        self.chat_display.clear()
-        self._last_readme_content = None
-        self._last_loader_content = None
-        self.chat_run_loader_button.setEnabled(False)
-
     def browse_cache_path(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "Select Cache File", self.cache_path_edit.text(), "NumPy Cache (*.npz)")
         if path:
@@ -1884,18 +1344,6 @@ class MlpTrainingStudio(QMainWindow):
         if self.current_task_name == "scan":
             self.dataset_schema_status_badge.set_status("Error")
             pass
-        if self.current_task_name == "readme_gen":
-            pass  # readme generation recovered
-        if self.current_task_name == "chat_msg":
-            self.chat_stop_button.setVisible(False)
-            self.chat_send_button.setVisible(True)
-            self.chat_input.setEnabled(True)
-            self._chat_append("system", f"Error: {message}")
-            return  # Don't show popup for chat errors — just show in chat.
-        if self.current_task_name == "loader_run":
-            self._chat_append("system", f"Loader failed: {message}")
-            self.append_log(f"[Run & Cache] Error: {message}")
-            return
         self.append_log(f"Error: {message}")
         self._show_warning(f"{message}\n\n{traceback_text}")
 
@@ -1903,7 +1351,7 @@ class MlpTrainingStudio(QMainWindow):
         """Reset task bookkeeping so a new task can start immediately.
 
         This is needed when an error or result callback wants to chain into a
-        follow-up task (e.g. auto-sending loader errors to the LLM).  The Qt
+        follow-up task.  The Qt
         ``finished`` signal travels through ``thread.quit → thread.finished``
         and arrives asynchronously, so ``current_task`` is still set when the
         error/result callback fires.  Clearing it here avoids the "A task is
@@ -1943,7 +1391,7 @@ class MlpTrainingStudio(QMainWindow):
         self.current_task_name = "idle"
         self._set_action_controls_enabled(True)
         self.stop_training_button.setEnabled(False)
-        if self.run_state_badge.text() in {"Training", "Transfer", "Searching", "Scanning", "Suggesting", "Checking", "Chat"}:
+        if self.run_state_badge.text() in {"Training", "Transfer", "Searching", "Scanning", "Suggesting", "Checking"}:
             self.run_state_badge.set_status("Idle")
 
     # ------------------------------------------------------------------
@@ -2393,11 +1841,6 @@ class MlpTrainingStudio(QMainWindow):
                 self.metric_cards["eta"].set_value(self._format_seconds(payload.get("eta_seconds")))
             self.run_state_badge.set_status("Stopped")
 
-    def _on_model_type_changed(self, model_type: str) -> None:
-        is_spectral = model_type == "SpectralNet"
-        self.baseline_latent_dim_spin_box.setEnabled(is_spectral)
-        self.baseline_fourier_bands_spin_box.setEnabled(is_spectral)
-
     # ------------------------------------------------------------------
     # Form helpers
     # ------------------------------------------------------------------
@@ -2410,10 +1853,8 @@ class MlpTrainingStudio(QMainWindow):
             "learning_rate": float(self.baseline_learning_rate_spin_box.value()),
             "weight_decay": float(self.baseline_weight_decay_spin_box.value()),
             "gradient_clip": float(self.baseline_gradient_clip_spin_box.value()),
-            "latent_dim": self.baseline_latent_dim_spin_box.value(),
             "width": self.baseline_width_spin_box.value(),
             "depth": self.baseline_depth_spin_box.value(),
-            "fourier_bands": self.baseline_fourier_bands_spin_box.value(),
             "dropout": float(self.baseline_dropout_spin_box.value()),
             "loss_function": self.baseline_loss_function_combo_box.currentText(),
             "scheduler": self.baseline_scheduler_combo_box.currentText(),
@@ -2425,7 +1866,7 @@ class MlpTrainingStudio(QMainWindow):
     def _apply_baseline_form(self, payload: dict[str, Any]) -> None:
         if not payload:
             return
-        model_type = payload.get("model_type", "SpectralNet")
+        model_type = payload.get("model_type", "FlatMLP")
         if model_type in MODEL_TYPES:
             self.baseline_model_type_combo_box.setCurrentText(model_type)
         self.baseline_epochs_spin_box.setValue(int(payload.get("epochs", self.baseline_epochs_spin_box.value())))
@@ -2434,10 +1875,8 @@ class MlpTrainingStudio(QMainWindow):
         self.baseline_learning_rate_spin_box.setValue(float(payload.get("learning_rate", self.baseline_learning_rate_spin_box.value())))
         self.baseline_weight_decay_spin_box.setValue(float(payload.get("weight_decay", self.baseline_weight_decay_spin_box.value())))
         self.baseline_gradient_clip_spin_box.setValue(float(payload.get("gradient_clip", self.baseline_gradient_clip_spin_box.value())))
-        self.baseline_latent_dim_spin_box.setValue(int(payload.get("latent_dim", self.baseline_latent_dim_spin_box.value())))
         self.baseline_width_spin_box.setValue(int(payload.get("width", self.baseline_width_spin_box.value())))
         self.baseline_depth_spin_box.setValue(int(payload.get("depth", self.baseline_depth_spin_box.value())))
-        self.baseline_fourier_bands_spin_box.setValue(int(payload.get("fourier_bands", self.baseline_fourier_bands_spin_box.value())))
         self.baseline_dropout_spin_box.setValue(float(payload.get("dropout", self.baseline_dropout_spin_box.value())))
         loss_fn = payload.get("loss_function", "rmse")
         if loss_fn in LOSS_FUNCTIONS:
@@ -2505,10 +1944,8 @@ class MlpTrainingStudio(QMainWindow):
             gradient_clip=form["gradient_clip"],
             train_frac=form["train_frac"],
             val_frac=form["val_frac"],
-            latent_dim=form["latent_dim"],
             width=form["width"],
             depth=form["depth"],
-            fourier_bands=form["fourier_bands"],
             dropout=form["dropout"],
             loss_function=form["loss_function"],
             scheduler=form["scheduler"],
@@ -2840,7 +2277,7 @@ class MlpTrainingStudio(QMainWindow):
         baseline = result["suggested_baseline_config"]
         baseline_ranges = result["suggested_baseline_ranges"]
         baseline_rationale = result["baseline_rationale"]
-        for name in ["latent_dim", "width", "depth", "fourier_bands", "batch_size", "learning_rate", "dropout", "weight_decay", "epochs", "patience"]:
+        for name in ["width", "depth", "batch_size", "learning_rate", "dropout", "weight_decay", "epochs", "patience"]:
             range_info = baseline_ranges.get(name, {})
             rows.append((f"Baseline: {self._prettify_key(name)}", self._stringify(baseline[name]), self._stringify(range_info.get("candidates", [])), baseline_rationale.get(name, "")))
         transfer = result["suggested_transfer_config"]
@@ -2857,7 +2294,6 @@ class MlpTrainingStudio(QMainWindow):
             str(trial["rank"]),
             str(config["width"]),
             str(config["depth"]),
-            str(config["latent_dim"]),
             f"{config['learning_rate']:.1e}",
             str(config["batch_size"]),
             f"{config['dropout']:.3f}",
@@ -3016,7 +2452,7 @@ class MlpTrainingStudio(QMainWindow):
         self._update_topbar_run_name()
 
     def _autofill_run_name_from_dataset_folder(self) -> None:
-        """Auto-fill run name, detect README, and reset chat session when dataset folder changes."""
+        """Auto-fill the run name and reset scan status when the dataset folder changes."""
         dataset_dir = self.dataset_folder_edit.text().strip()
         if dataset_dir:
             folder_name = Path(dataset_dir).name or Path(dataset_dir).stem
@@ -3027,15 +2463,7 @@ class MlpTrainingStudio(QMainWindow):
             self.ground_truth_data_folder_path_edit.clear()
         if dataset_dir:
             self.dataset_schema_status_badge.set_status("Not Scanned")
-        # Reset chat session so the next chat message rescans the new folder.
-        if self._chat_session is not None:
-            new_dir = Path(dataset_dir) if dataset_dir else None
-            if new_dir and (self._chat_session.dataset_dir is None or str(new_dir) != str(self._chat_session.dataset_dir)):
-                self._chat_session = None
-                self._last_readme_content = None
-                self._last_loader_content = None
-                self.chat_run_loader_button.setEnabled(False)
-                self._sync_auto_cache_path()
+        self._sync_auto_cache_path()
         self._update_topbar_run_name()
 
     def _autofill_run_name_from_gt_dir(self) -> None:

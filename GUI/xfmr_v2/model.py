@@ -1,49 +1,19 @@
-"""Compact branch/trunk model for XFMR spectral prediction.
+"""Compact feed-forward models for XFMR spectral prediction.
 
-The model follows a simple neural-operator-style pattern:
-- the branch network reads per-sample input features
-- the trunk network reads frequency coordinates
-- the final prediction is their interaction across a latent dimension
-
-This layout is a good fit for problems where one sample produces an entire curve
-over frequency rather than a single scalar output.
+Each model maps per-sample input features to an entire ``(channels, frequency)``
+output curve in one shot:
+- :class:`FlatMLPNet` is a single MLP from inputs to the flattened output.
+- :class:`CTLEMultiTaskMLP` shares an encoder and uses one linear head per channel.
 """
 
 from __future__ import annotations
-
-import math
 
 import torch
 from torch import nn
 
 
-class FourierEncoder(nn.Module):
-    """Expand normalized frequency into sinusoidal features."""
-
-    def __init__(self, bands: int) -> None:
-        super().__init__()
-        # Use exponentially spaced frequencies so the trunk can represent both
-        # slow and fast variation across the normalized frequency axis.
-        band_values = torch.tensor([2.0**i for i in range(bands)], dtype=torch.float32) * math.pi
-        self.register_buffer("band_values", band_values, persistent=False)
-
-    @property
-    def out_dim(self) -> int:
-        # Each band contributes one sine and one cosine term, plus the original
-        # coordinate itself so the network can still use the raw frequency value.
-        return 1 + 2 * int(self.band_values.numel())
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Accept either shape `(freq,)` or `(freq, 1)` to keep caller code simple.
-        if x.dim() == 1:
-            x = x.unsqueeze(-1)
-        phase = x * self.band_values
-        # Concatenate the raw coordinate with its sinusoidal features.
-        return torch.cat((x, torch.sin(phase), torch.cos(phase)), dim=-1)
-
-
 class MLP(nn.Module):
-    """Shared helper for the branch and trunk nets."""
+    """Shared MLP helper used by the models below."""
 
     def __init__(self, in_dim: int, hidden: int, out_dim: int, depth: int, dropout: float) -> None:
         super().__init__()
@@ -72,10 +42,8 @@ class MLP(nn.Module):
 class FlatMLPNet(nn.Module):
     """Standalone MLP that directly maps input features to the full spectral output.
 
-    Unlike SpectralNet, this model does not use frequency coordinates or a
-    branch/trunk decomposition.  It simply predicts the entire
-    ``(channels, num_frequencies)`` output from input features in one shot,
-    making it a natural flat-MLP baseline for comparison.
+    It does not use frequency coordinates; it predicts the entire
+    ``(channels, num_frequencies)`` output from input features in one shot.
 
     The ``num_frequencies`` value must be provided at construction time because
     the output layer size depends on it.
@@ -89,9 +57,6 @@ class FlatMLPNet(nn.Module):
         width: int = 256,
         depth: int = 4,
         dropout: float = 0.05,
-        # Accept but ignore SpectralNet-only args so the same config dict works.
-        latent_dim: int = 128,
-        fourier_bands: int = 16,
     ) -> None:
         super().__init__()
         self.ground_truth_channels = ground_truth_channels
@@ -108,38 +73,6 @@ class FlatMLPNet(nn.Module):
         # ``frequency`` is accepted for interface compatibility but not used.
         out = self.network(input_features)
         return out.view(input_features.shape[0], self.ground_truth_channels, self.num_frequencies)
-
-
-class SpectralNet(nn.Module):
-    """Input-feature branch + frequency trunk network."""
-
-    def __init__(
-        self,
-        input_feature_dim: int,
-        ground_truth_channels: int,
-        latent_dim: int = 128,
-        width: int = 256,
-        depth: int = 4,
-        fourier_bands: int = 16,
-        dropout: float = 0.05,
-    ) -> None:
-        super().__init__()
-        # The branch network outputs one latent vector per output channel.
-        self.ground_truth_channels = ground_truth_channels
-        self.latent_dim = latent_dim
-        self.frequency_encoder = FourierEncoder(fourier_bands)
-        self.branch = MLP(input_feature_dim, width, ground_truth_channels * latent_dim, depth, dropout)
-        self.trunk = MLP(self.frequency_encoder.out_dim, width, latent_dim, depth, dropout)
-        # A learned per-channel bias helps the network model simple offsets directly.
-        self.bias = nn.Parameter(torch.zeros(ground_truth_channels, 1))
-
-    def forward(self, input_features: torch.Tensor, frequency: torch.Tensor) -> torch.Tensor:
-        # Branch output: one latent representation per sample and output channel.
-        branch = self.branch(input_features).view(input_features.shape[0], self.ground_truth_channels, self.latent_dim)
-        # Trunk output: one latent representation per frequency coordinate.
-        trunk = self.trunk(self.frequency_encoder(frequency))
-        # Contract the latent dimension to produce `(batch, channels, frequency)`.
-        return torch.einsum("bcl,fl->bcf", branch, trunk) + self.bias
 
 
 def _symmetric_hidden_sizes(width: int, depth: int) -> list[int]:
@@ -194,9 +127,6 @@ class CTLEMultiTaskMLP(nn.Module):
         width: int = 256,
         depth: int = 5,
         dropout: float = 0.0,
-        # Accept but ignore SpectralNet-only args.
-        latent_dim: int = 128,
-        fourier_bands: int = 16,
     ) -> None:
         super().__init__()
         self.ground_truth_channels = ground_truth_channels

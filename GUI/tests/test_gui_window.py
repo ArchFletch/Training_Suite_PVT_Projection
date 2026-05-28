@@ -77,7 +77,7 @@ def test_window_scan_and_suggest_populate_preview_and_forms(
     gui_window.apply_suggested_settings()
     baseline_config = gui_window.last_suggest_result["suggested_baseline_config"]
     transfer_config = gui_window.last_suggest_result["suggested_transfer_config"]
-    assert gui_window.baseline_latent_dim_spin_box.value() == baseline_config["latent_dim"]
+    assert gui_window.baseline_width_spin_box.value() == baseline_config["width"]
     assert gui_window.transfer_num_bands_spin_box.value() == transfer_config["num_bands"]
 
 

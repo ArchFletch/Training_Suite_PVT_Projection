@@ -40,7 +40,7 @@ class SearchConfig:
     val_frac: float = 0.1
     max_samples: int | None = None
     search_max_samples: int | None = None
-    model_type: str = "SpectralNet"
+    model_type: str = "FlatMLP"
     trial_count: int = 6
     epochs_per_trial: int = 60
     patience_per_trial: int | None = None
@@ -282,10 +282,8 @@ def _build_search_summary(
             for name, values in suggestion["suggested_baseline_ranges"].items()
             if name
             in {
-                "latent_dim",
                 "width",
                 "depth",
-                "fourier_bands",
                 "batch_size",
                 "learning_rate",
                 "dropout",
@@ -380,7 +378,6 @@ def _build_candidate_entries(
         (
             "smaller_model",
             {
-                "latent_dim": lower("latent_dim", base_trial_config.latent_dim),
                 "width": lower("width", base_trial_config.width),
                 "depth": lower("depth", base_trial_config.depth),
             },
@@ -388,7 +385,6 @@ def _build_candidate_entries(
         (
             "larger_model",
             {
-                "latent_dim": higher("latent_dim", base_trial_config.latent_dim),
                 "width": higher("width", base_trial_config.width),
                 "depth": higher("depth", base_trial_config.depth),
             },
@@ -411,8 +407,6 @@ def _build_candidate_entries(
         ),
         ("smaller_batch", {"batch_size": lower("batch_size", base_trial_config.batch_size)}),
         ("larger_batch", {"batch_size": higher("batch_size", base_trial_config.batch_size)}),
-        ("fewer_fourier_bands", {"fourier_bands": lower("fourier_bands", base_trial_config.fourier_bands)}),
-        ("more_fourier_bands", {"fourier_bands": higher("fourier_bands", base_trial_config.fourier_bands)}),
     ]
 
     entries: list[dict[str, Any]] = []
@@ -464,10 +458,8 @@ def _apply_updates(config: TrainConfig, updates: dict[str, Any]) -> TrainConfig:
 def _config_signature(config: TrainConfig) -> tuple[Any, ...]:
     # The signature focuses only on the dimensions the search actually varies.
     return (
-        config.latent_dim,
         config.width,
         config.depth,
-        config.fourier_bands,
         config.batch_size,
         float(config.learning_rate),
         float(config.dropout),
@@ -490,13 +482,11 @@ def _fallback_candidate_updates(base_config: TrainConfig, ranges: dict[str, dict
     # If the hand-written proposals were not enough to fill the requested trial count,
     # generate simple multi-axis combinations ranked from "closest to base" outward.
     axes = {
-        "latent_dim": list(ranges.get("latent_dim", {}).get("candidates", [base_config.latent_dim])),
         "width": list(ranges.get("width", {}).get("candidates", [base_config.width])),
         "depth": list(ranges.get("depth", {}).get("candidates", [base_config.depth])),
         "learning_rate": list(ranges.get("learning_rate", {}).get("candidates", [base_config.learning_rate])),
         "dropout": list(ranges.get("dropout", {}).get("candidates", [base_config.dropout])),
         "batch_size": list(ranges.get("batch_size", {}).get("candidates", [base_config.batch_size])),
-        "fourier_bands": list(ranges.get("fourier_bands", {}).get("candidates", [base_config.fourier_bands])),
         "weight_decay": list(ranges.get("weight_decay", {}).get("candidates", [base_config.weight_decay])),
     }
     base_values = {name: getattr(base_config, name) for name in axes}
@@ -514,7 +504,7 @@ def _fallback_candidate_updates(base_config: TrainConfig, ranges: dict[str, dict
                 distance += abs(index_maps[name][value] - index_maps[name][base_values[name]])
         if not updates:
             continue
-        complexity = float(combo_values["width"] * combo_values["depth"] * combo_values["latent_dim"])
+        complexity = float(combo_values["width"] * combo_values["depth"])
         ranked.append((changed, distance, complexity, updates))
     ranked.sort(key=lambda item: (item[0], item[1], item[2]))
     return [updates for _, _, _, updates in ranked]

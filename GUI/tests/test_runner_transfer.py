@@ -24,13 +24,11 @@ def test_train_band_reports_elapsed_and_eta(monkeypatch) -> None:
     model_kwargs = {
         "input_feature_dim": 1,
         "ground_truth_channels": 1,
-        "latent_dim": 4,
         "width": 8,
         "depth": 2,
-        "fourier_bands": 2,
         "dropout": 0.0,
     }
-    init_model = runner.SpectralNet(**model_kwargs)
+    init_model = runner.FlatMLPNet(num_frequencies=3, **model_kwargs)
     init_state = runner.clone_state(init_model.state_dict())
     loader = DataLoader(
         # A tiny deterministic tensor dataset is enough because the patched epoch
@@ -56,6 +54,8 @@ def test_train_band_reports_elapsed_and_eta(monkeypatch) -> None:
         progress_callback=events.append,
         event_context={"band_run_index": 2, "total_band_runs": 5},
         run_start_time=perf_counter() - 0.5,
+        model_type="FlatMLP",
+        num_frequencies=3,
     )
 
     epoch_events = [event for event in events if event["event"] == "band_epoch_end"]
