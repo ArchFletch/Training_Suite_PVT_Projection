@@ -73,6 +73,9 @@ class TrainConfig:
     # Runtime controls.
     use_amp: bool = True
     max_samples: int | None = None
+    # Compute device to train on, e.g. "cuda:0", "cuda:1", or "cpu".
+    # ``None`` means auto-select (first CUDA device when available, else CPU).
+    device: str | None = None
 
     # Presets — notebook-validated defaults for known dataset families.
     PRESETS: dict[str, dict[str, Any]] = None  # type: ignore[assignment]
@@ -128,9 +131,34 @@ class TransferConfig:
     weight_decay: float | None = None
     gradient_clip: float = 1.0
     use_amp: bool = True
+    # Compute device to train on, e.g. "cuda:0", "cuda:1", or "cpu".
+    # ``None`` means auto-select (first CUDA device when available, else CPU).
+    device: str | None = None
 
 
 MODEL_TYPES = ("SpectralNet", "FlatMLP", "CTLE_MLP")
+
+
+def resolve_device(spec: str | None) -> torch.device:
+    """Turn a user-supplied device string into a usable ``torch.device``.
+
+    ``None`` (or an empty string) auto-selects the first CUDA device when CUDA is
+    available, otherwise CPU. A requested CUDA device falls back to CPU when CUDA
+    is unavailable so a stale selection can never crash a run.
+
+    When a specific CUDA device is selected, it is also made the current CUDA
+    device so AMP / ``GradScaler`` and any current-device-implicit ops land on the
+    same GPU the tensors are moved to.
+    """
+    if not spec:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    elif spec.startswith("cuda") and not torch.cuda.is_available():
+        device = torch.device("cpu")
+    else:
+        device = torch.device(spec)
+    if device.type == "cuda" and device.index is not None:
+        torch.cuda.set_device(device)
+    return device
 
 
 def build_model(model_type: str, *, num_frequencies: int, **kwargs: Any) -> nn.Module:
@@ -212,7 +240,7 @@ def run_baseline_trial(
     )
     seed_all(config.seed)
     enable_fast_cuda()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_device(config.device)
     bundle: Any | None = None
     history: list[dict[str, float]] = []
     best_val = float("inf")
@@ -661,7 +689,7 @@ def run_self_transfer(
     )
     seed_all(config.seed)
     enable_fast_cuda()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_device(config.device)
     amp = config.use_amp and device.type == "cuda"
     run_dir = make_run_dir(config.output_dir)
     results: list[dict[str, Any]] = []

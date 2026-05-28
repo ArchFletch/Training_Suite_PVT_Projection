@@ -10,14 +10,13 @@ from typing import Any
 
 import pyqtgraph as pg
 from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
-from PySide6.QtGui import QCloseEvent
+from PySide6.QtGui import QCloseEvent, QKeyEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
-    QDockWidget,
     QDoubleSpinBox,
     QFileDialog,
     QFrame,
@@ -39,6 +38,7 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
+    QTextEdit,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -49,12 +49,10 @@ from .gui_backend import (
     build_suggest_result,
     check_transfer_compatibility,
     default_run_name,
-    detect_environment,
-    load_gui_config,
+    list_available_devices,
     load_last_session,
     make_run_roots,
     run_training_workflow,
-    save_gui_config,
     save_last_session,
     scan_dataset,
 )
@@ -121,6 +119,39 @@ class _NoScrollComboBox(QComboBox):
             event.ignore()
         else:
             super().wheelEvent(event)
+
+
+class _ChatInput(QTextEdit):
+    """Multi-line text input that sends on Enter and inserts newlines on Shift+Enter."""
+
+    submitted = Signal()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setAcceptRichText(False)
+        self.setPlaceholderText("Type a message... (Enter to send, Shift+Enter for new line)")
+        self.setMinimumHeight(36)
+        self.setMaximumHeight(120)
+        # Start compact; grows with content up to max.
+        self.document().contentsChanged.connect(self._adjust_height)
+
+    def _adjust_height(self) -> None:
+        doc_height = int(self.document().size().height()) + 12
+        self.setFixedHeight(max(36, min(doc_height, 120)))
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and not event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+            event.accept()
+            self.submitted.emit()
+            return
+        super().keyPressEvent(event)
+
+    def text(self) -> str:
+        return self.toPlainText()
+
+    def clear(self) -> None:
+        super().clear()
+        self.setFixedHeight(36)
 
 
 class _LicenseStateBridge(QObject):
@@ -276,20 +307,6 @@ class MlpTrainingStudio(QMainWindow):
         splitter.setSizes([760, 740])
         self.main_splitter = splitter
 
-        # Run Log as a dock widget inside the main window.
-        self.run_log_text_edit = QPlainTextEdit()
-        self.run_log_text_edit.setReadOnly(True)
-        self.run_log_text_edit.setMaximumBlockCount(4000)
-        self.run_log_text_edit.setStyleSheet(
-            'QPlainTextEdit { font-family: "Cascadia Code", "Consolas", monospace; font-size: 9.5pt; }'
-        )
-        run_log_dock = QDockWidget("Run Log", self)
-        run_log_dock.setWidget(self.run_log_text_edit)
-        run_log_dock.setAllowedAreas(
-            Qt.DockWidgetArea.BottomDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
-        )
-        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, run_log_dock)
-
     def _build_top_bar(self) -> QWidget:
         top_bar = QFrame()
         top_bar.setObjectName("TopBar")
@@ -300,25 +317,12 @@ class MlpTrainingStudio(QMainWindow):
         title_col = QVBoxLayout()
         title_label = QLabel("Surrogate Model Traning Suite")
         title_label.setObjectName("TopBarTitle")
-        subtitle = QLabel("README-driven baseline training and frequency-domain self-transfer learning")
-        subtitle.setObjectName("TopBarSubtitle")
         title_col.addWidget(title_label)
-        title_col.addWidget(subtitle)
         layout.addLayout(title_col, 1)
 
         self.topbar_run_name = QLabel("No run configured")
         self.topbar_run_name.setObjectName("TopBarSubtitle")
         layout.addWidget(self.topbar_run_name)
-
-        self.load_config_button = self._make_button("Load Config", secondary=True)
-        self.save_config_button = self._make_button("Save Config", secondary=True)
-        self.recheck_hardware_button = self._make_button("Detect Environment", secondary=True)
-        self.load_config_button.clicked.connect(self.load_config_file)
-        self.save_config_button.clicked.connect(self.save_config_file)
-        self.recheck_hardware_button.clicked.connect(self.refresh_environment)
-        layout.addWidget(self.load_config_button)
-        layout.addWidget(self.save_config_button)
-        layout.addWidget(self.recheck_hardware_button)
         return top_bar
 
     def _build_left_pane(self) -> QWidget:
@@ -339,7 +343,6 @@ class MlpTrainingStudio(QMainWindow):
         self.left_layout.setSpacing(12)
         scroll.setWidget(content)
 
-        self.left_layout.addWidget(self._build_environment_card())
         self.left_layout.addWidget(self._build_license_card())
         self.left_layout.addWidget(self._build_data_sources_card())
         self.left_layout.addWidget(self._build_dataset_preview_card())
@@ -357,33 +360,34 @@ class MlpTrainingStudio(QMainWindow):
         layout.setSpacing(10)
 
         layout.addWidget(self._build_metrics_card(), 0)
-        layout.addWidget(self._build_monitor_tabs(), 1)
+
+        # Monitor plots on top, run log below — both resizable via a vertical splitter.
+        monitor_log_splitter = QSplitter(Qt.Orientation.Vertical)
+        monitor_log_splitter.setChildrenCollapsible(False)
+        monitor_log_splitter.setHandleWidth(10)
+        monitor_log_splitter.addWidget(self._build_monitor_tabs())
+        monitor_log_splitter.addWidget(self._build_run_log_card())
+        monitor_log_splitter.setStretchFactor(0, 3)
+        monitor_log_splitter.setStretchFactor(1, 1)
+        monitor_log_splitter.setSizes([640, 220])
+        layout.addWidget(monitor_log_splitter, 1)
         return container
 
-    def _build_environment_card(self) -> QWidget:
+    def _build_run_log_card(self) -> QWidget:
         card = CardFrame()
         layout = QVBoxLayout(card)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
-        layout.addWidget(self._section_header("System & Environment", "Hardware detection and backend runtime readiness"))
+        layout.addWidget(self._section_header("Run Log", "Live status, scan, and training messages"))
 
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(10)
-        grid.setVerticalSpacing(8)
-
-        self.detected_gpu_value = QLabel("Not checked yet")
-        self.cuda_status_badge = StatusBadge("Not Checked")
-        self.pytorch_cuda_value = QLabel("Not checked yet")
-        self.backend_device_value = QLabel("Not checked yet")
-        self.environment_status_text = QLabel("Click Detect Environment to check GPU, CUDA, and backend readiness.")
-        self.environment_status_text.setWordWrap(True)
-
-        self._add_form_row(grid, 0, "Detected GPU", self.detected_gpu_value)
-        self._add_form_row(grid, 1, "CUDA Status", self.cuda_status_badge)
-        self._add_form_row(grid, 2, "PyTorch CUDA", self.pytorch_cuda_value)
-        self._add_form_row(grid, 3, "Training Device", self.backend_device_value)
-        layout.addLayout(grid)
-        layout.addWidget(self.environment_status_text)
+        self.run_log_text_edit = QPlainTextEdit()
+        self.run_log_text_edit.setReadOnly(True)
+        self.run_log_text_edit.setMaximumBlockCount(4000)
+        self.run_log_text_edit.setMinimumHeight(90)
+        self.run_log_text_edit.setStyleSheet(
+            'QPlainTextEdit { font-family: "Cascadia Code", "Consolas", monospace; font-size: 9.5pt; }'
+        )
+        layout.addWidget(self.run_log_text_edit, 1)
         return card
 
     def _build_license_card(self) -> QWidget:
@@ -571,12 +575,53 @@ class MlpTrainingStudio(QMainWindow):
         layout.setSpacing(12)
         layout.addWidget(self._section_header("Training Settings", "Editable baseline and transfer hyperparameters"))
 
+        device_grid = QGridLayout()
+        device_grid.setHorizontalSpacing(10)
+        device_grid.setVerticalSpacing(8)
+        self.training_device_combo_box = _NoScrollComboBox()
+        self.training_device_combo_box.setToolTip(
+            "Compute unit used for baseline and transfer training. Detected automatically when the app starts."
+        )
+        self._populate_device_choices()
+        self._add_form_row(device_grid, 0, "Training Device", self.training_device_combo_box)
+        layout.addLayout(device_grid)
+
         self.training_tabs = QTabWidget()
         layout.addWidget(self.training_tabs)
 
         self.training_tabs.addTab(self._build_baseline_tab(), "Baseline Training")
         self.training_tabs.addTab(self._build_transfer_tab(), "Self-Transfer Learning")
         return card
+
+    def _populate_device_choices(self) -> None:
+        """Auto-detect compute devices and fill the Training Device dropdown.
+
+        Called once while the window is built so the user never has to trigger a
+        manual environment check. The first CUDA device (when present) is selected
+        by default, matching the previous auto-select behavior.
+        """
+        previous = self.training_device_combo_box.currentData()
+        self.training_device_combo_box.blockSignals(True)
+        self.training_device_combo_box.clear()
+        for device in list_available_devices():
+            self.training_device_combo_box.addItem(device["label"], device["id"])
+        if previous is not None:
+            restored = self.training_device_combo_box.findData(previous)
+            if restored >= 0:
+                self.training_device_combo_box.setCurrentIndex(restored)
+        self.training_device_combo_box.blockSignals(False)
+
+    def _current_device_id(self) -> str | None:
+        """Return the selected device string (e.g. ``"cuda:0"``) for a run config."""
+        return self.training_device_combo_box.currentData()
+
+    def _set_device_selection(self, device_id: str | None) -> None:
+        """Select ``device_id`` when it is still available; otherwise leave the default."""
+        if not device_id:
+            return
+        index = self.training_device_combo_box.findData(device_id)
+        if index >= 0:
+            self.training_device_combo_box.setCurrentIndex(index)
 
     def _build_baseline_tab(self) -> QWidget:
         tab = QWidget()
@@ -764,7 +809,7 @@ class MlpTrainingStudio(QMainWindow):
     def _build_monitor_tabs(self) -> QWidget:
         tabs = QTabWidget()
         tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        tabs.setMinimumHeight(420)
+        tabs.setMinimumHeight(200)
 
         baseline_tab = QWidget()
         baseline_layout = QGridLayout(baseline_tab)
@@ -773,8 +818,8 @@ class MlpTrainingStudio(QMainWindow):
         baseline_layout.setVerticalSpacing(12)
         self.baseline_loss_plot = pg.PlotWidget()
         self.baseline_frequency_mae_plot = pg.PlotWidget()
-        self.baseline_loss_plot.setMinimumHeight(320)
-        self.baseline_frequency_mae_plot.setMinimumHeight(320)
+        self.baseline_loss_plot.setMinimumHeight(160)
+        self.baseline_frequency_mae_plot.setMinimumHeight(160)
         baseline_layout.addWidget(self.baseline_loss_plot, 0, 0)
         baseline_layout.addWidget(self.baseline_frequency_mae_plot, 0, 1)
         baseline_layout.setColumnStretch(0, 1)
@@ -787,7 +832,7 @@ class MlpTrainingStudio(QMainWindow):
         transfer_layout.setContentsMargins(12, 12, 12, 12)
         transfer_layout.setSpacing(10)
         self.transfer_frequency_mae_plot = pg.PlotWidget(transfer_tab)
-        self.transfer_frequency_mae_plot.setMinimumHeight(520)
+        self.transfer_frequency_mae_plot.setMinimumHeight(200)
         transfer_layout.addWidget(self.transfer_frequency_mae_plot, 1)
         tabs.addTab(transfer_tab, "Transfer Results")
 
@@ -848,9 +893,8 @@ class MlpTrainingStudio(QMainWindow):
         # Input row
         input_row = QHBoxLayout()
         input_row.setSpacing(8)
-        self.chat_input = QLineEdit()
-        self.chat_input.setPlaceholderText("Type a message... (Enter to send)")
-        self.chat_input.returnPressed.connect(self._on_chat_send)
+        self.chat_input = _ChatInput()
+        self.chat_input.submitted.connect(self._on_chat_send)
         input_row.addWidget(self.chat_input, 1)
 
         self.chat_send_button = self._make_button("Send")
@@ -924,6 +968,7 @@ class MlpTrainingStudio(QMainWindow):
 
     def collect_config_payload(self) -> dict[str, Any]:
         return {
+            "device": self._current_device_id(),
             "data_sources": {
                 "input_feature_path": self.input_feature_path_edit.text().strip(),
                 "ground_truth_data_dir": self.ground_truth_data_folder_path_edit.text().strip(),
@@ -946,6 +991,7 @@ class MlpTrainingStudio(QMainWindow):
         }
 
     def apply_config_payload(self, payload: dict[str, Any]) -> None:
+        self._set_device_selection(payload.get("device"))
         data_sources = payload.get("data_sources", {})
         self.input_feature_path_edit.setText(str(data_sources.get("input_feature_path", "")))
         self.ground_truth_data_folder_path_edit.setText(str(data_sources.get("ground_truth_data_dir", "")))
@@ -1125,20 +1171,6 @@ class MlpTrainingStudio(QMainWindow):
     # ------------------------------------------------------------------
     # Actions
     # ------------------------------------------------------------------
-    def refresh_environment(self) -> None:
-        self.cuda_status_badge.set_status("Checking")
-        self.detected_gpu_value.setText("Checking...")
-        self.pytorch_cuda_value.setText("Checking...")
-        self.backend_device_value.setText("Checking...")
-        self.environment_status_text.setText("Checking CUDA availability...")
-        self._start_task(
-            detect_environment,
-            kwargs={},
-            task_name="environment",
-            busy_state="Checking",
-            on_result=self._on_environment_completed,
-        )
-
     def scan_dataset(self) -> None:
         payload = self._require_data_paths()
         if payload is None:
@@ -1741,22 +1773,6 @@ class MlpTrainingStudio(QMainWindow):
         Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
         self.append_log(f"Exported GUI summary to {path}")
 
-    def save_config_file(self) -> None:
-        default_path = self._default_dialog_root() / f"{self.run_name_edit.text().strip() or 'mlp_run'}_gui_config.json"
-        path, _ = QFileDialog.getSaveFileName(self, "Save GUI Config", str(default_path), "JSON Files (*.json)")
-        if not path:
-            return
-        save_gui_config(path, self.collect_config_payload())
-        self.append_log(f"Saved GUI configuration to {path}")
-
-    def load_config_file(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Load GUI Config", str(self._default_dialog_root()), "JSON Files (*.json)")
-        if not path:
-            return
-        payload = load_gui_config(path)
-        self.apply_config_payload(payload)
-        self.append_log(f"Loaded GUI configuration from {path}")
-
     def run_license_connection_test(self) -> None:
         server_url = normalize_server_url(self.license_server_url_edit.text())
         if not server_url:
@@ -1954,19 +1970,6 @@ class MlpTrainingStudio(QMainWindow):
             return
         if phase == "transfer":
             self._update_transfer_progress(payload)
-
-    def _on_environment_completed(self, result: dict[str, Any]) -> None:
-        self.cuda_status_badge.set_status(result["status"])
-        self.detected_gpu_value.setText(result["detected_gpu"])
-        pytorch_cuda = result["pytorch_cuda"]
-        if result["pytorch_cuda_version"]:
-            pytorch_cuda = f"{pytorch_cuda} ({result['pytorch_cuda_version']})"
-        self.pytorch_cuda_value.setText(pytorch_cuda)
-        self.backend_device_value.setText(result["device_used_by_backend"].upper())
-        self.environment_status_text.setText(result["device_summary"])
-        self.append_log(result["device_summary"])
-        if self.run_state_badge.text() == "Checking":
-            self.run_state_badge.set_status("Idle")
 
     def _on_scan_completed(self, result: dict[str, Any]) -> None:
         self.last_scan_result = result
@@ -2511,6 +2514,7 @@ class MlpTrainingStudio(QMainWindow):
             scheduler=form["scheduler"],
             use_amp=form.get("use_amp", True),
             max_samples=None,
+            device=self._current_device_id(),
         )
 
     def _build_transfer_config(self) -> TransferConfig:
@@ -2530,6 +2534,7 @@ class MlpTrainingStudio(QMainWindow):
             weight_decay=form["weight_decay"],
             gradient_clip=form["gradient_clip"],
             use_amp=True,
+            device=self._current_device_id(),
         )
 
     def _build_search_config(self) -> SearchConfig:
@@ -2630,9 +2635,7 @@ class MlpTrainingStudio(QMainWindow):
 
     def _set_action_controls_enabled(self, enabled: bool) -> None:
         widgets = [
-            self.load_config_button,
-            self.save_config_button,
-            self.recheck_hardware_button,
+            self.training_device_combo_box,
             self.suggest_initial_settings_button,
             self.start_baseline_button,
             self.start_transfer_button,

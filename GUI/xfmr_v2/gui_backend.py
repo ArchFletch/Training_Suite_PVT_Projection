@@ -5,7 +5,7 @@ interaction. It wraps the existing training/search/suggestion pipeline with a
 GUI-friendly surface that can:
 
 - scan datasets and summarize README-driven schema details
-- detect the current CUDA / GPU environment
+- enumerate the CUDA / CPU devices available for training
 - validate transfer-learning compatibility
 - orchestrate baseline-only or baseline-plus-transfer runs
 - save and load GUI config files
@@ -14,7 +14,6 @@ GUI-friendly surface that can:
 from __future__ import annotations
 
 import json
-import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -27,44 +26,26 @@ from .runner import TrainConfig, TransferConfig, run_self_transfer, train_baseli
 from .search import SearchConfig, quick_hyperparameter_search
 from .suggest import SuggestConfig, suggest_initial_settings
 
-def detect_environment(
-    *,
-    progress_callback=None,
-    should_stop=None,
-) -> dict[str, Any]:
-    """Return a user-facing snapshot of GPU and CUDA readiness."""
+def list_available_devices() -> list[dict[str, str]]:
+    """Enumerate the compute devices the user can train on.
 
-    pytorch_cuda_ready = bool(torch.cuda.is_available())
-    pytorch_cuda_version = str(torch.version.cuda) if torch.version.cuda else None
-    detected_gpu_name: str | None = None
-    detected_gpu_memory_gb: float | None = None
+    Each entry has an ``id`` (a ``torch.device`` string such as ``"cuda:0"`` or
+    ``"cpu"``) and a human-readable ``label``. CUDA devices are listed first when
+    PyTorch reports them as available, followed by CPU as an always-present
+    fallback. This is cheap enough to call synchronously when the GUI starts.
+    """
 
-    if pytorch_cuda_ready:
-        detected_gpu_name = torch.cuda.get_device_name(0)
-        props = torch.cuda.get_device_properties(0)
-        detected_gpu_memory_gb = round(props.total_memory / (1024**3), 2)
-        status = "Ready"
-        summary = f"{detected_gpu_name} detected. PyTorch CUDA is ready."
-    else:
-        nvidia_smi = _detect_gpu_via_nvidia_smi()
-        if nvidia_smi is not None:
-            detected_gpu_name = nvidia_smi["name"]
-            detected_gpu_memory_gb = nvidia_smi["memory_gb"]
-            status = "Setup Needed"
-            summary = f"{detected_gpu_name} detected, but PyTorch CUDA is not ready."
-        else:
-            status = "Not Available"
-            summary = "No CUDA-capable GPU was detected. Training will use CPU."
-
-    return {
-        "status": status,
-        "detected_gpu": detected_gpu_name or "None detected",
-        "gpu_memory_gb": detected_gpu_memory_gb,
-        "pytorch_cuda": "Ready" if pytorch_cuda_ready else "Unavailable",
-        "pytorch_cuda_version": pytorch_cuda_version,
-        "device_summary": summary,
-        "device_used_by_backend": "cuda" if pytorch_cuda_ready else "cpu",
-    }
+    devices: list[dict[str, str]] = []
+    if torch.cuda.is_available():
+        for index in range(torch.cuda.device_count()):
+            name = torch.cuda.get_device_name(index)
+            memory_gb = round(torch.cuda.get_device_properties(index).total_memory / (1024**3), 1)
+            devices.append({
+                "id": f"cuda:{index}",
+                "label": f"cuda:{index} — {name} ({memory_gb} GB)",
+            })
+    devices.append({"id": "cpu", "label": "cpu — CPU"})
+    return devices
 
 
 def scan_dataset(
@@ -397,33 +378,6 @@ def make_run_roots(model_output_dir: str, run_name: str) -> dict[str, str]:
         "baseline": str(root / "baseline"),
         "transfer": str(root / "transfer"),
     }
-
-
-def _detect_gpu_via_nvidia_smi() -> dict[str, Any] | None:
-    try:
-        completed = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=name,memory.total",
-                "--format=csv,noheader,nounits",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (FileNotFoundError, subprocess.SubprocessError):
-        return None
-    if completed.returncode != 0:
-        return None
-    line = next((raw.strip() for raw in completed.stdout.splitlines() if raw.strip()), None)
-    if not line:
-        return None
-    parts = [part.strip() for part in line.split(",")]
-    if len(parts) != 2:
-        return {"name": line, "memory_gb": None}
-    memory_gb = round(float(parts[1]) / 1024.0, 2)
-    return {"name": parts[0], "memory_gb": memory_gb}
 
 
 def _gui_search_progress_filter(progress_callback):

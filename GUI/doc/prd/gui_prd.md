@@ -53,19 +53,21 @@ validation, licensing state, and scientific outputs they care about.
 - current run-name summary
 - `Load Config`
 - `Save Config`
-- `Detect Environment`
 
 ### Left Pane
 
 Ordered sections:
 
 1. `License Server`
-2. `System & Environment`
-3. `Data Sources`
-4. `Dataset Preview`
-5. `Suggest Initial Settings`
-6. `Training Settings`
-7. `Run Controls`
+2. `Data Sources`
+3. `Dataset Preview`
+4. `Suggest Initial Settings`
+5. `Training Settings` (includes the `Training Device` selector)
+6. `Run Controls`
+
+Available compute devices (CUDA GPUs and CPU) are detected automatically when
+the app starts and offered in the `Training Device` dropdown inside
+`Training Settings`; the selected device is used for baseline and transfer runs.
 
 The left pane must remain vertically scrollable.
 
@@ -83,7 +85,7 @@ Ordered sections:
 
 1. User launches `Surrogate Model Traning Suite`.
 2. If a server URL is configured, the GUI tests connectivity and attempts startup checkout.
-3. User clicks `Detect Environment`.
+3. The GUI auto-detects available compute devices; the user picks the `Training Device` (e.g. `cuda:0`, `cuda:1`, `cpu`).
 4. User selects input-feature file, ground-truth folder, and output folder.
 5. User clicks `Scan Data` and reviews the preview.
 6. User runs `Suggest Initial Settings` and optionally applies them.
