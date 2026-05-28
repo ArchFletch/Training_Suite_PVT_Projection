@@ -14,18 +14,14 @@ from xfmr_v2.gui_workers import ImmediateTaskExecutor
 
 @pytest.fixture
 def gui_window(qtbot, monkeypatch: pytest.MonkeyPatch):
-    def fake_detect_environment(*, progress_callback=None, should_stop=None):
-        return {
-            "status": "Ready",
-            "detected_gpu": "Synthetic GPU",
-            "gpu_memory_gb": 16.0,
-            "pytorch_cuda": "Ready",
-            "pytorch_cuda_version": "12.4",
-            "device_summary": "Synthetic GPU detected. PyTorch CUDA is ready.",
-            "device_used_by_backend": "cuda",
-        }
+    def fake_list_available_devices():
+        return [
+            {"id": "cuda:0", "label": "cuda:0 — Synthetic GPU (16.0 GB)"},
+            {"id": "cuda:1", "label": "cuda:1 — Synthetic GPU (16.0 GB)"},
+            {"id": "cpu", "label": "cpu — CPU"},
+        ]
 
-    monkeypatch.setattr(gui_window_module, "detect_environment", fake_detect_environment)
+    monkeypatch.setattr(gui_window_module, "list_available_devices", fake_list_available_devices)
     monkeypatch.setattr(gui_window_module, "load_last_session", lambda: None)
     monkeypatch.setattr(gui_window_module, "save_last_session", lambda payload: None)
     monkeypatch.setattr(gui_window_module.QMessageBox, "warning", lambda *args, **kwargs: QMessageBox.StandardButton.Ok)
@@ -36,14 +32,19 @@ def gui_window(qtbot, monkeypatch: pytest.MonkeyPatch):
     return window
 
 
-def test_window_environment_detection_is_manual(gui_window) -> None:
-    assert gui_window.cuda_status_badge.text() == "Not Checked"
-    assert gui_window.detected_gpu_value.text() == "Not checked yet"
+def test_window_auto_detects_devices_and_selects_first(gui_window) -> None:
+    combo = gui_window.training_device_combo_box
+    assert [combo.itemData(i) for i in range(combo.count())] == ["cuda:0", "cuda:1", "cpu"]
+    # First CUDA device is selected by default, matching prior auto-select behavior.
+    assert gui_window._current_device_id() == "cuda:0"
 
-    gui_window.refresh_environment()
 
-    assert gui_window.cuda_status_badge.text() == "Ready"
-    assert gui_window.detected_gpu_value.text() == "Synthetic GPU"
+def test_window_selected_device_flows_into_configs(gui_window, synthetic_dataset, tmp_path) -> None:
+    _configure_dataset_paths(gui_window, synthetic_dataset, tmp_path)
+    gui_window._set_device_selection("cuda:1")
+    assert gui_window._current_device_id() == "cuda:1"
+    assert gui_window._build_baseline_train_config().device == "cuda:1"
+    assert gui_window._build_transfer_config().device == "cuda:1"
 
 
 def _configure_dataset_paths(window, synthetic_dataset: dict[str, Path], tmp_path: Path) -> None:

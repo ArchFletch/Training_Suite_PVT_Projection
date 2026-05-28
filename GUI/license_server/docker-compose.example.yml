@@ -1,0 +1,33 @@
+# Example compose file for the on-prem floating license server.
+#
+# Quick start (customer-hosted, after `docker build -t mlp/license-server:0.1 license_server/`):
+#   1. Copy this file to docker-compose.yml next to your customer license artifact.
+#   2. Place the customer-issued license JSON next to it as `active_license.json`
+#      (or drop the volume mount if you plan to import the license via the CLI
+#      after the container starts).
+#   3. docker compose up -d
+#
+# After the container is up, seat checkout from the Surrogate Model Training
+# GUI is available at: http://<host>:27850/
+
+services:
+  license:
+    image: mlp/license-server:0.1
+    container_name: mlp-license
+    restart: unless-stopped
+    ports:
+      - "27850:27850"
+    environment:
+      # /data is also the default in the Dockerfile, repeated here so it is
+      # obvious where the SQLite DB and active license file end up.
+      MLP_LICENSE_SERVER_RUNTIME_DIR: /data
+    volumes:
+      # Persistent data (SQLite DB, server identity, active license).
+      - license-data:/data
+      # Optional: pre-stage the customer license file. Drop this line and
+      # import via `docker compose exec license python -m license_server.cli ...`
+      # if you would rather import after the server is running.
+      - ./active_license.json:/data/active_license.json:ro
+
+volumes:
+  license-data:

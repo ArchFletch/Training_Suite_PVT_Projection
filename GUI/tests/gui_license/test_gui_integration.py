@@ -51,16 +51,11 @@ class _StubLicenseController:
         self.shutdown_calls += 1
 
 
-def _fake_detect_environment(*, progress_callback=None, should_stop=None):
-    return {
-        "status": "Ready",
-        "detected_gpu": "Synthetic GPU",
-        "gpu_memory_gb": 16.0,
-        "pytorch_cuda": "Ready",
-        "pytorch_cuda_version": "12.4",
-        "device_summary": "Synthetic GPU detected. PyTorch CUDA is ready.",
-        "device_used_by_backend": "cuda",
-    }
+def _fake_list_available_devices():
+    return [
+        {"id": "cuda:0", "label": "cuda:0 — Synthetic GPU (16.0 GB)"},
+        {"id": "cpu", "label": "cpu — CPU"},
+    ]
 
 
 def _build_window(
@@ -78,7 +73,7 @@ def _build_window(
         controller_instances.append(controller)
         return controller
 
-    monkeypatch.setattr(gui_window_module, "detect_environment", _fake_detect_environment)
+    monkeypatch.setattr(gui_window_module, "list_available_devices", _fake_list_available_devices)
     monkeypatch.setattr(gui_window_module, "load_last_session", lambda: saved_session)
     monkeypatch.setattr(gui_window_module, "save_last_session", lambda payload: None)
     monkeypatch.setattr(gui_window_module.QMessageBox, "warning", lambda *args, **kwargs: QMessageBox.StandardButton.Ok)
