@@ -105,9 +105,10 @@ def suggest_initial_settings(
     train_features = (train_features_raw[:, active_mask] - input_feature_mean) / input_feature_std
     train_targets = targets[split["train"]]
 
-    # Flatten `(samples, channels, frequency)` into one matrix when estimating overall
-    # output complexity with linear-algebra diagnostics such as effective rank.
-    ground_truth_matrix = train_targets.reshape(train_targets.shape[0], -1)
+    # Standardize each ground-truth channel before flattening so the effective-rank
+    # diagnostic is scale-invariant: otherwise a single large-magnitude channel (e.g.
+    # dB vs degrees) would dominate the singular spectrum and distort the estimate.
+    ground_truth_matrix = _standardize_per_channel(train_targets)
     frequency_ghz = frequency_hz / 1.0e9
 
     if show_progress:
@@ -122,7 +123,7 @@ def suggest_initial_settings(
     ground_truth_rank = _effective_rank(ground_truth_matrix, config.variance_threshold)
     spectral_stats = _spectral_complexity(train_targets)
     sample_to_ground_truth_rank_ratio = float(len(split["train"]) / max(ground_truth_rank, 1))
-    capacity_tier, overfit_risk = _capacity_and_risk(sample_to_ground_truth_rank_ratio)
+    capacity_tier = _capacity_tier(sample_to_ground_truth_rank_ratio)
     gpu_info = _detect_gpu()
     request_stop(should_stop)
 
@@ -139,13 +140,18 @@ def suggest_initial_settings(
         cache_path=str(cache_path),
         train_count=len(split["train"]),
         active_input_feature_dim=len(active_names),
+        ground_truth_channels=len(channel_names),
         ground_truth_rank=ground_truth_rank,
         frequency_point_count=int(train_targets.shape[-1]),
         spectral_tier=spectral_stats["tier"],
         capacity_tier=capacity_tier,
-        overfit_risk=overfit_risk,
         gpu_info=gpu_info,
     )
+    # The overfit estimate is now derived from the *chosen* model size relative to the
+    # supervised signal available, so it is read back from the baseline result.
+    overfit_risk = baseline["overfit_risk"]
+    param_count = baseline["param_count"]
+    signal_per_param = baseline["signal_per_param"]
     transfer = _suggest_transfer(
         frequency_point_count=int(train_targets.shape[-1]),
         spectral_tier=spectral_stats["tier"],
@@ -156,9 +162,7 @@ def suggest_initial_settings(
 
     confidence, confidence_reason = _confidence_summary(
         train_count=len(split["train"]),
-        ground_truth_rank=ground_truth_rank,
-        flattened_ground_truth_dim=int(ground_truth_matrix.shape[1]),
-        sample_to_ground_truth_rank_ratio=sample_to_ground_truth_rank_ratio,
+        signal_per_param=signal_per_param,
     )
 
     diagnostics = {
@@ -183,6 +187,8 @@ def suggest_initial_settings(
         "spectral_curvature_ratio": float(spectral_stats["curvature_ratio"]),
         "sample_to_ground_truth_rank_ratio": sample_to_ground_truth_rank_ratio,
         "capacity_tier": capacity_tier,
+        "estimated_param_count": int(param_count),
+        "supervised_signal_per_param": float(signal_per_param),
         "estimated_overfit_risk": overfit_risk,
         "gpu_available": bool(gpu_info["available"]),
         "gpu_name": gpu_info["name"],
@@ -255,13 +261,66 @@ def _effective_rank(matrix: np.ndarray, variance_threshold: float) -> int:
     return int(np.searchsorted(cumulative, variance_threshold, side="left") + 1)
 
 
-def _spectral_complexity(targets: np.ndarray) -> dict[str, float | str]:
+def _standardize_per_channel(targets: np.ndarray) -> np.ndarray:
+    # Flatten (samples, channels, frequency) -> (samples, channels*frequency) with each
+    # channel z-scored across samples and frequency. This makes the effective-rank
+    # diagnostic invariant to per-channel scale/units so no single large-magnitude
+    # channel dominates the singular spectrum.
+    #
+    # Caveat: because every channel is rescaled to unit variance, a pure-noise channel
+    # is weighted the same as a signal channel and will inflate the effective rank. That
+    # is acceptable here because ground-truth channels are smooth physical curves, but it
+    # means the rank (and the width anchored to it) is not robust to a garbage channel.
+    arr = targets.astype(np.float64, copy=False)
+    if arr.ndim != 3:
+        return arr.reshape(arr.shape[0], -1)
+    mean = arr.mean(axis=(0, 2), keepdims=True)
+    std = arr.std(axis=(0, 2), keepdims=True)
+    # Treat a channel as constant only when its std is negligible *relative to its own
+    # magnitude* (a units-independent test), so a structured but tiny-magnitude channel
+    # is still standardized rather than silently dropped by an absolute floor.
+    scale = np.abs(arr).max(axis=(0, 2), keepdims=True)
+    constant = std <= 1e-9 * (scale + 1e-30)
+    std = np.where(constant, 1.0, std)
+    return ((arr - mean) / std).reshape(arr.shape[0], -1)
+
+
+def _resample_curves(curves: np.ndarray, n: int) -> np.ndarray:
+    # Linearly resample each curve to a fixed number of points so the wiggliness
+    # diagnostic measures curve *shape* and does not depend on how densely the
+    # frequency axis happens to be sampled. Note: linear resampling has no
+    # anti-aliasing, so a feature much narrower than ~1/n of the axis (when the native
+    # resolution F >> n) can be missed; wider sharp features survive.
+    f = curves.shape[1]
+    if f == n:
+        return curves
+    src = np.linspace(0.0, 1.0, f)
+    dst = np.linspace(0.0, 1.0, n)
+    return np.vstack([np.interp(dst, src, row) for row in curves])
+
+
+# Spectral-complexity tier thresholds, calibrated on synthetic curves at the fixed
+# resample resolution: smooth/broad-hump -> low, single sharp resonance -> medium,
+# multi-resonance -> high, and the same tier across sampling densities. (Note: heavy
+# measurement noise also reads as "high" -- this proxy cannot separate noise from
+# genuine high-frequency structure.)
+_SPECTRAL_LOW_SCORE = 2.3
+_SPECTRAL_LOW_CURVATURE = 0.15
+_SPECTRAL_HIGH_SCORE = 5.0
+_SPECTRAL_HIGH_CURVATURE = 1.0
+
+
+def _spectral_complexity(targets: np.ndarray, resample_points: int = 64) -> dict[str, float | str]:
     # View every output channel for every sample as one curve over frequency, then
     # measure how wiggly those curves are using first and second differences.
     curves = targets.reshape(-1, targets.shape[-1]).astype(np.float64, copy=False)
     if curves.shape[-1] < 3:
         return {"variation_ratio": 0.0, "curvature_ratio": 0.0, "score": 0.0, "tier": "low"}
 
+    # Resample to a fixed resolution (density-invariant), then summarize with a high
+    # percentile across curves -- not the median -- so a minority of sharp-resonance
+    # channels is not averaged away by many smooth ones.
+    curves = _resample_curves(curves, resample_points)
     first_diff = np.diff(curves, axis=1)
     second_diff = np.diff(curves, n=2, axis=1)
     curve_range = np.ptp(curves, axis=1)
@@ -269,13 +328,13 @@ def _spectral_complexity(targets: np.ndarray) -> dict[str, float | str]:
     total_variation = np.sum(np.abs(first_diff), axis=1)
     total_variation[total_variation < 1e-8] = 1.0
 
-    variation_ratio = float(np.median(total_variation / curve_range))
-    curvature_ratio = float(np.median(np.sum(np.abs(second_diff), axis=1) / total_variation))
+    variation_ratio = float(np.percentile(total_variation / curve_range, 90))
+    curvature_ratio = float(np.percentile(np.sum(np.abs(second_diff), axis=1) / total_variation, 90))
     score = variation_ratio + 1.5 * curvature_ratio
 
-    if score < 1.6 and curvature_ratio < 0.35:
+    if score < _SPECTRAL_LOW_SCORE and curvature_ratio < _SPECTRAL_LOW_CURVATURE:
         tier = "low"
-    elif score < 3.2 and curvature_ratio < 0.9:
+    elif score < _SPECTRAL_HIGH_SCORE and curvature_ratio < _SPECTRAL_HIGH_CURVATURE:
         tier = "medium"
     else:
         tier = "high"
@@ -287,14 +346,42 @@ def _spectral_complexity(targets: np.ndarray) -> dict[str, float | str]:
     }
 
 
-def _capacity_and_risk(sample_to_ground_truth_rank_ratio: float) -> tuple[str, str]:
+def _capacity_tier(sample_to_ground_truth_rank_ratio: float) -> str:
     # When the dataset has many samples relative to output complexity, we can afford
     # a more expressive model. When that ratio is low, we should be more conservative.
     if sample_to_ground_truth_rank_ratio < 8.0:
-        return "conservative", "high"
+        return "conservative"
     if sample_to_ground_truth_rank_ratio < 25.0:
-        return "balanced", "medium"
-    return "aggressive", "low"
+        return "balanced"
+    return "aggressive"
+
+
+def _estimate_flatmlp_params(
+    input_dim: int, channels: int, frequency_point_count: int, width: int, depth: int
+) -> int:
+    # Parameter count of the default FlatMLP (an MLP from input features straight to the
+    # flattened channels*frequency output). Used purely as a model-size proxy for the
+    # overfit-risk and confidence estimates. NOTE: a CTLE_MLP has ~2-5x more parameters
+    # (its encoder expands to 4*width at the midpoint), so for that model this understates
+    # the parameter count and therefore the overfit risk.
+    out_dim = max(channels * frequency_point_count, 1)
+    if depth <= 1:
+        return input_dim * out_dim + out_dim
+    params = input_dim * width + width                 # first hidden layer
+    params += (depth - 2) * (width * width + width)    # intermediate hidden layers
+    params += width * out_dim + out_dim                # output projection
+    return int(params)
+
+
+def _overfit_risk_from_signal(signal_per_param: float) -> str:
+    # signal_per_param = (train_samples * channels * frequency_points) / parameter_count:
+    # how many supervised target scalars the data provides per model parameter. Fewer
+    # supervised scalars per parameter -> more overfitting headroom is needed.
+    if signal_per_param < 1.0:
+        return "high"
+    if signal_per_param < 5.0:
+        return "medium"
+    return "low"
 
 
 def _detect_gpu() -> dict[str, Any]:
@@ -314,11 +401,11 @@ def _suggest_baseline(
     cache_path: str,
     train_count: int,
     active_input_feature_dim: int,
+    ground_truth_channels: int,
     ground_truth_rank: int,
     frequency_point_count: int,
     spectral_tier: str,
     capacity_tier: str,
-    overfit_risk: str,
     gpu_info: dict[str, Any],
 ) -> dict[str, Any]:
     # These ordered tiers make the heuristic easier to reason about than a fully
@@ -365,6 +452,21 @@ def _suggest_baseline(
         depth = 3
     else:
         depth = 4
+
+    # Estimate the chosen model's size and derive the overfit risk from how much
+    # supervised signal the data provides per parameter. This closes the loop so a
+    # larger suggested model correctly calls for more regularization.
+    #
+    # The supervised-signal term counts every channel*frequency output scalar as an
+    # independent constraint. Because a smooth curve carries only ~rank effective
+    # degrees of freedom over frequency, this OVERSTATES the true signal (and so
+    # understates overfit risk) for smooth data -- the cutoffs below are tuned with that
+    # optimism in mind, and the warnings still steer the user to a real search.
+    param_count = _estimate_flatmlp_params(
+        active_input_feature_dim, ground_truth_channels, frequency_point_count, width, depth
+    )
+    signal_per_param = (train_count * ground_truth_channels * frequency_point_count) / max(param_count, 1)
+    overfit_risk = _overfit_risk_from_signal(signal_per_param)
 
     if overfit_risk == "high":
         dropout = 0.15
@@ -449,8 +551,8 @@ def _suggest_baseline(
         "width": f"Width is anchored to the ground-truth effective rank ({ground_truth_rank}) and adjusted for {capacity_tier} capacity with {spectral_tier} spectral complexity.",
         "depth": f"Depth {depth} balances train-set size {train_count} with {spectral_tier} spectral complexity.",
         "batch_size": _batch_rationale(batch_size, gpu_info, width, frequency_point_count),
-        "learning_rate": f"Learning rate {learning_rate:.1e} is a stable starting point for a {width}-wide, depth-{depth} network.",
-        "dropout": f"Dropout {dropout:.2f} reflects an estimated {overfit_risk} overfit risk.",
+        "learning_rate": f"Learning rate {learning_rate:.1e} is a safe AdamW default; it cannot be inferred from a static scan, so refine it with a quick search.",
+        "dropout": f"Dropout {dropout:.2f} reflects a {overfit_risk} overfit risk ({signal_per_param:.1f} supervised values per parameter).",
         "weight_decay": f"Weight decay {weight_decay:.1e} complements the same {overfit_risk} overfit estimate.",
         "epochs": f"Epoch budget {epochs} follows the current train split size of {train_count} samples.",
         "patience": f"Patience {patience} pairs with the suggested epoch budget to stop early if validation plateaus.",
@@ -466,6 +568,9 @@ def _suggest_baseline(
         "ranges": ranges,
         "rationale": rationale,
         "quick_search_hints": quick_search_hints,
+        "param_count": int(param_count),
+        "signal_per_param": float(signal_per_param),
+        "overfit_risk": overfit_risk,
     }
 
 
@@ -538,20 +643,15 @@ def _suggest_transfer(
     return {"config": config, "ranges": ranges, "rationale": rationale}
 
 
-def _confidence_summary(
-    train_count: int,
-    ground_truth_rank: int,
-    flattened_ground_truth_dim: int,
-    sample_to_ground_truth_rank_ratio: float,
-) -> tuple[str, str]:
-    # Confidence is intentionally simple: it reflects how much apparent output
-    # complexity is supported by the amount of training data available.
-    rank_fraction = ground_truth_rank / max(1, min(train_count, flattened_ground_truth_dim))
-    if train_count >= 1000 and sample_to_ground_truth_rank_ratio >= 15.0 and rank_fraction <= 0.65:
-        return "high", "Plenty of train samples are available relative to the estimated ground-truth complexity."
-    if train_count >= 250 and sample_to_ground_truth_rank_ratio >= 6.0:
-        return "medium", "The scan captures a useful amount of structure, but optimization still matters."
-    return "low", "The dataset looks sparse relative to ground-truth complexity, so these values should be treated as rough starters."
+def _confidence_summary(train_count: int, signal_per_param: float) -> tuple[str, str]:
+    # Confidence reflects how much supervised signal backs the suggested model: it
+    # combines the raw sample count with the supervised-values-per-parameter ratio so a
+    # large model on little data is never reported as high confidence.
+    if train_count >= 1000 and signal_per_param >= 5.0:
+        return "high", "Plenty of training samples and supervised signal per model parameter."
+    if train_count >= 250 and signal_per_param >= 1.0:
+        return "medium", "Enough structure to start from, but optimization and regularization still matter."
+    return "low", "Few samples or few supervised values per parameter, so treat these as rough starters."
 
 
 def _build_warnings(diagnostics: dict[str, Any], confidence: str, transfer: dict[str, Any]) -> list[str]:
@@ -566,7 +666,7 @@ def _build_warnings(diagnostics: dict[str, Any], confidence: str, transfer: dict
         warnings.append("CUDA was not detected, so training will fall back to CPU unless the environment changes.")
     if diagnostics["estimated_overfit_risk"] == "high":
         warnings.append(
-            "The current train split looks data-limited relative to ground-truth complexity, so watch validation loss closely."
+            "The suggested model is large relative to the available training signal, so watch validation loss closely."
         )
     if int(transfer["config"]["num_bands"]) <= 1:
         warnings.append(
