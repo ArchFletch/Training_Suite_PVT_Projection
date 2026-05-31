@@ -44,6 +44,7 @@ from PySide6.QtWidgets import (
 
 from .app_paths import current_runtime_paths
 from .gui_backend import (
+    build_and_scan_dataset,
     build_suggest_result,
     check_transfer_compatibility,
     default_run_name,
@@ -52,7 +53,6 @@ from .gui_backend import (
     make_run_roots,
     run_training_workflow,
     save_last_session,
-    scan_dataset,
 )
 from .gui_theme import APP_THEME, apply_application_theme, configure_plot_widget, plot_color_cycle, status_colors
 from .gui_workers import QtTaskExecutor
@@ -468,6 +468,9 @@ class MlpTrainingStudio(QMainWindow):
         self.dataset_schema_status_badge = StatusBadge("Not Scanned")
         button_row.addWidget(self.dataset_schema_status_badge)
         button_row.addStretch()
+        self.scan_dataset_button = self._make_button("Scan Dataset")
+        self.scan_dataset_button.clicked.connect(self.scan_dataset)
+        button_row.addWidget(self.scan_dataset_button)
         layout.addLayout(button_row)
 
         layout.addWidget(self.advanced_paths_section)
@@ -1060,17 +1063,18 @@ class MlpTrainingStudio(QMainWindow):
                         f"gt_dir={payload.get('ground_truth_data_dir', '')!r}")
         self.last_scan_result = None
         self.dataset_schema_status_badge.set_status("Scanning")
-        pass  # scan progress is shown via metric cards
-        self._fill_table(self.data_preview_table, [("Status", "Scanning dataset and preparing cache...")])
+        self._fill_table(self.data_preview_table, [("Status", "Building cache from the dataset folder and scanning...")])
         self._start_task(
-            scan_dataset,
+            build_and_scan_dataset,
             kwargs={
                 **payload,
                 "train_frac": self.baseline_train_fraction_spin_box.value(),
                 "val_frac": self.baseline_validation_fraction_spin_box.value(),
                 "seed": self.baseline_seed_spin_box.value(),
                 "max_samples": None,
-                "overwrite_mismatched_cache": not self._cache_path_manually_selected,
+                # Auto-managed cache: rebuild from the folder. Manually-selected cache:
+                # reuse it if present (only build when missing).
+                "overwrite": not self._cache_path_manually_selected,
             },
             task_name="scan",
             busy_state="Scanning",

@@ -21,7 +21,7 @@ import numpy as np
 import torch
 
 from .app_paths import current_runtime_paths
-from .data import load_existing_cache, load_split_bundle
+from .data import build_cache_from_dataset, load_existing_cache, load_split_bundle
 from .runner import TrainConfig, TransferConfig, run_self_transfer, train_baseline
 from .search import SearchConfig, quick_hyperparameter_search
 from .suggest import SuggestConfig, suggest_initial_settings
@@ -143,6 +143,50 @@ def scan_dataset(
             }
         )
     return result
+
+
+def build_and_scan_dataset(
+    *,
+    cache_path: str,
+    train_frac: float,
+    val_frac: float,
+    seed: int,
+    max_samples: int | None = None,
+    dataset_root: str = "",
+    input_feature_path: str = "",
+    ground_truth_data_dir: str = "",
+    overwrite: bool = False,
+    progress_callback=None,
+    should_stop=None,
+) -> dict[str, Any]:
+    """Build a cache from the chosen dataset folder (if needed), then scan it.
+
+    Builds the cache from the dataset README schema via ``build_cache_from_dataset``
+    when no cache exists yet (or when ``overwrite`` is set), then loads and summarizes
+    it for the GUI. This is the folder -> cache -> preview entry point.
+    """
+    build_root = dataset_root or ground_truth_data_dir or (
+        str(Path(input_feature_path).parent) if input_feature_path else ""
+    )
+    if overwrite or not Path(cache_path).is_file():
+        if not build_root:
+            raise ValueError("Select a dataset folder (containing a README schema) to build the cache.")
+        build_cache_from_dataset(
+            build_root,
+            cache_path,
+            max_samples=max_samples,
+            progress_callback=progress_callback,
+        )
+
+    return scan_dataset(
+        cache_path=cache_path,
+        train_frac=train_frac,
+        val_frac=val_frac,
+        seed=seed,
+        max_samples=max_samples,
+        progress_callback=progress_callback,
+        should_stop=should_stop,
+    )
 
 
 def check_transfer_compatibility(
