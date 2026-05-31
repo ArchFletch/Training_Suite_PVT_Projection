@@ -26,7 +26,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from .dataset_schema import DatasetSchema, Ground_TruthSchema, parse_dataset_readme
+from .dataset_schema import DatasetSchema, Ground_TruthSchema, InputFeatureSchema, parse_dataset_readme
 
 # Default paths for the current XFMR dataset layout on disk.
 DATA_ROOT = Path(r"C:\Users\tc57\Box\Rice_AIDRFIC\XFMR\XFMR_1to1\XFMR_2503_1x1_SameXY")
@@ -442,16 +442,17 @@ def build_cache_from_dataset(
     progress_callback=None,
     should_stop=None,
 ) -> dict[str, Any]:
-    """Build a cache directly from a README-described dataset folder.
+    """Build a cache directly from a dataset folder (no loader code required).
 
-    Reads the dataset README's JSON schema block and uses the suite's built-in
-    parsers (no loader code required). Supported ground-truth sources:
+    Resolution order:
 
-    - ``per_sample``: one Touchstone (.sNp) or CSV file per sample.
-    - ``inline`` with ``channel_files`` (Cadence CSV exports).
+    1. If the folder has a README with a fenced ``json`` schema block, build from that
+       schema (``per_sample`` Touchstone/CSV, or Cadence ``inline``).
+    2. Otherwise -- or if the README build fails -- auto-detect a supported layout:
+       - SPData/Touchstone: ``log.txt`` + a folder of ``.sNp`` files.
+       - Cadence CSV: one or more Cadence-export ``.csv`` files (one per channel).
 
-    Other declared sources raise ``NotImplementedError`` with guidance to use
-    ``build_cache_from_loader`` instead.
+    Auto-detection uses sensible, logged defaults rather than an explicit schema.
     """
     def emit(event: str, message: str, **payload: Any) -> None:
         if progress_callback is not None:
@@ -459,17 +460,33 @@ def build_cache_from_dataset(
 
     root = Path(dataset_root)
     readme = next((root / name for name in ("README.md", "README.txt") if (root / name).is_file()), None)
-    if readme is None:
-        raise FileNotFoundError(
-            f"No README.md/README.txt schema found in {root}. "
-            "Add a README with a fenced ```json``` schema block, or build the cache with loader code."
-        )
-    emit("schema_parsing", f"Reading dataset schema from {readme.name}.")
-    schema = parse_dataset_readme(readme)
+    if readme is not None:
+        try:
+            schema = parse_dataset_readme(readme)
+            emit("schema_parsing", f"Using dataset schema from {readme.name}.")
+            summary = _build_from_schema(root, schema, readme, cache_path, max_samples, emit)
+            emit("cache_saved", f"Cache saved: {summary['num_samples']} samples.", cache_path=summary["cache_path"])
+            return summary
+        except Exception as exc:  # noqa: BLE001 - any schema/build failure falls back to auto-detect
+            emit("schema_warning", f"README schema unusable ({exc}); falling back to format auto-detection.")
+
+    summary = _build_auto(root, cache_path, max_samples, emit)
+    emit("cache_saved", f"Cache saved: {summary['num_samples']} samples.", cache_path=summary["cache_path"])
+    return summary
+
+
+def _build_from_schema(
+    root: Path,
+    schema: DatasetSchema,
+    readme: Path,
+    cache_path: str | Path,
+    max_samples: int | None,
+    emit,
+) -> dict[str, Any]:
+    """Build a cache from an explicit README schema (per_sample or Cadence inline)."""
     sources = resolve_data_sources_from_schema(root, schema)
     src = schema.ground_truth.source
     emit("cache_build_started", f"Building cache for {schema.dataset_name} (source={src}).")
-
     if src == "per_sample":
         features, targets, frequency_hz = _build_per_sample_arrays(sources, schema, max_samples, emit)
         channel_names = list(schema.ground_truth.channel_names)
@@ -481,12 +498,10 @@ def build_cache_from_dataset(
         )
     else:
         raise NotImplementedError(
-            f"Building a cache from ground-truth source '{src}' is not supported in the folder/GUI flow yet. "
-            "Supported: per_sample (Touchstone/CSV) and Cadence CSV (inline + channel_files). "
-            "For other formats, build the cache with loader code via build_cache_from_loader()."
+            f"Ground-truth source '{src}' is not supported by the folder builder. "
+            "Supported: per_sample (Touchstone/CSV) and Cadence CSV (inline + channel_files)."
         )
-
-    summary = _save_cache(
+    return _save_cache(
         cache_path,
         dataset_root=root,
         dataset_name=schema.dataset_name,
@@ -515,8 +530,206 @@ def build_cache_from_dataset(
             },
         },
     )
-    emit("cache_saved", f"Cache saved: {features.shape[0]} samples.", cache_path=summary["cache_path"])
-    return summary
+
+
+# ---------------------------------------------------------------------------
+# README-free format auto-detection
+# ---------------------------------------------------------------------------
+def _find_sp_dir(root: Path) -> Path | None:
+    """Find a directory holding per-sample Touchstone (.sNp) files."""
+    def has_touchstone(directory: Path) -> bool:
+        return any(re.fullmatch(r"\.s\d+p", p.suffix.lower()) for p in directory.iterdir())
+
+    for candidate in ("SPData", "SPDATA", "spdata", "sp_data"):
+        d = root / candidate
+        if d.is_dir() and has_touchstone(d):
+            return d
+    for child in sorted(root.iterdir()):
+        if child.is_dir() and has_touchstone(child):
+            return child
+    return None
+
+
+def _build_auto(root: Path, cache_path: str | Path, max_samples: int | None, emit) -> dict[str, Any]:
+    """Detect a supported dataset layout from folder contents and build the cache."""
+    # 1. SPData / Touchstone: log.txt + a directory of .sNp files.
+    log_txt = next((root / n for n in ("log.txt", "log.TXT") if (root / n).is_file()), None)
+    sp_dir = _find_sp_dir(root)
+    if log_txt is not None and sp_dir is not None:
+        result = _build_touchstone_auto(root, log_txt, sp_dir, max_samples, emit)
+        return _save_cache(cache_path, dataset_root=root, readme_path="", **result)
+
+    # 2. Cadence CSV: one or more Cadence-export .csv files.
+    csv_files = [p for p in sorted(root.glob("*.csv")) if not p.name.startswith(".~")]
+    if csv_files:
+        result = _build_cadence_auto(root, csv_files, max_samples, emit)
+        return _save_cache(cache_path, dataset_root=root, readme_path="", **result)
+
+    raise FileNotFoundError(
+        f"Could not auto-detect a supported dataset format in {root}. Expected SPData/Touchstone "
+        "(log.txt + a folder of .sNp files) or Cadence CSV (*.csv), or a README with a json schema block."
+    )
+
+
+def _read_logtxt_columns(log_txt: Path) -> list[str]:
+    """Recover input-feature column names from a log.txt header comment.
+
+    The first non-empty line is expected to be a ``# [col, col, ...]`` comment. When
+    absent, generic names ``x0..xN`` are derived from the first data row's width.
+    """
+    header = None
+    first_row = None
+    with log_txt.open(encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("#") and header is None:
+                header = line.lstrip("#").strip()
+                continue
+            first_row = line
+            break
+    if header:
+        names = [c.strip().strip("'\"") for c in header.strip("[]").split(",") if c.strip()]
+        if names:
+            return names
+    width = len(ast.literal_eval(first_row)) if first_row else 0
+    return [f"x{i}" for i in range(width)]
+
+
+def _build_touchstone_auto(
+    root: Path, log_txt: Path, sp_dir: Path, max_samples: int | None, emit
+) -> dict[str, Any]:
+    """Auto-detect a per-sample Touchstone dataset (log.txt + .sNp files)."""
+    columns = _read_logtxt_columns(log_txt)
+    sample_id = "index" if "index" in columns else columns[-1]
+    id_like = {"index", "tid", "id", "batch", "sample_id", sample_id}
+    feature_columns = [c for c in columns if c not in id_like]
+
+    ext = next(
+        (f.suffix.lower() for f in sorted(sp_dir.iterdir()) if re.fullmatch(r"\.s\d+p", f.suffix.lower())),
+        ".s2p",
+    )
+    nports = int(re.fullmatch(r"\.s(\d+)p", ext).group(1))
+    # Upper-triangular unique S-parameters (S is symmetric for reciprocal networks).
+    sparams = [f"S{i}{j}" for i in range(1, nports + 1) for j in range(i, nports + 1)]
+
+    schema = DatasetSchema(
+        dataset_name=root.name,
+        input_feature=InputFeatureSchema(
+            columns=tuple(columns),
+            feature_columns=tuple(feature_columns),
+            sample_id_column=sample_id,
+            source="file",
+            file_path=str(log_txt.relative_to(root)),
+        ),
+        ground_truth=Ground_TruthSchema(
+            source="per_sample",
+            file_extension=ext,
+            ground_truth_parameters=tuple(sparams),
+            ground_truth_parts=("re", "im"),
+            drop_first_frequency=True,
+            data_dir=str(sp_dir.relative_to(root)),
+        ),
+    )
+    emit(
+        "auto_detected",
+        f"Auto-detected Touchstone dataset: {len(feature_columns)} features (id='{sample_id}'), "
+        f"{nports}-port, {len(sparams)} S-params x (re, im); first frequency point dropped.",
+    )
+    sources = resolve_data_sources_from_schema(root, schema)
+    features, targets, frequency_hz = _build_per_sample_arrays(sources, schema, max_samples, emit)
+    channel_names = list(schema.ground_truth.channel_names)
+    return {
+        "dataset_name": root.name,
+        "features": features,
+        "targets": targets,
+        "frequency_hz": frequency_hz,
+        "feature_names": list(feature_columns),
+        "channel_names": channel_names,
+        "target_names": list(channel_names),
+        "channel_units": [""] * len(channel_names),
+        "channel_transforms": [""] * len(channel_names),
+        "sweep_label": "Frequency (GHz)",
+        "ground_truth_data_dir": sources.ground_truth_data_dir,
+        "input_feature_path": str(sources.input_feature_path.resolve()) if sources.input_feature_path else "",
+    }
+
+
+# CTLE Cadence-CSV conventions (match the CTLE training notebooks).
+_CTLE_PARAM_KEYS = {
+    "CS": ("CS_fF", 1e15), "LD": ("LD_pH", 1e12), "M": ("M", 1.0),
+    "RD": ("RD", 1.0), "RS": ("RS", 1.0), "MN": ("MN", 1.0),
+}
+_CTLE_FEATURES = ["CS_fF", "LD_pH", "M", "RD", "RS", "MN"]
+_CTLE_UNITS = {
+    "gain": "dB", "hb_gain": "dB", "phase": "deg",
+    "noise": "V/sqrt(Hz)", "noise_spectrum": "V/sqrt(Hz)", "integrated_noise": "V",
+}
+
+
+def _build_cadence_auto(root: Path, csv_files: list[Path], max_samples: int | None, emit) -> dict[str, Any]:
+    """Auto-detect Cadence-CSV channels and combine those that share a sweep axis.
+
+    Channels with different axes (AC gain vs VCM-swept HB gain vs scalar noise) cannot
+    share one cache, so the largest group with a common axis is loaded and the rest are
+    reported as excluded. Mirrors the CTLE notebooks (gain + phase trained together).
+    """
+    parsed: dict[str, tuple[list[dict[str, float]], np.ndarray, np.ndarray]] = {}
+    for csv_path in csv_files:
+        try:
+            params, freq_ghz, values = _parse_cadence_csv(csv_path, _CTLE_PARAM_KEYS, max_samples)
+        except Exception as exc:  # noqa: BLE001 - non-Cadence / odd-format CSVs are skipped
+            emit("auto_skip", f"Skipping {csv_path.name}: not a standard Cadence CSV ({exc}).")
+            continue
+        name = re.sub(r"(?i)^ctle[_-]", "", csv_path.stem)
+        parsed[name] = (params, freq_ghz, values)
+
+    if not parsed:
+        raise ValueError("No Cadence-CSV channels could be parsed in this folder.")
+
+    groups: dict[tuple, list[str]] = {}
+    for name, (_, freq_ghz, _) in parsed.items():
+        axis_key = (len(freq_ghz), round(float(freq_ghz[0]), 9), round(float(freq_ghz[-1]), 9))
+        groups.setdefault(axis_key, []).append(name)
+    channels = sorted(max(groups.values(), key=lambda names: (len(names), len(parsed[names[0]][1]))))
+    excluded = sorted(set(parsed) - set(channels))
+    if excluded:
+        emit("auto_note", f"Loading channels {channels} (shared sweep axis); excluded {excluded} (different axes).")
+
+    params0, freq_ghz, _ = parsed[channels[0]]
+    num_samples, num_freq = len(params0), len(freq_ghz)
+
+    def _key(params: dict[str, float]) -> tuple:
+        return tuple(round(float(params[c]), 6) for c in _CTLE_FEATURES)
+
+    features = np.zeros((num_samples, len(_CTLE_FEATURES)), dtype=np.float32)
+    for i, params in enumerate(params0):
+        features[i] = [params[c] for c in _CTLE_FEATURES]
+
+    targets = np.zeros((num_samples, len(channels), num_freq), dtype=np.float32)
+    for ch_idx, channel in enumerate(channels):
+        ch_params, _, ch_values = parsed[channel]
+        index = {_key(p): i for i, p in enumerate(ch_params)}
+        for i, params in enumerate(params0):
+            j = index.get(_key(params), i if i < len(ch_values) else 0)
+            targets[i, ch_idx, :] = ch_values[j]
+
+    emit("auto_detected",
+         f"Auto-detected Cadence CSV dataset: {num_samples} samples, channels {channels}, {num_freq} points.")
+    return {
+        "dataset_name": root.name,
+        "features": features,
+        "targets": targets,
+        "frequency_hz": (freq_ghz * 1e9).astype(np.float32),
+        "feature_names": list(_CTLE_FEATURES),
+        "channel_names": channels,
+        "target_names": channels,
+        "channel_units": [_CTLE_UNITS.get(c, "") for c in channels],
+        "channel_transforms": [""] * len(channels),
+        "sweep_label": "Frequency (GHz)",
+        "ground_truth_data_dir": root,
+    }
 
 
 def _build_cadence_arrays(

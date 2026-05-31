@@ -157,6 +157,53 @@ def test_build_cache_from_dataset_per_sample(synthetic_dataset: dict[str, Path],
     assert loaded["num_channels"] == 4
 
 
+def test_build_cache_from_dataset_autodetect_touchstone(synthetic_dataset: dict[str, Path], tmp_path: Path) -> None:
+    """With no README, an SPData/Touchstone layout (log.txt + .sNp dir) is auto-detected."""
+    import shutil
+
+    auto_root = tmp_path / "auto_touchstone"
+    sp_dir = auto_root / "SPData"
+    sp_dir.mkdir(parents=True)
+    for f in sorted(synthetic_dataset["output_dir"].glob("*.s2p")):
+        shutil.copy(f, sp_dir / f.name)
+    # log.txt at the root with a header naming the columns (no README present).
+    rows = synthetic_dataset["input_file"].read_text(encoding="utf-8")
+    (auto_root / "log.txt").write_text("# [x, y, const, index]\n" + rows, encoding="utf-8")
+
+    summary = data.build_cache_from_dataset(str(auto_root), str(tmp_path / "auto_ts.npz"))
+
+    assert summary["num_samples"] == 10
+    assert summary["num_features"] == 3  # x, y, const (index dropped as the id column)
+    assert summary["num_channels"] == 6  # 2-port upper-tri S11,S12,S22 x (re, im)
+    assert summary["num_frequencies"] == 3  # 4 points minus the dropped first
+
+
+def test_build_cache_from_dataset_autodetect_cadence(tmp_path: Path) -> None:
+    """Cadence CSVs are auto-detected and channels sharing an axis are combined."""
+
+    root = tmp_path / "ctle_auto"
+    root.mkdir()
+
+    def write_cadence(path: Path, freqs: list[str], base: float) -> None:
+        lines = ["", "freq (Hz)   db(stuff)"]
+        for s in range(2):  # two samples (distinct CS)
+            lines += [f"CS = {80.98 + s}f", "LD = 191.6p", "M = 40", "RD = 167.2", "RS = 560.4", "MN = 13", "VCM   599m"]
+            lines += [f"  {f}   {base + s + 0.1 * i}" for i, f in enumerate(freqs)]
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    write_cadence(root / "CTLE_gain.csv", ["1K", "2K", "3K"], -18.0)
+    write_cadence(root / "CTLE_phase.csv", ["1K", "2K", "3K"], 90.0)
+    write_cadence(root / "CTLE_hb_gain.csv", ["1m", "2m"], 5.0)  # different axis -> excluded
+
+    summary = data.build_cache_from_dataset(str(root), str(tmp_path / "ctle_auto.npz"))
+
+    assert summary["num_channels"] == 2  # gain + phase share the freq axis; hb_gain excluded
+    assert summary["num_frequencies"] == 3
+    assert summary["num_features"] == 6  # CS_fF, LD_pH, M, RD, RS, MN
+    with np.load(tmp_path / "ctle_auto.npz", allow_pickle=False) as cache:
+        assert sorted(cache["channel_names"].astype(str).tolist()) == ["gain", "phase"]
+
+
 def test_load_cache_and_split_bundle(synthetic_dataset: dict[str, Path]) -> None:
     """The cache (pre-built by fixture) should load correctly."""
 
