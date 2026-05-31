@@ -26,7 +26,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from .dataset_schema import DatasetSchema, Ground_TruthSchema, InputFeatureSchema, parse_dataset_readme
+from .dataset_schema import DatasetSchema, Ground_TruthSchema, InputFeatureSchema
 
 # Default paths for the current XFMR dataset layout on disk.
 DATA_ROOT = Path(r"C:\Users\tc57\Box\Rice_AIDRFIC\XFMR\XFMR_1to1\XFMR_2503_1x1_SameXY")
@@ -442,98 +442,26 @@ def build_cache_from_dataset(
     progress_callback=None,
     should_stop=None,
 ) -> dict[str, Any]:
-    """Build a cache directly from a dataset folder (no loader code required).
+    """Build a cache directly from a dataset folder by auto-detecting its format.
 
-    Resolution order:
+    No schema or README is required. Supported layouts:
 
-    1. If the folder has a README with a fenced ``json`` schema block, build from that
-       schema (``per_sample`` Touchstone/CSV, or Cadence ``inline``).
-    2. Otherwise -- or if the README build fails -- auto-detect a supported layout:
-       - SPData/Touchstone: ``log.txt`` + a folder of ``.sNp`` files.
-       - Cadence CSV: one or more Cadence-export ``.csv`` files (one per channel).
+    - SPData/Touchstone: ``log.txt`` + a folder of ``.sNp`` files.
+    - Cadence CSV: one or more Cadence-export ``.csv`` files (one per channel).
 
-    Auto-detection uses sensible, logged defaults rather than an explicit schema.
+    See ``_build_auto`` for the detection rules and defaults.
     """
     def emit(event: str, message: str, **payload: Any) -> None:
         if progress_callback is not None:
             progress_callback({"phase": "scan", "event": event, "message": message, **payload})
 
-    root = Path(dataset_root)
-    readme = next((root / name for name in ("README.md", "README.txt") if (root / name).is_file()), None)
-    if readme is not None:
-        try:
-            schema = parse_dataset_readme(readme)
-            emit("schema_parsing", f"Using dataset schema from {readme.name}.")
-            summary = _build_from_schema(root, schema, readme, cache_path, max_samples, emit)
-            emit("cache_saved", f"Cache saved: {summary['num_samples']} samples.", cache_path=summary["cache_path"])
-            return summary
-        except Exception as exc:  # noqa: BLE001 - any schema/build failure falls back to auto-detect
-            emit("schema_warning", f"README schema unusable ({exc}); falling back to format auto-detection.")
-
-    summary = _build_auto(root, cache_path, max_samples, emit)
+    summary = _build_auto(Path(dataset_root), cache_path, max_samples, emit)
     emit("cache_saved", f"Cache saved: {summary['num_samples']} samples.", cache_path=summary["cache_path"])
     return summary
 
 
-def _build_from_schema(
-    root: Path,
-    schema: DatasetSchema,
-    readme: Path,
-    cache_path: str | Path,
-    max_samples: int | None,
-    emit,
-) -> dict[str, Any]:
-    """Build a cache from an explicit README schema (per_sample or Cadence inline)."""
-    sources = resolve_data_sources_from_schema(root, schema)
-    src = schema.ground_truth.source
-    emit("cache_build_started", f"Building cache for {schema.dataset_name} (source={src}).")
-    if src == "per_sample":
-        features, targets, frequency_hz = _build_per_sample_arrays(sources, schema, max_samples, emit)
-        channel_names = list(schema.ground_truth.channel_names)
-        channel_units = [""] * len(channel_names)
-        channel_transforms = [""] * len(channel_names)
-    elif src == "inline" and schema.ground_truth.channel_files:
-        features, targets, frequency_hz, channel_names, channel_units, channel_transforms = _build_cadence_arrays(
-            sources, schema, max_samples, emit
-        )
-    else:
-        raise NotImplementedError(
-            f"Ground-truth source '{src}' is not supported by the folder builder. "
-            "Supported: per_sample (Touchstone/CSV) and Cadence CSV (inline + channel_files)."
-        )
-    return _save_cache(
-        cache_path,
-        dataset_root=root,
-        dataset_name=schema.dataset_name,
-        features=features,
-        targets=targets,
-        frequency_hz=frequency_hz,
-        feature_names=list(schema.input_feature.feature_columns),
-        channel_names=channel_names,
-        target_names=list(channel_names),
-        channel_units=channel_units,
-        channel_transforms=channel_transforms,
-        sweep_label=schema.ground_truth.sweep_label or "Frequency (GHz)",
-        ground_truth_data_dir=sources.ground_truth_data_dir,
-        input_feature_path=str(sources.input_feature_path.resolve()) if sources.input_feature_path else "",
-        readme_path=str(readme.resolve()),
-        dataset_schema={
-            "input_feature": {
-                "columns": list(schema.input_feature.columns),
-                "feature_columns": list(schema.input_feature.feature_columns),
-                "source": schema.input_feature.source,
-            },
-            "ground_truth": {
-                "source": src,
-                "ground_truth_parameters": list(schema.ground_truth.ground_truth_parameters),
-                "ground_truth_parts": list(schema.ground_truth.ground_truth_parts),
-            },
-        },
-    )
-
-
 # ---------------------------------------------------------------------------
-# README-free format auto-detection
+# Folder format auto-detection
 # ---------------------------------------------------------------------------
 def _find_sp_dir(root: Path) -> Path | None:
     """Find a directory holding per-sample Touchstone (.sNp) files."""
@@ -730,61 +658,6 @@ def _build_cadence_auto(root: Path, csv_files: list[Path], max_samples: int | No
         "sweep_label": "Frequency (GHz)",
         "ground_truth_data_dir": root,
     }
-
-
-def _build_cadence_arrays(
-    sources: DataSources,
-    schema: DatasetSchema,
-    max_samples: int | None,
-    emit,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str], list[str], list[str]]:
-    """Assemble features/targets from Cadence CSV exports (one CSV per channel).
-
-    Each channel's CSV holds all samples as sequential parameter blocks; input
-    features come from the block headers via ``parameter_keys``. Reuses the shared
-    ``_parse_cadence_csv`` parser.
-    """
-    channel_files = dict(schema.ground_truth.channel_files)
-    channel_order = list(schema.ground_truth.ground_truth_parameters)
-    feature_columns = list(schema.input_feature.feature_columns)
-    param_key_map = {csv_key: (col, float(scale)) for csv_key, col, scale in schema.input_feature.parameter_keys}
-    if not param_key_map and feature_columns:
-        param_key_map = {col: (col, 1.0) for col in feature_columns}
-    data_dir = sources.ground_truth_data_dir
-
-    first = channel_order[0]
-    params_list, freq_ghz, first_values = _parse_cadence_csv(data_dir / channel_files[first], param_key_map, max_samples)
-    frequency_hz = (freq_ghz * 1e9).astype(np.float32)
-    num_samples, num_freq = len(params_list), len(frequency_hz)
-    emit("input_rows_loaded", f"Loaded {num_samples} samples from {Path(channel_files[first]).name}.",
-         total_samples=num_samples)
-
-    features = np.zeros((num_samples, len(feature_columns)), dtype=np.float32)
-    for idx, params in enumerate(params_list):
-        features[idx] = [params[col] for col in feature_columns]
-
-    targets = np.zeros((num_samples, len(channel_order), num_freq), dtype=np.float32)
-    targets[:, 0, :] = first_values
-    for ch_idx, channel in enumerate(channel_order):
-        if ch_idx == 0:
-            continue
-        _, ch_freq_ghz, ch_values = _parse_cadence_csv(data_dir / channel_files[channel], param_key_map, max_samples)
-        if not np.allclose(freq_ghz, ch_freq_ghz, rtol=1e-4):
-            raise ValueError(f"Frequency grid in {channel} does not match {first}.")
-        if len(ch_values) != num_samples:
-            raise ValueError(f"Sample count mismatch: {first} has {num_samples} but {channel} has {len(ch_values)}.")
-        targets[:, ch_idx, :] = ch_values
-        emit("cache_progress", f"Loaded channel '{channel}'.", completed_samples=num_samples, total_samples=num_samples)
-
-    if schema.ground_truth.drop_first_frequency and num_freq > 1:
-        frequency_hz = frequency_hz[1:]
-        targets = targets[:, :, 1:]
-
-    units = dict(schema.ground_truth.channel_units)
-    transforms = dict(schema.ground_truth.channel_transforms)
-    channel_units = [units.get(name, "") for name in channel_order]
-    channel_transforms = [transforms.get(name, "") for name in channel_order]
-    return features, targets, frequency_hz, channel_order, channel_units, channel_transforms
 
 
 def ensure_cache(

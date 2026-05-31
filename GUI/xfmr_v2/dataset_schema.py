@@ -154,13 +154,6 @@ def _validate_schema_payload(payload: dict[str, Any]) -> None:
     ground_truth_schema = payload["ground_truth"]
 
     src = str(ground_truth_schema.get("source", "")).lower()
-    if not src:
-        # Cadence-style READMEs declare `format: cadence_csv` + channel_files instead of an
-        # explicit source; treat those as the inline (one-CSV-per-channel) source.
-        fmt = str(ground_truth_schema.get("format", "")).lower()
-        if ground_truth_schema.get("channel_files") or fmt == "cadence_csv":
-            ground_truth_schema["source"] = "inline"
-            src = "inline"
     if src not in SUPPORTED_SOURCES:
         raise ValueError(f"Unsupported ground-truth source {src!r}. Choose from {SUPPORTED_SOURCES}.")
 
