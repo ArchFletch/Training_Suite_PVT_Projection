@@ -15,15 +15,13 @@ from torch import nn
 class MLP(nn.Module):
     """Shared MLP helper used by the models below."""
 
-    def __init__(self, in_dim: int, hidden: int, out_dim: int, depth: int, dropout: float) -> None:
+    def __init__(self, in_dim: int, hidden: int, out_dim: int, depth: int) -> None:
         super().__init__()
         layers: list[nn.Module] = []
         dim = in_dim
         # Build `depth - 1` hidden blocks, then end with a final linear projection.
         for _ in range(depth - 1):
             layers += [nn.Linear(dim, hidden), nn.SiLU()]
-            if dropout > 0.0:
-                layers.append(nn.Dropout(dropout))
             dim = hidden
         layers.append(nn.Linear(dim, out_dim))
         self.network = nn.Sequential(*layers)
@@ -56,7 +54,6 @@ class FlatMLPNet(nn.Module):
         num_frequencies: int,
         width: int = 256,
         depth: int = 4,
-        dropout: float = 0.05,
     ) -> None:
         super().__init__()
         self.ground_truth_channels = ground_truth_channels
@@ -66,7 +63,6 @@ class FlatMLPNet(nn.Module):
             width,
             ground_truth_channels * num_frequencies,
             depth,
-            dropout,
         )
 
     def forward(self, input_features: torch.Tensor, frequency: torch.Tensor) -> torch.Tensor:
@@ -126,7 +122,6 @@ class CTLEMultiTaskMLP(nn.Module):
         num_frequencies: int,
         width: int = 256,
         depth: int = 5,
-        dropout: float = 0.0,
     ) -> None:
         super().__init__()
         self.ground_truth_channels = ground_truth_channels
@@ -144,8 +139,6 @@ class CTLEMultiTaskMLP(nn.Module):
             encoder_layers.append(nn.Linear(dim, hidden))
             encoder_layers.append(nn.LayerNorm(hidden))
             encoder_layers.append(nn.GELU())
-            if dropout > 0.0:
-                encoder_layers.append(nn.Dropout(dropout))
             dim = hidden
         self.encoder = nn.Sequential(*encoder_layers)
 

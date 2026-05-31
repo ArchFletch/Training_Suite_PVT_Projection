@@ -373,6 +373,36 @@ def _estimate_flatmlp_params(
     return int(params)
 
 
+def _estimate_ctle_mlp_params(
+    input_dim: int, channels: int, frequency_point_count: int, width: int, depth: int
+) -> int:
+    # Parameter count of the CTLE_MLP: a Linear->LayerNorm->GELU encoder whose hidden
+    # sizes follow the same expand-then-contract schedule the model uses, plus one
+    # Linear output head per channel. Mirrors xfmr_v2.model so the size proxy is honest
+    # for this (much larger) architecture.
+    from .model import _symmetric_hidden_sizes
+
+    out_dim = max(frequency_point_count, 1)
+    params = 0
+    dim = input_dim
+    for hidden in _symmetric_hidden_sizes(width, depth):
+        params += dim * hidden + hidden    # Linear
+        params += 2 * hidden               # LayerNorm weight + bias
+        dim = hidden
+    params += channels * (dim * out_dim + out_dim)  # one output head per channel
+    return int(params)
+
+
+def _estimate_params(
+    model_type: str, input_dim: int, channels: int, frequency_point_count: int, width: int, depth: int
+) -> int:
+    # Dispatch to the right size proxy so the overfit/confidence estimates reflect the
+    # architecture the heuristic actually recommends.
+    if model_type == "CTLE_MLP":
+        return _estimate_ctle_mlp_params(input_dim, channels, frequency_point_count, width, depth)
+    return _estimate_flatmlp_params(input_dim, channels, frequency_point_count, width, depth)
+
+
 def _overfit_risk_from_signal(signal_per_param: float) -> str:
     # signal_per_param = (train_samples * channels * frequency_points) / parameter_count:
     # how many supervised target scalars the data provides per model parameter. Fewer
@@ -413,11 +443,9 @@ def _suggest_baseline(
     width_tiers = [128, 192, 256, 384, 512, 768]
     depth_tiers = [3, 4, 5, 6]
     batch_tiers = [8, 16, 32, 64]
-    lr_tiers = [7e-5, 1e-4, 2e-4]
-    dropout_tiers = [0.02, 0.05, 0.10, 0.15]
+    lr_tiers = [7e-5, 1e-4, 2e-4, 5e-4, 1e-3]
     weight_decay_tiers = [5e-5, 1e-4, 3e-4]
     epoch_tiers = [200, 300, 400]
-    patience_tiers = [15, 20, 30]
 
     # Anchor width directly to the ground-truth effective rank, then adjust for
     # richer inputs or more complex spectra.
@@ -453,6 +481,23 @@ def _suggest_baseline(
     else:
         depth = 4
 
+    # Architecture choice. The shared-encoder CTLE_MLP (Linear->LayerNorm->GELU blocks
+    # that expand to 4x width at the midpoint, then contract, with one output head per
+    # channel) is substantially more accurate than the flat MLP whenever there is enough
+    # data to support it. The flat MLP is reserved for data-starved (conservative) cases
+    # where the larger model would mostly add overfitting risk.
+    if capacity_tier == "conservative":
+        model_type = "FlatMLP"
+        loss_function = "rmse"
+        scheduler = "plateau"
+        gradient_clip = 1.0
+    else:
+        model_type = "CTLE_MLP"
+        depth = 5  # yields the validated [w, 2w, 4w, 2w, w] encoder
+        loss_function = "mse"
+        scheduler = "cosine"
+        gradient_clip = 0.0  # the validated recipe does not clip gradients
+
     # Estimate the chosen model's size and derive the overfit risk from how much
     # supervised signal the data provides per parameter. This closes the loop so a
     # larger suggested model correctly calls for more regularization.
@@ -461,31 +506,30 @@ def _suggest_baseline(
     # independent constraint. Because a smooth curve carries only ~rank effective
     # degrees of freedom over frequency, this OVERSTATES the true signal (and so
     # understates overfit risk) for smooth data -- the cutoffs below are tuned with that
-    # optimism in mind, and the warnings still steer the user to a real search.
-    param_count = _estimate_flatmlp_params(
-        active_input_feature_dim, ground_truth_channels, frequency_point_count, width, depth
+    # optimism in mind, and the warnings still steer the user to a real validation check.
+    param_count = _estimate_params(
+        model_type, active_input_feature_dim, ground_truth_channels, frequency_point_count, width, depth
     )
     signal_per_param = (train_count * ground_truth_channels * frequency_point_count) / max(param_count, 1)
     overfit_risk = _overfit_risk_from_signal(signal_per_param)
 
-    if overfit_risk == "high":
-        dropout = 0.15
-        weight_decay = 3e-4
-    elif overfit_risk == "medium":
-        dropout = 0.10
+    if model_type == "CTLE_MLP":
+        # Notebook-validated AdamW recipe for the shared-encoder model (with cosine LR).
+        learning_rate = 1e-3
         weight_decay = 1e-4
     else:
-        dropout = 0.05
-        weight_decay = 5e-5
-    if train_count >= 4000 and spectral_tier == "low":
-        dropout = 0.02
-
-    if width <= 256 and depth <= 4:
-        learning_rate = 2e-4
-    elif capacity_tier == "conservative" and width >= 512:
-        learning_rate = 7e-5
-    else:
-        learning_rate = 1e-4
+        if overfit_risk == "high":
+            weight_decay = 3e-4
+        elif overfit_risk == "medium":
+            weight_decay = 1e-4
+        else:
+            weight_decay = 5e-5
+        if width <= 256 and depth <= 4:
+            learning_rate = 2e-4
+        elif capacity_tier == "conservative" and width >= 512:
+            learning_rate = 7e-5
+        else:
+            learning_rate = 1e-4
 
     if not gpu_info["available"]:
         batch_size = 16 if train_count >= 256 else 8
@@ -500,13 +544,14 @@ def _suggest_baseline(
 
     if train_count < 800:
         epochs = 400
-        patience = 30
     elif train_count < 4000:
         epochs = 300
-        patience = 20
     else:
         epochs = 200
-        patience = 15
+    if model_type == "CTLE_MLP":
+        # The larger encoder under a cosine schedule needs a longer budget to converge;
+        # with early stopping removed, the validated recipe trains the full 500 epochs.
+        epochs = max(epochs, 500)
 
     # Start from the baseline training defaults, then override only the fields the
     # heuristic is actually choosing.
@@ -522,15 +567,16 @@ def _suggest_baseline(
         seed=request.seed,
         batch_size=batch_size,
         epochs=epochs,
-        patience=patience,
         learning_rate=learning_rate,
         weight_decay=weight_decay,
-        gradient_clip=defaults.gradient_clip,
+        gradient_clip=gradient_clip,
         train_frac=request.train_frac,
         val_frac=request.val_frac,
+        model_type=model_type,
         width=width,
         depth=depth,
-        dropout=dropout,
+        loss_function=loss_function,
+        scheduler=scheduler,
         use_amp=bool(gpu_info["available"]),
         max_samples=request.max_samples,
     )
@@ -542,26 +588,34 @@ def _suggest_baseline(
         "depth": _neighbor_range(depth_tiers, depth),
         "batch_size": _neighbor_range(batch_tiers, batch_size),
         "learning_rate": _neighbor_range(lr_tiers, learning_rate),
-        "dropout": _neighbor_range(dropout_tiers, dropout),
         "weight_decay": _neighbor_range(weight_decay_tiers, weight_decay),
         "epochs": _neighbor_range(epoch_tiers, epochs),
-        "patience": _neighbor_range(patience_tiers, patience),
     }
     rationale = {
+        "model_type": (
+            f"{model_type} chosen for {capacity_tier} capacity: the shared-encoder CTLE_MLP "
+            "(with MSE loss + cosine LR) is used whenever the data supports it, and the flat "
+            "MLP only for data-starved cases."
+        ),
         "width": f"Width is anchored to the ground-truth effective rank ({ground_truth_rank}) and adjusted for {capacity_tier} capacity with {spectral_tier} spectral complexity.",
-        "depth": f"Depth {depth} balances train-set size {train_count} with {spectral_tier} spectral complexity.",
+        "depth": (
+            f"Depth {depth} gives the validated expand-then-contract CTLE encoder."
+            if model_type == "CTLE_MLP"
+            else f"Depth {depth} balances train-set size {train_count} with {spectral_tier} spectral complexity."
+        ),
         "batch_size": _batch_rationale(batch_size, gpu_info, width, frequency_point_count),
-        "learning_rate": f"Learning rate {learning_rate:.1e} is a safe AdamW default; it cannot be inferred from a static scan, so refine it with a quick search.",
-        "dropout": f"Dropout {dropout:.2f} reflects a {overfit_risk} overfit risk ({signal_per_param:.1f} supervised values per parameter).",
-        "weight_decay": f"Weight decay {weight_decay:.1e} complements the same {overfit_risk} overfit estimate.",
+        "learning_rate": (
+            f"Learning rate {learning_rate:.1e} is the notebook-validated AdamW rate for the CTLE_MLP encoder."
+            if model_type == "CTLE_MLP"
+            else f"Learning rate {learning_rate:.1e} is a safe AdamW default; it cannot be inferred from a static scan, so refine it with a quick search."
+        ),
+        "weight_decay": f"Weight decay {weight_decay:.1e} reflects a {overfit_risk} overfit estimate ({signal_per_param:.1f} supervised values per parameter).",
         "epochs": f"Epoch budget {epochs} follows the current train split size of {train_count} samples.",
-        "patience": f"Patience {patience} pairs with the suggested epoch budget to stop early if validation plateaus.",
     }
     quick_search_hints = {
         "width": ranges["width"]["candidates"],
         "depth": ranges["depth"]["candidates"],
         "learning_rate": ranges["learning_rate"]["candidates"],
-        "dropout": ranges["dropout"]["candidates"],
     }
     return {
         "config": asdict(suggested),

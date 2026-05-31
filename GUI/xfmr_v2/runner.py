@@ -49,7 +49,6 @@ class TrainConfig:
     seed: int = 42
     batch_size: int = 16
     epochs: int = 300
-    patience: int = 20
     learning_rate: float = 1e-4
     weight_decay: float = 1e-4
     gradient_clip: float = 1.0
@@ -62,7 +61,6 @@ class TrainConfig:
     model_type: str = "FlatMLP"  # "FlatMLP" or "CTLE_MLP"
     width: int = 512
     depth: int = 5
-    dropout: float = 0.05
 
     # Loss and scheduler settings.
     loss_function: str = "rmse"  # "rmse" or "mse"
@@ -85,12 +83,10 @@ class TrainConfig:
                 "model_type": "CTLE_MLP",
                 "batch_size": 64,
                 "epochs": 500,
-                "patience": 50,
                 "learning_rate": 1e-3,
                 "weight_decay": 1e-4,
                 "width": 1024,
                 "depth": 5,
-                "dropout": 0.0,
                 "loss_function": "mse",
                 "scheduler": "plateau",
             },
@@ -135,6 +131,10 @@ class TransferConfig:
 
 
 MODEL_TYPES = ("FlatMLP", "CTLE_MLP")
+
+# LR-reduction patience for the "plateau" scheduler. Training no longer early-stops,
+# so this only controls when ReduceLROnPlateau lowers the learning rate.
+_PLATEAU_LR_PATIENCE = 10
 
 
 def resolve_device(spec: str | None) -> torch.device:
@@ -242,7 +242,6 @@ def run_baseline_trial(
     best_val = float("inf")
     best_epoch = 0
     best_state: dict[str, torch.Tensor] | None = None
-    stale = 0
     start_time = perf_counter()
     try:
         request_stop(should_stop)
@@ -314,15 +313,16 @@ def run_baseline_trial(
             ground_truth_channels=len(bundle.channel_names),
             width=config.width,
             depth=config.depth,
-            dropout=config.dropout,
         ).to(device)
         loss_fn = _build_loss_fn(config.loss_function)
         optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
         if config.scheduler == "cosine":
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs)
         else:
+            # Fixed LR-reduction patience: this is the plateau scheduler's own knob for
+            # lowering the learning rate, not training early stopping (which was removed).
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer, mode="min", factor=0.5, patience=max(config.patience // 2, 2)
+                optimizer, mode="min", factor=0.5, patience=_PLATEAU_LR_PATIENCE
             )
         amp = config.use_amp and device.type == "cuda"
         scaler = torch.amp.GradScaler("cuda", enabled=amp)
@@ -340,8 +340,8 @@ def run_baseline_trial(
             ),
         )
 
-        # Stage 4: run the train/validation loop with early stopping and best-checkpoint
-        # tracking based on validation loss.
+        # Stage 4: run the full train/validation loop, tracking the best checkpoint by
+        # validation loss. Training always runs the full epoch budget (no early stopping).
         for epoch in range(1, config.epochs + 1):
             request_stop(should_stop)
             train_loss = _run_epoch(
@@ -368,10 +368,8 @@ def run_baseline_trial(
             if improved:
                 # Clone the state dict so later optimizer steps cannot mutate the stored
                 # "best so far" checkpoint in place.
-                best_val, best_epoch, stale = val_loss, epoch, 0
+                best_val, best_epoch = val_loss, epoch
                 best_state = clone_state(model.state_dict())
-            else:
-                stale += 1
             elapsed_seconds = perf_counter() - start_time
             eta_seconds = 0.0 if epoch <= 0 else max((config.epochs - epoch) * elapsed_seconds / epoch, 0.0)
             emit_progress(
@@ -405,21 +403,6 @@ def run_baseline_trial(
                         best_val_loss=float(best_val),
                     ),
                 )
-            if stale >= config.patience:
-                emit_progress(
-                    progress_callback,
-                    event="early_stopped",
-                    phase="baseline",
-                    message="Early stopping triggered after validation plateaued.",
-                    **_progress_data(
-                        event_context,
-                        epoch=epoch,
-                        patience=config.patience,
-                        best_epoch=int(best_epoch),
-                        best_val_loss=float(best_val),
-                    ),
-                )
-                break
 
         runtime_seconds = perf_counter() - start_time
         if best_state is None:
@@ -729,6 +712,16 @@ def run_self_transfer(
         x = (features[:, active_idx] - input_feature_mean) / input_feature_std
         train_x, test_x = x[split["train"]], x[split["test"]]
         train_y, test_y = targets[split["train"]], targets[split["test"]]
+        # Per-channel, per-frequency target normalization saved with the baseline.
+        # Band fine-tuning runs in this SAME normalized space the baseline trained in,
+        # then MAE is reported back in original units. Older checkpoints without these
+        # stats fall back to identity (raw-space) behavior.
+        if "target_mean" in checkpoint and "target_std" in checkpoint:
+            target_mean = np.asarray(checkpoint["target_mean"], dtype=np.float32)
+            target_std = np.asarray(checkpoint["target_std"], dtype=np.float32)
+        else:
+            target_mean = np.zeros((train_y.shape[1], train_y.shape[2]), dtype=np.float32)
+            target_std = np.ones((train_y.shape[1], train_y.shape[2]), dtype=np.float32)
         freq_ghz = frequency_hz / 1.0e9
         freq_norm = normalize_frequency(freq_ghz)
         original_frequency_count = int(len(freq_norm))
@@ -741,6 +734,8 @@ def run_self_transfer(
             # number of bands.
             train_y = train_y[:, :, :effective_frequency_count]
             test_y = test_y[:, :, :effective_frequency_count]
+            target_mean = target_mean[:, :effective_frequency_count]
+            target_std = target_std[:, :effective_frequency_count]
             freq_ghz = freq_ghz[:effective_frequency_count]
             freq_norm = freq_norm[:effective_frequency_count]
             transfer_data_message = (
@@ -773,19 +768,31 @@ def run_self_transfer(
             "ground_truth_channels": len(checkpoint["target_channel_names"]),
             "width": int(cfg["width"]),
             "depth": int(cfg["depth"]),
-            "dropout": float(cfg["dropout"]),
         }
         base_state = clone_state(
             checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint["model_state"]
         )
         weight_decay = float(cfg["weight_decay"]) if config.weight_decay is None else float(config.weight_decay)
-        loaders = _band_loaders(train_x, train_y, bands, config.batch_size, device.type == "cuda")
-        eval_model = build_model(saved_model_type, num_frequencies=original_frequency_count, **model_kwargs).to(device)
+        # Each band predicts only its own frequencies, so band models are built at the
+        # band width (the per-frequency output layer is what differs from the baseline).
+        band_width = int(len(bands[0]))
+        # Train in the baseline's normalized target space; MAE is denormalized for reports.
+        train_y_norm = (train_y - target_mean) / target_std
+        loaders = _band_loaders(train_x, train_y_norm, bands, config.batch_size, device.type == "cuda")
+        eval_model = build_model(saved_model_type, num_frequencies=band_width, **model_kwargs).to(device)
+        # Seed each band by slicing the full-spectrum baseline output layer down to that
+        # band's frequency positions, so every band starts from the baseline's knowledge
+        # of exactly those frequencies.
+        base_states = [
+            _seed_band_state(base_state, saved_model_type, model_kwargs, original_frequency_count, band)
+            for band in bands
+        ]
 
         # Measure the baseline checkpoint in the "stitched" band-evaluation framework
         # so transfer iterations can be compared directly against it.
         base_average, base_freq_mae, base_band_mae = _stitched_mae(
-            eval_model, [base_state] * config.num_bands, bands, test_x, test_y, freq_norm, device, amp, config.batch_size
+            eval_model, base_states, bands, test_x, test_y, freq_norm, device, amp, config.batch_size,
+            target_mean=target_mean, target_std=target_std,
         )
         emit_progress(
             progress_callback,
@@ -804,7 +811,7 @@ def run_self_transfer(
         # Initialize the first band by fine-tuning directly from the baseline checkpoint.
         states[0] = _train_band(
             model_kwargs,
-            base_state,
+            base_states[0],
             loaders[0],
             freq_norm[bands[0]],
             device,
@@ -826,7 +833,7 @@ def run_self_transfer(
             },
             run_start_time=start_time,
             model_type=saved_model_type,
-            num_frequencies=original_frequency_count,
+            num_frequencies=band_width,
         )
 
         for t in range(1, config.iterations + 1):
@@ -869,7 +876,7 @@ def run_self_transfer(
                     },
                     run_start_time=start_time,
                     model_type=saved_model_type,
-                    num_frequencies=original_frequency_count,
+                    num_frequencies=band_width,
                 )
             if show_progress:
                 print(f"T={t}: backward loop")
@@ -901,12 +908,13 @@ def run_self_transfer(
                     },
                     run_start_time=start_time,
                     model_type=saved_model_type,
-                    num_frequencies=original_frequency_count,
+                    num_frequencies=band_width,
                 )
             # Reassemble the per-band models into one full-spectrum prediction and
             # record its error profile.
             average_mae, freq_mae, band_mae = _stitched_mae(
-                eval_model, states, bands, test_x, test_y, freq_norm, device, amp, config.batch_size
+                eval_model, states, bands, test_x, test_y, freq_norm, device, amp, config.batch_size,
+                target_mean=target_mean, target_std=target_std,
             )
             result = {"transfer_iteration": t, "average_mae": average_mae, "frequency_mae": freq_mae, "band_mae": band_mae}
             results.append(result)
@@ -1294,9 +1302,15 @@ def _stitched_mae(
     device: torch.device,
     amp: bool,
     batch_size: int,
+    target_mean: np.ndarray | None = None,
+    target_std: np.ndarray | None = None,
 ) -> tuple[float, list[float], list[float]]:
     # Evaluate each band-specific state on its own frequency slice, then stitch the
     # predictions back together into a full-spectrum tensor.
+    #
+    # Band models predict in the baseline's normalized target space.  When the
+    # normalization stats are supplied, predictions are denormalized per band so the
+    # MAE is reported in the original (raw) units of ``test_y``.
     pred = np.zeros_like(test_y, dtype=np.float32)
     x = torch.from_numpy(test_x.astype(np.float32))
     for state, band in zip(states, bands, strict=True):
@@ -1308,9 +1322,79 @@ def _stitched_mae(
             with torch.no_grad():
                 with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
                     out = model(x[start:stop].to(device), freq)
-            pred[start:stop, :, band] = out.detach().cpu().numpy()
+            out_np = out.detach().cpu().numpy().astype(np.float32)
+            if target_mean is not None and target_std is not None:
+                out_np = out_np * target_std[:, band][np.newaxis, :, :] + target_mean[:, band][np.newaxis, :, :]
+            pred[start:stop, :, band] = out_np
     abs_err = np.abs(pred - test_y)
     return float(abs_err.mean()), abs_err.mean(axis=(0, 1)).tolist(), [float(abs_err[:, :, band].mean()) for band in bands]
+
+
+def _seed_band_state(
+    base_state: dict[str, torch.Tensor],
+    model_type: str,
+    model_kwargs: dict[str, Any],
+    original_frequency_count: int,
+    band: np.ndarray,
+) -> dict[str, torch.Tensor]:
+    """Build a band-width initial state from a full-spectrum baseline state.
+
+    Every parameter except the final per-frequency output layer keeps the exact
+    baseline values (those shapes are identical for full- and band-width models).
+    The output layer is sliced to the band's frequency positions for each channel so
+    the band model starts from the baseline's knowledge of exactly those frequencies.
+    """
+    full = build_model(model_type, num_frequencies=original_frequency_count, **model_kwargs)
+    full.load_state_dict(base_state)
+    band_width = int(len(band))
+    band_model = build_model(model_type, num_frequencies=band_width, **model_kwargs)
+    channels = int(model_kwargs["ground_truth_channels"])
+    idx = torch.as_tensor(np.asarray(band), dtype=torch.long)
+
+    full_sd = full.state_dict()
+    target_sd = band_model.state_dict()
+    new_sd: dict[str, torch.Tensor] = {}
+    for key, target_param in target_sd.items():
+        source_param = full_sd[key]
+        if source_param.shape == target_param.shape:
+            # Only the output layer changes size, so everything else copies verbatim.
+            new_sd[key] = source_param.detach().clone()
+        else:
+            new_sd[key] = _slice_output_param(source_param, channels, original_frequency_count, idx)
+    band_model.load_state_dict(new_sd)
+    return clone_state(band_model.state_dict())
+
+
+def _slice_output_param(
+    param: torch.Tensor,
+    channels: int,
+    original_frequency_count: int,
+    idx: torch.Tensor,
+) -> torch.Tensor:
+    """Slice a full-spectrum output-layer parameter down to a band's frequencies.
+
+    Handles both output conventions used by the models here:
+    - FlatMLP: one flat output of ``channels * num_frequencies`` ordered by channel.
+    - CTLE_MLP: one ``num_frequencies``-wide head per channel.
+    Reached only for parameters whose shape actually differs between the full- and
+    band-width models, i.e. the per-frequency output layer.
+    """
+    band_width = int(idx.numel())
+    if param.dim() == 2:
+        if param.shape[0] == channels * original_frequency_count:  # FlatMLP output weight
+            reshaped = param.view(channels, original_frequency_count, param.shape[1])
+            return reshaped.index_select(1, idx).reshape(channels * band_width, param.shape[1]).detach().clone()
+        if param.shape[0] == original_frequency_count:  # CTLE per-channel head weight
+            return param.index_select(0, idx).detach().clone()
+    if param.dim() == 1:
+        if param.shape[0] == channels * original_frequency_count:  # FlatMLP output bias
+            reshaped = param.view(channels, original_frequency_count)
+            return reshaped.index_select(1, idx).reshape(channels * band_width).detach().clone()
+        if param.shape[0] == original_frequency_count:  # CTLE per-channel head bias
+            return param.index_select(0, idx).detach().clone()
+    raise ValueError(
+        f"Cannot slice output parameter of shape {tuple(param.shape)} to band width {band_width}."
+    )
 
 
 #

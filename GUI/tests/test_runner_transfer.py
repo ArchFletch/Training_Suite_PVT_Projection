@@ -26,7 +26,6 @@ def test_train_band_reports_elapsed_and_eta(monkeypatch) -> None:
         "ground_truth_channels": 1,
         "width": 8,
         "depth": 2,
-        "dropout": 0.0,
     }
     init_model = runner.FlatMLPNet(num_frequencies=3, **model_kwargs)
     init_state = runner.clone_state(init_model.state_dict())

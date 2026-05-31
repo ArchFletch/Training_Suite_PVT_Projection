@@ -599,14 +599,12 @@ class MlpTrainingStudio(QMainWindow):
         self.baseline_model_type_combo_box.addItems(list(MODEL_TYPES))
         self.baseline_model_type_combo_box.setCurrentText("FlatMLP")
         self.baseline_epochs_spin_box = self._make_int_spin(1, 5000, 300)
-        self.baseline_patience_spin_box = self._make_int_spin(1, 1000, 20)
         self.baseline_batch_size_spin_box = self._make_int_spin(1, 4096, 16)
         self.baseline_learning_rate_spin_box = self._make_float_spin(1e-6, 1.0, 1e-4, decimals=6, step=1e-5, scientific=True)
         self.baseline_weight_decay_spin_box = self._make_float_spin(0.0, 1.0, 1e-4, decimals=6, step=1e-5, scientific=True)
         self.baseline_gradient_clip_spin_box = self._make_float_spin(0.0, 100.0, 1.0, decimals=3, step=0.1)
         self.baseline_width_spin_box = self._make_int_spin(16, 8192, 512)
         self.baseline_depth_spin_box = self._make_int_spin(1, 20, 5)
-        self.baseline_dropout_spin_box = self._make_float_spin(0.0, 0.95, 0.05, decimals=3, step=0.01)
         self.baseline_loss_function_combo_box = _NoScrollComboBox()
         self.baseline_loss_function_combo_box.addItems(list(LOSS_FUNCTIONS))
         self.baseline_loss_function_combo_box.setCurrentText("rmse")
@@ -624,14 +622,12 @@ class MlpTrainingStudio(QMainWindow):
         fields = [
             ("Model Type", self.baseline_model_type_combo_box),
             ("Full Training Epochs", self.baseline_epochs_spin_box),
-            ("Early Stopping Patience", self.baseline_patience_spin_box),
             ("Batch Size", self.baseline_batch_size_spin_box),
             ("Learning Rate", self.baseline_learning_rate_spin_box),
             ("Weight Decay", self.baseline_weight_decay_spin_box),
             ("Gradient Clip", self.baseline_gradient_clip_spin_box),
             ("Network Width", self.baseline_width_spin_box),
             ("Network Depth", self.baseline_depth_spin_box),
-            ("Dropout", self.baseline_dropout_spin_box),
             ("Loss Function", self.baseline_loss_function_combo_box),
             ("LR Scheduler", self.baseline_scheduler_combo_box),
             ("Train Fraction", self.baseline_train_fraction_spin_box),
@@ -1848,14 +1844,12 @@ class MlpTrainingStudio(QMainWindow):
         return {
             "model_type": self.baseline_model_type_combo_box.currentText(),
             "epochs": self.baseline_epochs_spin_box.value(),
-            "patience": self.baseline_patience_spin_box.value(),
             "batch_size": self.baseline_batch_size_spin_box.value(),
             "learning_rate": float(self.baseline_learning_rate_spin_box.value()),
             "weight_decay": float(self.baseline_weight_decay_spin_box.value()),
             "gradient_clip": float(self.baseline_gradient_clip_spin_box.value()),
             "width": self.baseline_width_spin_box.value(),
             "depth": self.baseline_depth_spin_box.value(),
-            "dropout": float(self.baseline_dropout_spin_box.value()),
             "loss_function": self.baseline_loss_function_combo_box.currentText(),
             "scheduler": self.baseline_scheduler_combo_box.currentText(),
             "train_frac": float(self.baseline_train_fraction_spin_box.value()),
@@ -1870,14 +1864,12 @@ class MlpTrainingStudio(QMainWindow):
         if model_type in MODEL_TYPES:
             self.baseline_model_type_combo_box.setCurrentText(model_type)
         self.baseline_epochs_spin_box.setValue(int(payload.get("epochs", self.baseline_epochs_spin_box.value())))
-        self.baseline_patience_spin_box.setValue(int(payload.get("patience", self.baseline_patience_spin_box.value())))
         self.baseline_batch_size_spin_box.setValue(int(payload.get("batch_size", self.baseline_batch_size_spin_box.value())))
         self.baseline_learning_rate_spin_box.setValue(float(payload.get("learning_rate", self.baseline_learning_rate_spin_box.value())))
         self.baseline_weight_decay_spin_box.setValue(float(payload.get("weight_decay", self.baseline_weight_decay_spin_box.value())))
         self.baseline_gradient_clip_spin_box.setValue(float(payload.get("gradient_clip", self.baseline_gradient_clip_spin_box.value())))
         self.baseline_width_spin_box.setValue(int(payload.get("width", self.baseline_width_spin_box.value())))
         self.baseline_depth_spin_box.setValue(int(payload.get("depth", self.baseline_depth_spin_box.value())))
-        self.baseline_dropout_spin_box.setValue(float(payload.get("dropout", self.baseline_dropout_spin_box.value())))
         loss_fn = payload.get("loss_function", "rmse")
         if loss_fn in LOSS_FUNCTIONS:
             self.baseline_loss_function_combo_box.setCurrentText(loss_fn)
@@ -1938,7 +1930,6 @@ class MlpTrainingStudio(QMainWindow):
             seed=form["seed"],
             batch_size=form["batch_size"],
             epochs=form["epochs"],
-            patience=form["patience"],
             learning_rate=form["learning_rate"],
             weight_decay=form["weight_decay"],
             gradient_clip=form["gradient_clip"],
@@ -1946,7 +1937,6 @@ class MlpTrainingStudio(QMainWindow):
             val_frac=form["val_frac"],
             width=form["width"],
             depth=form["depth"],
-            dropout=form["dropout"],
             loss_function=form["loss_function"],
             scheduler=form["scheduler"],
             use_amp=form.get("use_amp", True),
@@ -2277,7 +2267,7 @@ class MlpTrainingStudio(QMainWindow):
         baseline = result["suggested_baseline_config"]
         baseline_ranges = result["suggested_baseline_ranges"]
         baseline_rationale = result["baseline_rationale"]
-        for name in ["width", "depth", "batch_size", "learning_rate", "dropout", "weight_decay", "epochs", "patience"]:
+        for name in ["model_type", "width", "depth", "batch_size", "learning_rate", "weight_decay", "epochs"]:
             range_info = baseline_ranges.get(name, {})
             rows.append((f"Baseline: {self._prettify_key(name)}", self._stringify(baseline[name]), self._stringify(range_info.get("candidates", [])), baseline_rationale.get(name, "")))
         transfer = result["suggested_transfer_config"]
@@ -2296,7 +2286,6 @@ class MlpTrainingStudio(QMainWindow):
             str(config["depth"]),
             f"{config['learning_rate']:.1e}",
             str(config["batch_size"]),
-            f"{config['dropout']:.3f}",
             f"{trial['best_val_loss']:.6f}",
             f"{trial['average_val_mae']:.6f}",
             self._format_seconds(trial["runtime_seconds"]),

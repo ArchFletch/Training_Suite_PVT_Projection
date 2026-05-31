@@ -167,7 +167,6 @@ def test_quick_hyperparameter_search_ranks_trials_and_writes_outputs(
         seed=11,
         batch_size=16,
         epochs=200,
-        patience=20,
         learning_rate=1e-4,
         weight_decay=1e-4,
         gradient_clip=1.0,
@@ -175,7 +174,6 @@ def test_quick_hyperparameter_search_ranks_trials_and_writes_outputs(
         val_frac=0.1,
         width=192,
         depth=4,
-        dropout=0.10,
         use_amp=False,
         max_samples=24,
     )
@@ -189,7 +187,6 @@ def test_quick_hyperparameter_search_ranks_trials_and_writes_outputs(
             "depth": {"selected": 4, "candidates": [3, 4, 5]},
             "batch_size": {"selected": 16, "candidates": [8, 16, 32]},
             "learning_rate": {"selected": 1e-4, "candidates": [7e-5, 1e-4, 2e-4]},
-            "dropout": {"selected": 0.10, "candidates": [0.05, 0.10, 0.15]},
             "weight_decay": {"selected": 1e-4, "candidates": [5e-5, 1e-4, 3e-4]},
         },
     }
