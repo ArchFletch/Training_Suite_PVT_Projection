@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 import pyqtgraph as pg
-from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
-from PySide6.QtGui import QCloseEvent
+from PySide6.QtCore import QObject, QThread, Qt, QUrl, Signal, Slot
+from PySide6.QtGui import QCloseEvent, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -1214,10 +1213,11 @@ class MlpTrainingStudio(QMainWindow):
         if not path.exists():
             self._show_warning("The selected output path does not exist yet.")
             return
-        try:
-            os.startfile(str(path))  # type: ignore[attr-defined]
-        except OSError as exc:
-            self._show_warning(f"Could not open the output folder: {exc}")
+        # QDesktopServices picks the right opener per platform (xdg-open on Linux,
+        # open on macOS, ShellExecute on Windows) instead of the Windows-only
+        # os.startfile.
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
+            self._show_warning(f"Could not open the output folder: {path}")
 
     def export_run_summary(self) -> None:
         payload = {
