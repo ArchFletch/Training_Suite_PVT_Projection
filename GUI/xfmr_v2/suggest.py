@@ -490,13 +490,11 @@ def _suggest_baseline(
         model_type = "FlatMLP"
         loss_function = "rmse"
         scheduler = "plateau"
-        gradient_clip = 1.0
     else:
         model_type = "CTLE_MLP"
         depth = 5  # yields the validated [w, 2w, 4w, 2w, w] encoder
         loss_function = "mse"
         scheduler = "cosine"
-        gradient_clip = 0.0  # the validated recipe does not clip gradients
 
     # Estimate the chosen model's size and derive the overfit risk from how much
     # supervised signal the data provides per parameter. This closes the loop so a
@@ -569,7 +567,6 @@ def _suggest_baseline(
         epochs=epochs,
         learning_rate=learning_rate,
         weight_decay=weight_decay,
-        gradient_clip=gradient_clip,
         train_frac=request.train_frac,
         val_frac=request.val_frac,
         model_type=model_type,
@@ -673,7 +670,6 @@ def _suggest_transfer(
         "batch_size": int(batch_size),
         "learning_rate": learning_rate,
         "weight_decay": None,
-        "gradient_clip": 1.0,
         "use_amp": bool(gpu_info["available"]),
     }
     ranges = {

@@ -51,7 +51,6 @@ class TrainConfig:
     epochs: int = 300
     learning_rate: float = 1e-4
     weight_decay: float = 1e-4
-    gradient_clip: float = 1.0
 
     # Dataset split settings.
     train_frac: float = 0.8
@@ -123,7 +122,6 @@ class TransferConfig:
     batch_size: int = 64
     learning_rate: float = 5e-5
     weight_decay: float | None = None
-    gradient_clip: float = 1.0
     use_amp: bool = True
     # Compute device to train on, e.g. "cuda:0", "cuda:1", or "cpu".
     # ``None`` means auto-select (first CUDA device when available, else CPU).
@@ -352,7 +350,6 @@ def run_baseline_trial(
                 scaler,
                 device,
                 amp,
-                config.gradient_clip,
                 should_stop=should_stop,
                 loss_fn=loss_fn,
             )
@@ -819,7 +816,6 @@ def run_self_transfer(
             config.transfer_epochs,
             config.learning_rate,
             weight_decay,
-            config.gradient_clip,
             show_progress=show_progress,
             progress_callback=progress_callback,
             should_stop=should_stop,
@@ -862,7 +858,6 @@ def run_self_transfer(
                     config.transfer_epochs,
                     config.learning_rate,
                     weight_decay,
-                    config.gradient_clip,
                     show_progress=show_progress,
                     progress_callback=progress_callback,
                     should_stop=should_stop,
@@ -894,7 +889,6 @@ def run_self_transfer(
                     config.transfer_epochs,
                     config.learning_rate,
                     weight_decay,
-                    config.gradient_clip,
                     show_progress=show_progress,
                     progress_callback=progress_callback,
                     should_stop=should_stop,
@@ -1045,7 +1039,6 @@ def _run_epoch(
     scaler: torch.amp.GradScaler,
     device: torch.device,
     amp: bool,
-    grad_clip: float,
     should_stop: StopChecker | None = None,
     loss_fn=frequency_rmse,
 ) -> float:
@@ -1059,9 +1052,6 @@ def _run_epoch(
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
             loss = loss_fn(model(x, freq), y)
         scaler.scale(loss).backward()
-        if grad_clip > 0.0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         scaler.step(optimizer)
         scaler.update()
         total += float(loss.detach().cpu()) * x.shape[0]
@@ -1216,7 +1206,6 @@ def _train_band(
     epochs: int,
     lr: float,
     weight_decay: float,
-    grad_clip: float,
     show_progress: bool = True,
     progress_callback: ProgressCallback | None = None,
     should_stop: StopChecker | None = None,
@@ -1249,7 +1238,6 @@ def _train_band(
             scaler,
             device,
             amp,
-            grad_clip,
             should_stop=should_stop,
         )
         if show_progress:

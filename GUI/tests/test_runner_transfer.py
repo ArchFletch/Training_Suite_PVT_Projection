@@ -48,7 +48,6 @@ def test_train_band_reports_elapsed_and_eta(monkeypatch) -> None:
         epochs=2,
         lr=1e-3,
         weight_decay=0.0,
-        grad_clip=1.0,
         show_progress=False,
         progress_callback=events.append,
         event_context={"band_run_index": 2, "total_band_runs": 5},

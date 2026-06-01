@@ -216,7 +216,6 @@ def test_quick_hyperparameter_search_ranks_trials_and_writes_outputs(
         epochs=200,
         learning_rate=1e-4,
         weight_decay=1e-4,
-        gradient_clip=1.0,
         train_frac=0.8,
         val_frac=0.1,
         width=192,

@@ -607,7 +607,6 @@ class MlpTrainingStudio(QMainWindow):
         self.baseline_batch_size_spin_box = self._make_int_spin(1, 4096, 16)
         self.baseline_learning_rate_spin_box = self._make_float_spin(1e-6, 1.0, 1e-4, decimals=6, step=1e-5, scientific=True)
         self.baseline_weight_decay_spin_box = self._make_float_spin(0.0, 1.0, 1e-4, decimals=6, step=1e-5, scientific=True)
-        self.baseline_gradient_clip_spin_box = self._make_float_spin(0.0, 100.0, 1.0, decimals=3, step=0.1)
         self.baseline_width_spin_box = self._make_int_spin(16, 8192, 512)
         self.baseline_depth_spin_box = self._make_int_spin(1, 20, 5)
         self.baseline_loss_function_combo_box = _NoScrollComboBox()
@@ -630,7 +629,6 @@ class MlpTrainingStudio(QMainWindow):
             ("Batch Size", self.baseline_batch_size_spin_box),
             ("Learning Rate", self.baseline_learning_rate_spin_box),
             ("Weight Decay", self.baseline_weight_decay_spin_box),
-            ("Gradient Clip", self.baseline_gradient_clip_spin_box),
             ("Network Width", self.baseline_width_spin_box),
             ("Network Depth", self.baseline_depth_spin_box),
             ("Loss Function", self.baseline_loss_function_combo_box),
@@ -682,7 +680,6 @@ class MlpTrainingStudio(QMainWindow):
         self.transfer_learning_rate_spin_box = self._make_float_spin(1e-6, 1.0, 5e-5, decimals=6, step=1e-5, scientific=True)
         self.transfer_weight_decay_spin_box = self._make_float_spin(0.0, 1.0, 0.0, decimals=6, step=1e-5, scientific=True)
         self.transfer_weight_decay_spin_box.setSpecialValueText("Use baseline")
-        self.transfer_gradient_clip_spin_box = self._make_float_spin(0.0, 100.0, 1.0, decimals=3, step=0.1)
         self.transfer_seed_spin_box = self._make_int_spin(0, 1000000, 42)
 
         self._add_form_row(grid, 0, "Base Model Source", self.transfer_base_model_source_combo_box)
@@ -694,8 +691,7 @@ class MlpTrainingStudio(QMainWindow):
         self._add_form_row(grid, 6, "Batch Size", self.transfer_batch_size_spin_box)
         self._add_form_row(grid, 7, "Learning Rate", self.transfer_learning_rate_spin_box)
         self._add_form_row(grid, 8, "Weight Decay", self.transfer_weight_decay_spin_box)
-        self._add_form_row(grid, 9, "Gradient Clip", self.transfer_gradient_clip_spin_box)
-        self._add_form_row(grid, 10, "Random Seed", self.transfer_seed_spin_box)
+        self._add_form_row(grid, 9, "Random Seed", self.transfer_seed_spin_box)
         layout.addLayout(grid)
         layout.addWidget(self.transfer_notes_label)
         return tab
@@ -1887,7 +1883,6 @@ class MlpTrainingStudio(QMainWindow):
             "batch_size": self.baseline_batch_size_spin_box.value(),
             "learning_rate": float(self.baseline_learning_rate_spin_box.value()),
             "weight_decay": float(self.baseline_weight_decay_spin_box.value()),
-            "gradient_clip": float(self.baseline_gradient_clip_spin_box.value()),
             "width": self.baseline_width_spin_box.value(),
             "depth": self.baseline_depth_spin_box.value(),
             "loss_function": self.baseline_loss_function_combo_box.currentText(),
@@ -1907,7 +1902,6 @@ class MlpTrainingStudio(QMainWindow):
         self.baseline_batch_size_spin_box.setValue(int(payload.get("batch_size", self.baseline_batch_size_spin_box.value())))
         self.baseline_learning_rate_spin_box.setValue(float(payload.get("learning_rate", self.baseline_learning_rate_spin_box.value())))
         self.baseline_weight_decay_spin_box.setValue(float(payload.get("weight_decay", self.baseline_weight_decay_spin_box.value())))
-        self.baseline_gradient_clip_spin_box.setValue(float(payload.get("gradient_clip", self.baseline_gradient_clip_spin_box.value())))
         self.baseline_width_spin_box.setValue(int(payload.get("width", self.baseline_width_spin_box.value())))
         self.baseline_depth_spin_box.setValue(int(payload.get("depth", self.baseline_depth_spin_box.value())))
         loss_fn = payload.get("loss_function", "rmse")
@@ -1928,7 +1922,6 @@ class MlpTrainingStudio(QMainWindow):
             "batch_size": self.transfer_batch_size_spin_box.value(),
             "learning_rate": float(self.transfer_learning_rate_spin_box.value()),
             "weight_decay": None if self.transfer_weight_decay_spin_box.value() <= 0.0 else float(self.transfer_weight_decay_spin_box.value()),
-            "gradient_clip": float(self.transfer_gradient_clip_spin_box.value()),
             "seed": self.transfer_seed_spin_box.value(),
         }
 
@@ -1942,7 +1935,6 @@ class MlpTrainingStudio(QMainWindow):
         self.transfer_learning_rate_spin_box.setValue(float(payload.get("learning_rate", self.transfer_learning_rate_spin_box.value())))
         weight_decay = payload.get("weight_decay", None)
         self.transfer_weight_decay_spin_box.setValue(0.0 if weight_decay in (None, "") else float(weight_decay))
-        self.transfer_gradient_clip_spin_box.setValue(float(payload.get("gradient_clip", self.transfer_gradient_clip_spin_box.value())))
         self.transfer_seed_spin_box.setValue(int(payload.get("seed", self.transfer_seed_spin_box.value())))
         self._refresh_transfer_note_text()
 
@@ -1972,7 +1964,6 @@ class MlpTrainingStudio(QMainWindow):
             epochs=form["epochs"],
             learning_rate=form["learning_rate"],
             weight_decay=form["weight_decay"],
-            gradient_clip=form["gradient_clip"],
             train_frac=form["train_frac"],
             val_frac=form["val_frac"],
             width=form["width"],
@@ -1999,7 +1990,6 @@ class MlpTrainingStudio(QMainWindow):
             batch_size=form["batch_size"],
             learning_rate=form["learning_rate"],
             weight_decay=form["weight_decay"],
-            gradient_clip=form["gradient_clip"],
             use_amp=True,
             device=self._current_device_id(),
         )
@@ -2034,7 +2024,6 @@ class MlpTrainingStudio(QMainWindow):
             self.transfer_batch_size_spin_box,
             self.transfer_learning_rate_spin_box,
             self.transfer_weight_decay_spin_box,
-            self.transfer_gradient_clip_spin_box,
             self.transfer_seed_spin_box,
         ):
             widget.setEnabled(enabled)
