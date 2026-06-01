@@ -230,14 +230,13 @@ class MlpTrainingStudio(QMainWindow):
         self._setting_search_max_samples = False
         self._controls_locked = False
         self._search_text_items: list[pg.TextItem] = []
-        self._transfer_frequency_items: list[Any] = []
 
         self._baseline_epochs: list[float] = []
         self._baseline_train_losses: list[float] = []
         self._baseline_val_losses: list[float] = []
         self._transfer_iteration_mae_x: list[float] = []
         self._transfer_iteration_mae_y: list[float] = []
-        self._transfer_frequency_history: list[list[float]] = []
+        self._transfer_base_average_mae: float | None = None
 
         self.setWindowTitle("Surrogate Model Traning Suite")
         self.resize(1440, 920)
@@ -790,9 +789,9 @@ class MlpTrainingStudio(QMainWindow):
         transfer_layout = QVBoxLayout(transfer_tab)
         transfer_layout.setContentsMargins(12, 12, 12, 12)
         transfer_layout.setSpacing(10)
-        self.transfer_frequency_mae_plot = pg.PlotWidget(transfer_tab)
-        self.transfer_frequency_mae_plot.setMinimumHeight(200)
-        transfer_layout.addWidget(self.transfer_frequency_mae_plot, 1)
+        self.transfer_average_mae_plot = pg.PlotWidget(transfer_tab)
+        self.transfer_average_mae_plot.setMinimumHeight(200)
+        transfer_layout.addWidget(self.transfer_average_mae_plot, 1)
         tabs.addTab(transfer_tab, "Transfer Results")
 
         # Test Samples tab — shows prediction vs ground truth for test samples.
@@ -1813,7 +1812,8 @@ class MlpTrainingStudio(QMainWindow):
             if base_average is not None:
                 self.metric_cards["best_metric"].set_value(f"Base MAE {base_average:.6f}")
                 self.metric_cards["average_mae"].set_value(f"{base_average:.6f}")
-            self._plot_transfer_base_metrics(payload)
+                self._transfer_base_average_mae = float(base_average)
+            self._plot_transfer_average()
         elif event == "iteration_started":
             if payload.get("transfer_iteration") is not None and payload.get("total_iterations") is not None:
                 self.metric_cards["current_progress"].set_value(f"Iteration {payload['transfer_iteration']}/{payload['total_iterations']}")
@@ -1847,8 +1847,7 @@ class MlpTrainingStudio(QMainWindow):
             transfer_iteration = int(payload["transfer_iteration"])
             self._transfer_iteration_mae_x.append(transfer_iteration)
             self._transfer_iteration_mae_y.append(float(payload["average_mae"]))
-            self._transfer_frequency_history.append(list(payload.get("frequency_mae", [])))
-            self._plot_transfer_iteration_metrics(payload)
+            self._plot_transfer_average()
             self.metric_cards["average_mae"].set_value(f"{payload['average_mae']:.6f}")
             self.metric_cards["current_progress"].set_value(f"Iteration {transfer_iteration}/{payload['total_iterations']} complete")
             if payload.get("elapsed_seconds") is not None:
@@ -2147,11 +2146,14 @@ class MlpTrainingStudio(QMainWindow):
     def _reset_transfer_plots(self) -> None:
         self._transfer_iteration_mae_x.clear()
         self._transfer_iteration_mae_y.clear()
-        self._transfer_frequency_history.clear()
-        self._transfer_frequency_items.clear()
-        self.transfer_frequency_mae_plot.clear()
-        sweep = getattr(self, "_sweep_label", "Frequency (GHz)")
-        configure_plot_widget(self.transfer_frequency_mae_plot, title=f"MAE over {sweep} by Transfer Iteration", x_label=sweep, y_label="MAE")
+        self._transfer_base_average_mae = None
+        self.transfer_average_mae_plot.clear()
+        configure_plot_widget(
+            self.transfer_average_mae_plot,
+            title="Average MAE by Transfer Iteration",
+            x_label="Transfer Iteration",
+            y_label="Average MAE",
+        )
 
     def _plot_search_tradeoff(self, trials: list[dict[str, Any]]) -> None:
         self._reset_search_plot()
@@ -2165,29 +2167,25 @@ class MlpTrainingStudio(QMainWindow):
             self.search_tradeoff_plot.addItem(label)
             self._search_text_items.append(label)
 
-    def _plot_transfer_base_metrics(self, payload: dict[str, Any]) -> None:
+    def _plot_transfer_average(self) -> None:
+        """Show the average MAE for each transfer iteration, with the baseline as a reference."""
+        self.transfer_average_mae_plot.clear()
         colors = plot_color_cycle()
-        if payload.get("frequency_ghz") and payload.get("base_frequency_mae"):
-            item = self.transfer_frequency_mae_plot.plot(
-                payload["frequency_ghz"],
-                payload["base_frequency_mae"],
+        if self._transfer_base_average_mae is not None:
+            self.transfer_average_mae_plot.addLine(
+                y=self._transfer_base_average_mae,
                 pen=pg.mkPen(colors[4], width=2.0, style=Qt.PenStyle.DashLine),
-                name="Base",
             )
-            self._transfer_frequency_items.append(item)
-
-    def _plot_transfer_iteration_metrics(self, payload: dict[str, Any]) -> None:
-        colors = plot_color_cycle()
-        index = max(len(self._transfer_frequency_history) - 1, 0)
-        color = colors[index % len(colors)]
-        if payload.get("frequency_ghz") and payload.get("frequency_mae"):
-            item = self.transfer_frequency_mae_plot.plot(
-                payload["frequency_ghz"],
-                payload["frequency_mae"],
-                pen=pg.mkPen(color, width=2.2),
-                name=f"T={payload['transfer_iteration']}",
+        if self._transfer_iteration_mae_x:
+            self.transfer_average_mae_plot.plot(
+                self._transfer_iteration_mae_x,
+                self._transfer_iteration_mae_y,
+                pen=pg.mkPen(colors[0], width=2.2),
+                symbol="o",
+                symbolSize=8,
+                symbolBrush=colors[0],
+                name="Average MAE",
             )
-            self._transfer_frequency_items.append(item)
 
     # ------------------------------------------------------------------
     # Misc helpers
