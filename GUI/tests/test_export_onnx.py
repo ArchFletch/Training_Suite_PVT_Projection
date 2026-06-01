@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 import torch
 
-from xfmr_v2.export_onnx import export_checkpoint_to_onnx
+from xfmr_v2.export_onnx import export_checkpoint_to_onnx, export_transfer_to_onnx
 from xfmr_v2.runner import build_model
 
 # The exporter needs `onnx`; the numerical check needs `onnxruntime`.
@@ -33,8 +33,13 @@ def _make_checkpoint(
     depth: int = 3,
     transforms: list[str] | None = None,
     with_cache: bool = False,
+    target_scale: float = 1.0,
 ) -> tuple[Path, dict]:
-    """Write a minimal but valid checkpoint and return (path, reference info)."""
+    """Write a minimal but valid checkpoint and return (path, reference info).
+
+    ``target_scale`` inflates the target normalization stats so denormalized outputs
+    can reach the large magnitudes (e.g. phase in degrees) that stress the exporter.
+    """
     run_dir.mkdir(parents=True, exist_ok=True)
     model = build_model(
         model_type,
@@ -48,8 +53,8 @@ def _make_checkpoint(
     rng = np.random.default_rng(0)
     input_mean = rng.standard_normal(n_features).astype(np.float32)
     input_std = (np.abs(rng.standard_normal(n_features)) + 0.5).astype(np.float32)
-    target_mean = rng.standard_normal((channels, freqs)).astype(np.float32)
-    target_std = (np.abs(rng.standard_normal((channels, freqs))) + 0.5).astype(np.float32)
+    target_mean = (rng.standard_normal((channels, freqs)) * target_scale).astype(np.float32)
+    target_std = ((np.abs(rng.standard_normal((channels, freqs))) + 0.5) * target_scale).astype(np.float32)
 
     cache_path = ""
     if with_cache:
@@ -163,3 +168,78 @@ def test_missing_cache_still_exports_with_empty_axis_meta(tmp_path: Path) -> Non
     # Export succeeds; axis labels are empty placeholders when no cache is present.
     assert meta["frequency_hz"] == []
     assert meta["num_channels"] == 2
+
+
+def test_no_nan_with_large_nonlog10_outputs(tmp_path: Path) -> None:
+    """Large denormalized outputs (e.g. phase in degrees) must not produce NaN/inf.
+
+    A non-log10 channel whose denormalized value exceeds ~38 overflowed 10**y in an
+    earlier mask-multiply formulation (0*inf=NaN). This regression test fails on that
+    bug and passes once the inverse is applied only to log10 channels.
+    """
+    ckpt, ref = _make_checkpoint(
+        tmp_path / "big", model_type="CTLE_MLP", channels=2, target_scale=60.0, with_cache=True
+    )
+    out = export_checkpoint_to_onnx(ckpt)
+    rng = np.random.default_rng(7)
+    x = rng.standard_normal((16, ref["n_features"])).astype(np.float32)
+    o = ort.InferenceSession(str(out)).run(["prediction"], {"input_features": x})[0]
+    assert not np.isnan(o).any(), "exported model produced NaN on large-output channels"
+    assert not np.isinf(o).any()
+    expected = _reference(ref, x)
+    assert np.max(np.abs(o - expected)) < 1e-2
+
+
+def _make_transfer_run(tmp_path: Path, *, freqs: int = 9, num_bands: int = 3, channels: int = 2,
+                       n_features: int = 4, width: int = 16, depth: int = 3) -> tuple[Path, dict]:
+    """Build a synthetic self-transfer run dir (baseline + per-band submodels)."""
+    base_dir = tmp_path / "baseline"
+    ckpt, ref = _make_checkpoint(base_dir, model_type="CTLE_MLP", n_features=n_features,
+                                 channels=channels, freqs=freqs, width=width, depth=depth, with_cache=True)
+    size = freqs // num_bands
+    bands = [np.arange(i * size, (i + 1) * size, dtype=np.int64) for i in range(num_bands)]
+    states = []
+    for band in bands:
+        sub = build_model("CTLE_MLP", num_frequencies=int(len(band)), input_feature_dim=n_features,
+                          ground_truth_channels=channels, width=width, depth=depth)
+        states.append(sub.state_dict())
+    trun = tmp_path / "transfer"
+    trun.mkdir(parents=True, exist_ok=True)
+    torch.save({"states": states,
+                "model_kwargs": {"input_feature_dim": n_features, "ground_truth_channels": channels,
+                                 "width": width, "depth": depth},
+                "bands": [b for b in bands]}, trun / "final_submodels.pt")
+    (trun / "summary.json").write_text(json.dumps({"base_run_dir": str(base_dir)}))
+    return trun, {"states": states, "bands": bands, "ref": ref, "channels": channels,
+                  "freqs": freqs, "n_features": n_features, "model_kwargs": {
+                      "input_feature_dim": n_features, "ground_truth_channels": channels,
+                      "width": width, "depth": depth}}
+
+
+def test_transfer_export_matches_stitched_torch(tmp_path: Path) -> None:
+    trun, info = _make_transfer_run(tmp_path, freqs=9, num_bands=3)
+    out = export_transfer_to_onnx(trun)
+
+    meta = json.loads(out.with_suffix(".meta.json").read_text())
+    assert "transfer" in meta["model_type"]
+    assert meta["num_frequencies"] == info["freqs"]
+    assert len(meta["transfer_bands"]) == 3
+
+    # Reference: run each band submodel and stitch in band order (as runner does).
+    ref = info["ref"]
+    rng = np.random.default_rng(5)
+    x = rng.standard_normal((6, info["n_features"])).astype(np.float32)
+    xn = torch.from_numpy(((x - ref["input_mean"]) / ref["input_std"]).astype(np.float32))
+    C, F = info["channels"], info["freqs"]
+    stitched = np.zeros((len(x), C, F), dtype=np.float32)
+    for state, band in zip(info["states"], info["bands"]):
+        m = build_model("CTLE_MLP", num_frequencies=int(len(band)), **info["model_kwargs"])
+        m.load_state_dict(state)
+        m.eval()
+        with torch.no_grad():
+            o = m(xn, torch.zeros(1)).numpy()
+        stitched[:, :, band] = o * ref["target_std"][:, band][None] + ref["target_mean"][:, band][None]
+
+    onnx_out = ort.InferenceSession(str(out)).run(["prediction"], {"input_features": x})[0]
+    assert not np.isnan(onnx_out).any()
+    assert np.max(np.abs(onnx_out - stitched.reshape(len(x), C * F))) < 1e-3

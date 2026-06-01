@@ -37,6 +37,20 @@ from torch import nn
 from .runner import build_model
 
 
+def _apply_log10_inverse(y: torch.Tensor, log10_mask: torch.Tensor, has_log10: bool) -> torch.Tensor:
+    """Undo a log10 transform on the masked channels of ``y`` (shape (batch, C, F)).
+
+    ``torch.where`` is used rather than ``mask * 10**y + (1-mask) * y`` because the
+    latter computes ``10**y`` for every channel, and a non-log10 channel with a large
+    denormalized value (e.g. phase in degrees) overflows to +inf -> ``0 * inf`` = NaN.
+    ``where`` is a select, so inf in the unselected lanes is simply discarded.  When no
+    channel is log10 (e.g. CTLE), the pow op is skipped entirely.
+    """
+    if not has_log10:
+        return y
+    return torch.where(log10_mask, torch.pow(10.0, y), y)
+
+
 class _ExportWrapper(nn.Module):
     """Wrap a trained net so the ONNX graph maps raw inputs to physical outputs.
 
@@ -70,8 +84,10 @@ class _ExportWrapper(nn.Module):
         self.register_buffer("target_mean", _buf(target_mean).unsqueeze(0))
         self.register_buffer("target_std", _buf(target_std).unsqueeze(0))
         # log10 channels are stored as log10(value); the inverse is 10**x.  Encoded as a
-        # (1, C, 1) float mask so the graph stays branch-free and export-friendly.
-        mask = torch.tensor([1.0 if m else 0.0 for m in log10_channel_mask], dtype=torch.float32)
+        # (1, C, 1) bool mask used with torch.where (see forward for why a mask-multiply
+        # would be wrong).  The pow op is only emitted when some channel needs it.
+        self._has_log10 = any(log10_channel_mask)
+        mask = torch.tensor([m for m in log10_channel_mask], dtype=torch.bool)
         self.register_buffer("log10_mask", mask.view(1, -1, 1))
         # `frequency` is required by the forward signature but ignored by the models.
         self.register_buffer("_unused_frequency", torch.zeros(1, dtype=torch.float32))
@@ -83,8 +99,57 @@ class _ExportWrapper(nn.Module):
         y = self.model(x, self._unused_frequency)  # (batch, C, F), normalized space
         if self.bake_normalization:
             y = y * self.target_std + self.target_mean
-            # Undo log10 only on the channels that were stored in log space.
-            y = self.log10_mask * torch.pow(10.0, y) + (1.0 - self.log10_mask) * y
+            y = _apply_log10_inverse(y, self.log10_mask, self._has_log10)
+        return y.reshape(y.shape[0], self.num_channels * self.num_frequencies)
+
+
+class _TransferExportWrapper(nn.Module):
+    """Stitch per-band transfer submodels into one end-to-end graph.
+
+    Self-transfer learning trains one submodel per contiguous frequency band, each
+    predicting its slice in the baseline's normalized target space.  This wrapper runs
+    every band, concatenates the slices in band order, then denormalizes — producing
+    the same ``(batch, channels * num_frequencies)`` output as :class:`_ExportWrapper`
+    so the same MATLAB loader works unchanged.  Bands are concatenated in list order,
+    which matches the ascending, contiguous index layout that training produces.
+    """
+
+    def __init__(
+        self,
+        submodels: list[nn.Module],
+        input_mean: np.ndarray,
+        input_std: np.ndarray,
+        target_mean: np.ndarray,
+        target_std: np.ndarray,
+        log10_channel_mask: list[bool],
+        bake_normalization: bool,
+    ) -> None:
+        super().__init__()
+        self.submodels = nn.ModuleList(submodels)
+        self.bake_normalization = bake_normalization
+        self.num_channels, self.num_frequencies = target_mean.shape
+
+        def _buf(arr: np.ndarray) -> torch.Tensor:
+            return torch.tensor(np.asarray(arr, dtype=np.float32))
+
+        self.register_buffer("input_mean", _buf(input_mean))
+        self.register_buffer("input_std", _buf(input_std))
+        self.register_buffer("target_mean", _buf(target_mean).unsqueeze(0))
+        self.register_buffer("target_std", _buf(target_std).unsqueeze(0))
+        self._has_log10 = any(log10_channel_mask)
+        mask = torch.tensor([m for m in log10_channel_mask], dtype=torch.bool)
+        self.register_buffer("log10_mask", mask.view(1, -1, 1))
+        self.register_buffer("_unused_frequency", torch.zeros(1, dtype=torch.float32))
+
+    def forward(self, input_features: torch.Tensor) -> torch.Tensor:
+        x = input_features
+        if self.bake_normalization:
+            x = (x - self.input_mean) / self.input_std
+        # Each submodel returns (batch, C, band_width); concatenate along frequency.
+        y = torch.cat([sub(x, self._unused_frequency) for sub in self.submodels], dim=2)
+        if self.bake_normalization:
+            y = y * self.target_std + self.target_mean
+            y = _apply_log10_inverse(y, self.log10_mask, self._has_log10)
         return y.reshape(y.shape[0], self.num_channels * self.num_frequencies)
 
 
@@ -203,6 +268,115 @@ def export_checkpoint_to_onnx(
     return out_path
 
 
+def export_transfer_to_onnx(
+    transfer_run_dir: str | Path,
+    out_path: str | Path | None = None,
+    *,
+    baseline_checkpoint: str | Path | None = None,
+    bake_normalization: bool = True,
+    opset: int = 17,
+    check: bool = False,
+) -> Path:
+    """Export a self-transfer (per-band) model to a single stitched ONNX graph.
+
+    ``transfer_run_dir`` must contain ``final_submodels.pt``.  The normalization stats,
+    model type, and frequency axis are taken from the baseline run the transfer was
+    seeded from (resolved via the transfer ``summary.json``'s ``base_run_dir``, or
+    overridden with ``baseline_checkpoint``).  Writes ``<out>.onnx`` + ``<out>.meta.json``
+    and returns the ``.onnx`` path.  The output contract matches the baseline exporter,
+    so the same MATLAB loader works unchanged.
+    """
+    transfer_run_dir = Path(transfer_run_dir)
+    bundle = torch.load(transfer_run_dir / "final_submodels.pt", map_location="cpu", weights_only=False)
+    states = bundle["states"]
+    model_kwargs = dict(bundle["model_kwargs"])
+    bands = [np.asarray(b, dtype=np.int64) for b in bundle["bands"]]
+
+    # The baseline run supplies model_type + normalization (the transfer file omits them).
+    if baseline_checkpoint is None:
+        summary = json.loads((transfer_run_dir / "summary.json").read_text())
+        base_run_dir = summary.get("base_run_dir")
+        if not base_run_dir:
+            raise ValueError(
+                "Transfer summary.json has no 'base_run_dir'; pass baseline_checkpoint explicitly."
+            )
+        baseline_checkpoint = Path(base_run_dir) / "best_model.pt"
+    baseline_checkpoint = Path(baseline_checkpoint)
+    base = torch.load(baseline_checkpoint, map_location="cpu", weights_only=False)
+    config = base["config"]
+    model_type = config.get("model_type", "FlatMLP")
+
+    active_names = list(_get(base, "active_input_feature_names", "active_feature_names"))
+    channel_names = list(base["target_channel_names"])
+    input_mean = np.asarray(_get(base, "input_feature_mean", "input_mean"), dtype=np.float32)
+    input_std = np.asarray(_get(base, "input_feature_std", "input_std"), dtype=np.float32)
+    target_mean_full = np.asarray(base["target_mean"], dtype=np.float32)
+    target_std_full = np.asarray(base["target_std"], dtype=np.float32)
+
+    # The transfer model covers the (possibly trimmed) union of band indices, in band order.
+    eff_idx = np.concatenate(bands)
+    target_mean = target_mean_full[:, eff_idx]
+    target_std = target_std_full[:, eff_idx]
+    num_channels = target_mean.shape[0]
+
+    axis_meta = _load_axis_metadata(config.get("cache_path"), num_channels)
+    transforms = axis_meta["channel_transforms"] or [""] * num_channels
+    log10_mask = [t == "log10" for t in transforms]
+    freq_full = axis_meta["frequency_hz"]
+    freq_eff = [float(freq_full[int(i)]) for i in eff_idx] if freq_full else []
+
+    submodels: list[nn.Module] = []
+    for band, state in zip(bands, states, strict=True):
+        sub = build_model(model_type, num_frequencies=int(len(band)), **model_kwargs)
+        sub.load_state_dict(state)
+        sub.eval()
+        submodels.append(sub)
+
+    wrapper = _TransferExportWrapper(
+        submodels, input_mean, input_std, target_mean, target_std, log10_mask, bake_normalization
+    ).eval()
+
+    out_path = Path(out_path) if out_path else (transfer_run_dir / "transfer_model.onnx")
+    example = torch.zeros(1, len(active_names), dtype=torch.float32)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.onnx.export(
+        wrapper,
+        (example,),
+        str(out_path),
+        input_names=["input_features"],
+        output_names=["prediction"],
+        dynamic_axes={"input_features": {0: "batch"}, "prediction": {0: "batch"}},
+        opset_version=opset,
+        do_constant_folding=True,
+    )
+
+    sidecar = {
+        "model_type": f"{model_type} (self-transfer, {len(bands)} bands)",
+        "input_feature_names": active_names,
+        "channel_names": channel_names,
+        "channel_units": axis_meta["channel_units"],
+        "channel_transforms": transforms,
+        "num_channels": int(num_channels),
+        "num_frequencies": int(len(eff_idx)),
+        "frequency_hz": freq_eff,
+        "sweep_label": axis_meta["sweep_label"],
+        "normalization_baked_in": bool(bake_normalization),
+        "input_mean": input_mean.tolist(),
+        "input_std": input_std.tolist(),
+        "target_mean": target_mean.tolist(),
+        "target_std": target_std.tolist(),
+        "transfer_bands": [[int(i) for i in band] for band in bands],
+        "baseline_checkpoint": str(baseline_checkpoint),
+        "output_layout": "row-major (channel, frequency); reshape to [num_frequencies, num_channels].' in MATLAB",
+    }
+    out_path.with_suffix(".meta.json").write_text(json.dumps(sidecar, indent=2))
+
+    if check:
+        _verify(wrapper, str(out_path), len(active_names))
+
+    return out_path
+
+
 def _verify(wrapper: nn.Module, onnx_path: str, input_dim: int, num_samples: int = 8) -> None:
     """Compare ONNX runtime output against the torch wrapper on random inputs."""
     try:
@@ -224,8 +398,20 @@ def _verify(wrapper: nn.Module, onnx_path: str, input_dim: int, num_samples: int
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("checkpoint", help="Path to best_model.pt")
+    parser.add_argument(
+        "checkpoint",
+        help="Path to best_model.pt (baseline), or a self-transfer run directory with --transfer.",
+    )
     parser.add_argument("-o", "--out", help="Output .onnx path (default: alongside the checkpoint)")
+    parser.add_argument(
+        "--transfer",
+        action="store_true",
+        help="Treat the path as a self-transfer run dir and stitch its per-band submodels into one ONNX.",
+    )
+    parser.add_argument(
+        "--baseline-checkpoint",
+        help="(transfer only) baseline best_model.pt supplying normalization; default: resolved from summary.json.",
+    )
     parser.add_argument(
         "--no-norm",
         action="store_true",
@@ -235,13 +421,23 @@ def main() -> None:
     parser.add_argument("--check", action="store_true", help="Verify ONNX output matches torch (needs onnxruntime)")
     args = parser.parse_args()
 
-    out = export_checkpoint_to_onnx(
-        args.checkpoint,
-        args.out,
-        bake_normalization=not args.no_norm,
-        opset=args.opset,
-        check=args.check,
-    )
+    if args.transfer:
+        out = export_transfer_to_onnx(
+            args.checkpoint,
+            args.out,
+            baseline_checkpoint=args.baseline_checkpoint,
+            bake_normalization=not args.no_norm,
+            opset=args.opset,
+            check=args.check,
+        )
+    else:
+        out = export_checkpoint_to_onnx(
+            args.checkpoint,
+            args.out,
+            bake_normalization=not args.no_norm,
+            opset=args.opset,
+            check=args.check,
+        )
     print(f"Wrote {out}")
     print(f"Wrote {out.with_suffix('.meta.json')}")
 
