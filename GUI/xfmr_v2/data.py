@@ -26,7 +26,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from .dataset_schema import DatasetSchema, Ground_TruthSchema, InputFeatureSchema, parse_dataset_readme
+from .dataset_schema import DatasetSchema, Ground_TruthSchema, InputFeatureSchema
 
 # Default paths for the current XFMR dataset layout on disk.
 DATA_ROOT = Path(r"C:\Users\tc57\Box\Rice_AIDRFIC\XFMR\XFMR_1to1\XFMR_2503_1x1_SameXY")
@@ -347,6 +347,49 @@ def build_cache_from_loader(
          f"Loaded {features.shape[0]} samples, {targets.shape[1]} channels, "
          f"{targets.shape[2]} sweep points.")
 
+    summary = _save_cache(
+        cache_path,
+        dataset_root=dataset_root,
+        dataset_name=dataset_name,
+        features=features,
+        targets=targets,
+        frequency_hz=frequency_hz,
+        feature_names=feature_names,
+        channel_names=channel_names_list,
+        target_names=target_names,
+        channel_units=channel_unit_list,
+        channel_transforms=channel_transform_list,
+        sweep_label=sweep_label,
+    )
+    emit("cache_saved", f"Cache saved: {features.shape[0]} samples.", cache_path=summary["cache_path"])
+    return summary
+
+
+def _save_cache(
+    cache_path: str | Path,
+    *,
+    dataset_root: str | Path,
+    dataset_name: str,
+    features: np.ndarray,
+    targets: np.ndarray,
+    frequency_hz: np.ndarray,
+    feature_names: list[str],
+    channel_names: list[str],
+    target_names: list[str],
+    channel_units: list[str],
+    channel_transforms: list[str],
+    sweep_label: str,
+    ground_truth_data_dir: str | Path | None = None,
+    input_feature_path: str = "",
+    readme_path: str = "",
+    dataset_schema: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Write standardized arrays to a ``.npz`` cache plus a ``.json`` metadata sidecar.
+
+    Shared by both cache builders (loader-code and schema-driven) so every cache has
+    the exact same on-disk layout that ``load_existing_cache`` / ``load_split_bundle``
+    expect.
+    """
     cache_path = Path(cache_path)
     meta_path = cache_path.with_suffix(".json")
     cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -357,10 +400,10 @@ def build_cache_from_loader(
         targets=targets,
         frequency_hz=frequency_hz,
         input_feature_names=np.asarray(feature_names),
-        channel_names=np.asarray(channel_names_list),
+        channel_names=np.asarray(channel_names),
         target_names=np.asarray(target_names),
-        channel_units=np.asarray(channel_unit_list),
-        channel_transforms=np.asarray(channel_transform_list),
+        channel_units=np.asarray(channel_units),
+        channel_transforms=np.asarray(channel_transforms),
         sweep_label=np.asarray(sweep_label),
     )
 
@@ -369,14 +412,17 @@ def build_cache_from_loader(
         "cache_path": str(cache_path.resolve()),
         "dataset_root": str(Path(dataset_root).resolve()),
         "dataset_name": dataset_name,
-        "input_feature_path": "",
-        "ground_truth_data_dir": str(Path(dataset_root).resolve()),
-        "readme_path": "",
-        "dataset_schema": {
-            "input_feature": {"columns": feature_names, "feature_columns": feature_names},
+        "input_feature_path": input_feature_path,
+        "ground_truth_data_dir": (
+            str(Path(ground_truth_data_dir).resolve()) if ground_truth_data_dir else str(Path(dataset_root).resolve())
+        ),
+        "readme_path": readme_path,
+        "dataset_schema": dataset_schema
+        or {
+            "input_feature": {"columns": list(feature_names), "feature_columns": list(feature_names)},
             "ground_truth": {
                 "source": "loader",
-                "ground_truth_parameters": target_names,
+                "ground_truth_parameters": list(target_names),
                 "ground_truth_parts": ["raw"],
             },
         },
@@ -386,8 +432,232 @@ def build_cache_from_loader(
         "num_frequencies": int(targets.shape[2]),
     }
     meta_path.write_text(json.dumps(summary, indent=2))
-    emit("cache_saved", f"Cache saved: {features.shape[0]} samples.", cache_path=str(cache_path.resolve()))
     return summary
+
+
+def build_cache_from_dataset(
+    dataset_root: str | Path,
+    cache_path: str | Path,
+    max_samples: int | None = None,
+    progress_callback=None,
+    should_stop=None,
+) -> dict[str, Any]:
+    """Build a cache directly from a dataset folder by auto-detecting its format.
+
+    No schema or README is required. Supported layouts:
+
+    - SPData/Touchstone: ``log.txt`` + a folder of ``.sNp`` files.
+    - Cadence CSV: one or more Cadence-export ``.csv`` files (one per channel).
+
+    See ``_build_auto`` for the detection rules and defaults.
+    """
+    def emit(event: str, message: str, **payload: Any) -> None:
+        if progress_callback is not None:
+            progress_callback({"phase": "scan", "event": event, "message": message, **payload})
+
+    summary = _build_auto(Path(dataset_root), cache_path, max_samples, emit)
+    emit("cache_saved", f"Cache saved: {summary['num_samples']} samples.", cache_path=summary["cache_path"])
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# Folder format auto-detection
+# ---------------------------------------------------------------------------
+def _find_sp_dir(root: Path) -> Path | None:
+    """Find a directory holding per-sample Touchstone (.sNp) files."""
+    def has_touchstone(directory: Path) -> bool:
+        return any(re.fullmatch(r"\.s\d+p", p.suffix.lower()) for p in directory.iterdir())
+
+    for candidate in ("SPData", "SPDATA", "spdata", "sp_data"):
+        d = root / candidate
+        if d.is_dir() and has_touchstone(d):
+            return d
+    for child in sorted(root.iterdir()):
+        if child.is_dir() and has_touchstone(child):
+            return child
+    return None
+
+
+def _build_auto(root: Path, cache_path: str | Path, max_samples: int | None, emit) -> dict[str, Any]:
+    """Detect a supported dataset layout from folder contents and build the cache."""
+    # 1. SPData / Touchstone: log.txt + a directory of .sNp files.
+    log_txt = next((root / n for n in ("log.txt", "log.TXT") if (root / n).is_file()), None)
+    sp_dir = _find_sp_dir(root)
+    if log_txt is not None and sp_dir is not None:
+        result = _build_touchstone_auto(root, log_txt, sp_dir, max_samples, emit)
+        return _save_cache(cache_path, dataset_root=root, readme_path="", **result)
+
+    # 2. Cadence CSV: one or more Cadence-export .csv files.
+    csv_files = [p for p in sorted(root.glob("*.csv")) if not p.name.startswith(".~")]
+    if csv_files:
+        result = _build_cadence_auto(root, csv_files, max_samples, emit)
+        return _save_cache(cache_path, dataset_root=root, readme_path="", **result)
+
+    raise FileNotFoundError(
+        f"Could not auto-detect a supported dataset format in {root}. Expected SPData/Touchstone "
+        "(log.txt + a folder of .sNp files) or Cadence CSV (*.csv), or a README with a json schema block."
+    )
+
+
+def _read_logtxt_columns(log_txt: Path) -> list[str]:
+    """Recover input-feature column names from a log.txt header comment.
+
+    The first non-empty line is expected to be a ``# [col, col, ...]`` comment. When
+    absent, generic names ``x0..xN`` are derived from the first data row's width.
+    """
+    header = None
+    first_row = None
+    with log_txt.open(encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("#") and header is None:
+                header = line.lstrip("#").strip()
+                continue
+            first_row = line
+            break
+    if header:
+        names = [c.strip().strip("'\"") for c in header.strip("[]").split(",") if c.strip()]
+        if names:
+            return names
+    width = len(ast.literal_eval(first_row)) if first_row else 0
+    return [f"x{i}" for i in range(width)]
+
+
+def _build_touchstone_auto(
+    root: Path, log_txt: Path, sp_dir: Path, max_samples: int | None, emit
+) -> dict[str, Any]:
+    """Auto-detect a per-sample Touchstone dataset (log.txt + .sNp files)."""
+    columns = _read_logtxt_columns(log_txt)
+    sample_id = "index" if "index" in columns else columns[-1]
+    id_like = {"index", "tid", "id", "batch", "sample_id", sample_id}
+    feature_columns = [c for c in columns if c not in id_like]
+
+    ext = next(
+        (f.suffix.lower() for f in sorted(sp_dir.iterdir()) if re.fullmatch(r"\.s\d+p", f.suffix.lower())),
+        ".s2p",
+    )
+    nports = int(re.fullmatch(r"\.s(\d+)p", ext).group(1))
+    # Upper-triangular unique S-parameters (S is symmetric for reciprocal networks).
+    sparams = [f"S{i}{j}" for i in range(1, nports + 1) for j in range(i, nports + 1)]
+
+    schema = DatasetSchema(
+        dataset_name=root.name,
+        input_feature=InputFeatureSchema(
+            columns=tuple(columns),
+            feature_columns=tuple(feature_columns),
+            sample_id_column=sample_id,
+            source="file",
+            file_path=str(log_txt.relative_to(root)),
+        ),
+        ground_truth=Ground_TruthSchema(
+            source="per_sample",
+            file_extension=ext,
+            ground_truth_parameters=tuple(sparams),
+            ground_truth_parts=("re", "im"),
+            drop_first_frequency=True,
+            data_dir=str(sp_dir.relative_to(root)),
+        ),
+    )
+    emit(
+        "auto_detected",
+        f"Auto-detected Touchstone dataset: {len(feature_columns)} features (id='{sample_id}'), "
+        f"{nports}-port, {len(sparams)} S-params x (re, im); first frequency point dropped.",
+    )
+    sources = resolve_data_sources_from_schema(root, schema)
+    features, targets, frequency_hz = _build_per_sample_arrays(sources, schema, max_samples, emit)
+    channel_names = list(schema.ground_truth.channel_names)
+    return {
+        "dataset_name": root.name,
+        "features": features,
+        "targets": targets,
+        "frequency_hz": frequency_hz,
+        "feature_names": list(feature_columns),
+        "channel_names": channel_names,
+        "target_names": list(channel_names),
+        "channel_units": [""] * len(channel_names),
+        "channel_transforms": [""] * len(channel_names),
+        "sweep_label": "Frequency (GHz)",
+        "ground_truth_data_dir": sources.ground_truth_data_dir,
+        "input_feature_path": str(sources.input_feature_path.resolve()) if sources.input_feature_path else "",
+    }
+
+
+# CTLE Cadence-CSV conventions (match the CTLE training notebooks).
+_CTLE_PARAM_KEYS = {
+    "CS": ("CS_fF", 1e15), "LD": ("LD_pH", 1e12), "M": ("M", 1.0),
+    "RD": ("RD", 1.0), "RS": ("RS", 1.0), "MN": ("MN", 1.0),
+}
+_CTLE_FEATURES = ["CS_fF", "LD_pH", "M", "RD", "RS", "MN"]
+_CTLE_UNITS = {
+    "gain": "dB", "hb_gain": "dB", "phase": "deg",
+    "noise": "V/sqrt(Hz)", "noise_spectrum": "V/sqrt(Hz)", "integrated_noise": "V",
+}
+
+
+def _build_cadence_auto(root: Path, csv_files: list[Path], max_samples: int | None, emit) -> dict[str, Any]:
+    """Auto-detect Cadence-CSV channels and combine those that share a sweep axis.
+
+    Channels with different axes (AC gain vs VCM-swept HB gain vs scalar noise) cannot
+    share one cache, so the largest group with a common axis is loaded and the rest are
+    reported as excluded. Mirrors the CTLE notebooks (gain + phase trained together).
+    """
+    parsed: dict[str, tuple[list[dict[str, float]], np.ndarray, np.ndarray]] = {}
+    for csv_path in csv_files:
+        try:
+            params, freq_ghz, values = _parse_cadence_csv(csv_path, _CTLE_PARAM_KEYS, max_samples)
+        except Exception as exc:  # noqa: BLE001 - non-Cadence / odd-format CSVs are skipped
+            emit("auto_skip", f"Skipping {csv_path.name}: not a standard Cadence CSV ({exc}).")
+            continue
+        name = re.sub(r"(?i)^ctle[_-]", "", csv_path.stem)
+        parsed[name] = (params, freq_ghz, values)
+
+    if not parsed:
+        raise ValueError("No Cadence-CSV channels could be parsed in this folder.")
+
+    groups: dict[tuple, list[str]] = {}
+    for name, (_, freq_ghz, _) in parsed.items():
+        axis_key = (len(freq_ghz), round(float(freq_ghz[0]), 9), round(float(freq_ghz[-1]), 9))
+        groups.setdefault(axis_key, []).append(name)
+    channels = sorted(max(groups.values(), key=lambda names: (len(names), len(parsed[names[0]][1]))))
+    excluded = sorted(set(parsed) - set(channels))
+    if excluded:
+        emit("auto_note", f"Loading channels {channels} (shared sweep axis); excluded {excluded} (different axes).")
+
+    params0, freq_ghz, _ = parsed[channels[0]]
+    num_samples, num_freq = len(params0), len(freq_ghz)
+
+    def _key(params: dict[str, float]) -> tuple:
+        return tuple(round(float(params[c]), 6) for c in _CTLE_FEATURES)
+
+    features = np.zeros((num_samples, len(_CTLE_FEATURES)), dtype=np.float32)
+    for i, params in enumerate(params0):
+        features[i] = [params[c] for c in _CTLE_FEATURES]
+
+    targets = np.zeros((num_samples, len(channels), num_freq), dtype=np.float32)
+    for ch_idx, channel in enumerate(channels):
+        ch_params, _, ch_values = parsed[channel]
+        index = {_key(p): i for i, p in enumerate(ch_params)}
+        for i, params in enumerate(params0):
+            j = index.get(_key(params), i if i < len(ch_values) else 0)
+            targets[i, ch_idx, :] = ch_values[j]
+
+    emit("auto_detected",
+         f"Auto-detected Cadence CSV dataset: {num_samples} samples, channels {channels}, {num_freq} points.")
+    return {
+        "dataset_name": root.name,
+        "features": features,
+        "targets": targets,
+        "frequency_hz": (freq_ghz * 1e9).astype(np.float32),
+        "feature_names": list(_CTLE_FEATURES),
+        "channel_names": channels,
+        "target_names": channels,
+        "channel_units": [_CTLE_UNITS.get(c, "") for c in channels],
+        "channel_transforms": [""] * len(channels),
+        "sweep_label": "Frequency (GHz)",
+        "ground_truth_data_dir": root,
+    }
 
 
 def ensure_cache(
@@ -410,68 +680,6 @@ def ensure_cache(
     return p
 
 
-# Source and schema resolution helpers.
-def resolve_data_sources(
-    data_root: str | Path | None = DATA_ROOT,
-    input_feature_path: str | Path | None = None,
-    ground_truth_data_dir: str | Path | None = None,
-) -> DataSources:
-    """Resolve the effective input-feature table and ground-truth-data directory."""
-    input_feature_file = Path(input_feature_path) if input_feature_path not in (None, "") else None
-    ground_truth_dir = Path(ground_truth_data_dir) if ground_truth_data_dir not in (None, "") else None
-
-    # The loader supports two ways of specifying the dataset:
-    # - one `data_root`, which implies the conventional file layout
-    # - explicit input/output paths
-    explicit_input_feature_and_ground_truth = input_feature_file is not None and ground_truth_dir is not None
-    root = (
-        None if explicit_input_feature_and_ground_truth else Path(data_root) if data_root not in (None, "") else None
-    )
-
-    # These default names still reflect the current dataset layout on disk.
-    if input_feature_file is None and root is not None:
-        candidate = root / "log.txt"
-        # For cadence_csv datasets there is no log.txt; input_feature_path stays None
-        # and the build_cache path will extract parameters from the CSV files instead.
-        if candidate.exists():
-            input_feature_file = candidate
-    elif input_feature_file is not None and input_feature_file.is_dir():
-        input_feature_file = input_feature_file / "log.txt"
-
-    if ground_truth_dir is None and root is not None:
-        sp_candidate = root / "SPData"
-        # For cadence_csv datasets the CSV files live directly in the data root.
-        ground_truth_dir = sp_candidate if sp_candidate.is_dir() else root
-
-    if ground_truth_dir is None:
-        raise ValueError("Provide data_root or ground_truth_data_dir.")
-    # Validate input_feature_file only when it was explicitly requested or when
-    # the default log.txt actually existed.
-    if input_feature_file is not None:
-        if not input_feature_file.exists():
-            raise FileNotFoundError(f"Input-feature description file not found: {input_feature_file}")
-        if not input_feature_file.is_file():
-            raise ValueError(f"Input-feature description path must be a file: {input_feature_file}")
-    if not ground_truth_dir.exists():
-        raise FileNotFoundError(f"Ground-truth data directory not found: {ground_truth_dir}")
-    if not ground_truth_dir.is_dir():
-        raise ValueError(f"Ground-truth data path must be a directory: {ground_truth_dir}")
-
-    # When explicit paths are used, recover the shared dataset root from the common
-    # parent so schema discovery and cache metadata still have a stable anchor point.
-    if root is not None:
-        dataset_root = root
-    elif input_feature_file is not None:
-        dataset_root = Path(
-            os.path.commonpath([str(input_feature_file.parent), str(ground_truth_dir.parent)])
-        )
-    else:
-        dataset_root = ground_truth_dir
-    return DataSources(
-        dataset_root=dataset_root,
-        input_feature_path=input_feature_file,
-        ground_truth_data_dir=ground_truth_dir,
-    )
 
 
 def resolve_data_sources_from_schema(
@@ -518,41 +726,10 @@ def resolve_data_sources_from_schema(
     )
 
 
-def _try_load_schema_from_root(dataset_root: Path) -> "DatasetSchema | None":
-    """Try to find and parse a README schema directly from the dataset root."""
-    for filename in ("README.md", "README.txt"):
-        candidate = dataset_root / filename
-        if candidate.is_file():
-            try:
-                return parse_dataset_readme(candidate)
-            except Exception:
-                return None
-    return None
 
 
-def _load_dataset_schema_from_sources(sources: DataSources) -> "DatasetSchema | None":
-    # The README can live at the dataset root or beside the input-feature/ground-truth data.
-    readme_path = _find_dataset_readme_path(sources)
-    if readme_path is None:
-        return None
-    return parse_dataset_readme(readme_path)
 
 
-def _find_dataset_readme_path(sources: DataSources) -> Path | None:
-    # Prefer a README at the dataset root, but also allow one beside the data folders
-    # when the root was inferred from explicit paths.
-    readme_dirs = [sources.dataset_root]
-    if sources.input_feature_path is not None:
-        common_parent = sources.input_feature_path.parent
-        if common_parent == sources.ground_truth_data_dir.parent and common_parent != sources.dataset_root:
-            readme_dirs.append(common_parent)
-
-    for directory in readme_dirs:
-        for filename in ("README.md", "README.txt"):
-            candidate = directory / filename
-            if candidate.is_file():
-                return candidate
-    return None
 
 
 # Cache loading and split preparation.
@@ -651,15 +828,6 @@ def load_split_bundle(
     )
 
 
-def _apply_channel_transforms(targets: np.ndarray, transforms: list[str]) -> np.ndarray:
-    """Apply per-channel transforms (e.g. log10) to the target array in-place."""
-    for ch_idx, transform in enumerate(transforms):
-        if transform == "log10":
-            # Clamp to a small positive floor to avoid log(0).
-            targets[:, ch_idx, :] = np.log10(np.maximum(targets[:, ch_idx, :], 1e-30))
-        elif transform and transform != "":
-            raise ValueError(f"Unsupported channel transform: {transform!r}")
-    return targets
 
 
 def _inverse_channel_transforms(values: np.ndarray, transforms: list[str]) -> np.ndarray:
@@ -697,17 +865,6 @@ def normalize_frequency(frequency_ghz: np.ndarray) -> np.ndarray:
     return (2.0 * (frequency_ghz - lo) / (hi - lo) - 1.0).astype(np.float32)
 
 
-# Cache metadata and raw input-feature parsing.
-def _cache_source_metadata(sources: DataSources, schema: DatasetSchema) -> dict[str, Any]:
-    return {
-        "dataset_root": str(sources.dataset_root.resolve()),
-        "input_feature_path": str(sources.input_feature_path.resolve()) if sources.input_feature_path else None,
-        "ground_truth_data_dir": str(sources.ground_truth_data_dir.resolve()),
-        "readme_path": str(schema.readme_path) if schema.readme_path is not None else None,
-        "dataset_name": schema.dataset_name,
-        "schema_hash": schema.schema_hash,
-        "dataset_schema": schema.to_metadata(),
-    }
 
 
 def _make_loader(
@@ -849,174 +1006,8 @@ def _build_per_sample_arrays(
     return features, targets, frequency_hz
 
 
-def _build_cadence_csv_arrays(
-    sources: DataSources,
-    schema: DatasetSchema,
-    max_samples: int | None,
-    emit,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Parse Cadence Ocean CSV exports and build features/targets arrays.
-
-    Each CSV file contains all samples as sequential parameter blocks.  Input
-    features are extracted from the parameter headers inside the blocks and
-    converted using the ``parameter_keys`` mapping defined in the schema.
-    """
-    channel_file_map = schema.ground_truth.channel_file_map
-    channel_order = list(schema.ground_truth.ground_truth_parameters)
-    param_key_map = schema.input_feature.parameter_key_map
-    feature_columns = list(schema.input_feature.feature_columns)
-    # Auto-generate param_key_map from feature_columns if not explicitly provided.
-    if not param_key_map and feature_columns:
-        param_key_map = {col: (col, 1.0) for col in feature_columns}
-    data_dir = sources.ground_truth_data_dir
-
-    # Parse the first channel file to discover the shared frequency grid and input features.
-    first_channel = channel_order[0]
-    first_path = data_dir / channel_file_map[first_channel]
-    emit(
-        "cache_build_started",
-        f"Parsing Cadence CSV files for {schema.dataset_name}.",
-    )
-    params_list, freq_ghz, first_values = _parse_cadence_csv(
-        first_path, param_key_map, max_samples,
-    )
-    emit(
-        "input_rows_loaded",
-        f"Loaded {len(params_list)} samples from {first_path.name}.",
-        total_samples=len(params_list),
-    )
-    frequency_hz = (freq_ghz * 1e9).astype(np.float32)
-    num_samples = len(params_list)
-    num_freq = len(frequency_hz)
-
-    # Build the features array from extracted parameters.
-    features = np.zeros((num_samples, len(feature_columns)), dtype=np.float32)
-    for idx, params in enumerate(params_list):
-        features[idx] = [params[col] for col in feature_columns]
-
-    # Build the targets array, one channel per CSV file.
-    targets = np.zeros((num_samples, len(channel_order), num_freq), dtype=np.float32)
-    targets[0 : len(first_values)] = first_values[:, np.newaxis, :]
-    # Treat the first channel as already loaded at index 0.
-    # (targets[:, 0, :] is set; we used np.newaxis above for the single-channel shape.)
-    targets[:, 0, :] = first_values
-
-    for ch_idx, channel in enumerate(channel_order):
-        if ch_idx == 0:
-            continue  # Already loaded above.
-        ch_path = data_dir / channel_file_map[channel]
-        _, ch_freq_ghz, ch_values = _parse_cadence_csv(ch_path, param_key_map, max_samples)
-        if not np.allclose(freq_ghz, ch_freq_ghz, rtol=1e-4):
-            raise ValueError(f"Frequency grid in {ch_path.name} does not match {first_path.name}.")
-        if len(ch_values) != num_samples:
-            raise ValueError(
-                f"Sample count mismatch: {first_path.name} has {num_samples} samples "
-                f"but {ch_path.name} has {len(ch_values)}."
-            )
-        targets[:, ch_idx, :] = ch_values
-        emit(
-            "cache_progress",
-            f"Loaded channel '{channel}' from {ch_path.name}.",
-            completed_samples=num_samples,
-            total_samples=num_samples,
-        )
-
-    if schema.ground_truth.drop_first_frequency and num_freq > 1:
-        frequency_hz = frequency_hz[1:]
-        targets = targets[:, :, 1:]
-
-    return features, targets, frequency_hz
 
 
-def _build_inline_arrays(
-    sources: DataSources,
-    schema: DatasetSchema,
-    max_samples: int | None,
-    emit,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Load a single flat CSV where each sample spans multiple rows (one per frequency).
-
-    Samples are identified by grouping consecutive rows that share the same
-    values in the feature columns.  Each group must have the same number of
-    rows (frequency points).
-    """
-    import csv as csv_module
-
-    assert sources.input_feature_path is not None
-    input_feature_schema = schema.input_feature
-    ground_truth_schema = schema.ground_truth
-
-    feature_col_names = list(input_feature_schema.feature_columns)
-
-    emit("input_loading", f"Loading flat CSV from {sources.input_feature_path.name}.")
-    with sources.input_feature_path.open(encoding="utf-8") as fh:
-        reader = csv_module.DictReader(fh)
-        all_rows = list(reader)
-    emit("input_rows_loaded", f"Read {len(all_rows)} rows from {sources.input_feature_path.name}.",
-         total_samples=len(all_rows))
-
-    # Resolve GT column names using auto-detection from CSV headers.
-    csv_columns = set(all_rows[0].keys()) if all_rows else set()
-    gt_col_names = _resolve_gt_column_names(ground_truth_schema, csv_columns)
-
-    # Resolve frequency column.
-    freq_col = _resolve_frequency_column(ground_truth_schema.frequency_column, csv_columns)
-
-    # Group rows into samples by feature columns.
-    # Consecutive rows with the same feature values form one sample.
-    samples: list[list[dict[str, str]]] = []
-    current_key: tuple[str, ...] | None = None
-    current_group: list[dict[str, str]] = []
-
-    for row in all_rows:
-        key = tuple(row[col] for col in feature_col_names)
-        if key != current_key:
-            if current_group:
-                samples.append(current_group)
-            current_group = [row]
-            current_key = key
-        else:
-            current_group.append(row)
-    if current_group:
-        samples.append(current_group)
-
-    if max_samples is not None:
-        samples = samples[:max_samples]
-    total_samples = len(samples)
-    num_channels = len(gt_col_names)
-
-    emit("cache_build_started", f"Building cache from {total_samples} samples ({len(samples[0])} freq points each).",
-         total_samples=total_samples)
-
-    # Use first sample to determine frequency count.
-    num_freq = len(samples[0])
-    frequency_hz = np.array([float(r[freq_col]) for r in samples[0]], dtype=np.float32)
-    # Convert GHz to Hz if the column name suggests GHz.
-    if "ghz" in freq_col.lower():
-        frequency_hz = frequency_hz * 1e9
-
-    features = np.zeros((total_samples, len(feature_col_names)), dtype=np.float32)
-    targets = np.zeros((total_samples, num_channels, num_freq), dtype=np.float32)
-    progress_interval = max(1, total_samples // 25)
-
-    for idx, group in enumerate(samples):
-        # Extract features from the first row of the group (constant across freq).
-        for j, col in enumerate(feature_col_names):
-            features[idx, j] = float(group[0][col])
-        # Extract GT values across all frequency rows.
-        for fi, row in enumerate(group):
-            for ci, col in enumerate(gt_col_names):
-                targets[idx, ci, fi] = float(row[col])
-
-        if (idx + 1) == 1 or (idx + 1) == total_samples or (idx + 1) % progress_interval == 0:
-            emit("cache_progress", f"Processed sample {idx + 1}/{total_samples}.",
-                 completed_samples=idx + 1, total_samples=total_samples)
-
-    if ground_truth_schema.drop_first_frequency and len(frequency_hz) > 1:
-        frequency_hz = frequency_hz[1:]
-        targets = targets[:, :, 1:]
-
-    return features, targets, frequency_hz
 
 
 def _part_to_csv_suffix(part: str) -> str:
@@ -1264,22 +1255,6 @@ def _load_input_feature_rows(
     return rows
 
 
-def _cache_matches_sources(meta: dict[str, Any], sources: DataSources, schema: DatasetSchema) -> bool:
-    # Reuse a cache only when both the raw data location and the schema hash match.
-    cached_input = meta.get("input_feature_path")
-    ground_truth_data_dir = meta.get("ground_truth_data_dir")
-    schema_hash = meta.get("schema_hash")
-    if ground_truth_data_dir is None or schema_hash is None:
-        return False
-    if Path(ground_truth_data_dir).resolve() != sources.ground_truth_data_dir.resolve():
-        return False
-    # For file-based sources, also check the input-feature path matches.
-    if sources.input_feature_path is not None:
-        if cached_input is None:
-            return False
-        if Path(cached_input).resolve() != sources.input_feature_path.resolve():
-            return False
-    return schema_hash == schema.schema_hash
 
 
 # Ground-truth parsing entry point.
@@ -1458,101 +1433,3 @@ def _complex_to_part(values: np.ndarray, part: str) -> np.ndarray:
     raise ValueError(f"Unsupported ground-truth part: {part}")
 
 
-def _build_numpy_array(
-    sources: DataSources,
-    schema: DatasetSchema,
-    max_samples: int | None,
-    emit,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Build cache arrays from a pre-packed numpy/pickle ground-truth array.
-
-    Expects:
-    - Input features in a tabular CSV (schema.input_feature.file_path).
-    - Ground-truth data in a pickle file containing a numpy array with shape
-      (num_samples, num_frequencies, num_channels).  The file path is stored
-      in ``schema.ground_truth.data_dir`` (reusing the field for the pkl path).
-    """
-    import csv
-    import pickle
-
-    # --- Load input features from CSV ---
-    input_path = sources.input_feature_path
-    if input_path is None:
-        raise FileNotFoundError("numpy_array format requires an input-feature CSV file (set file_path in schema).")
-
-    emit("input_loading", f"Loading input features from {input_path.name}.")
-    with input_path.open(encoding="utf-8") as fh:
-        reader = csv.DictReader(fh)
-        rows = list(reader)
-
-    if max_samples is not None:
-        rows = rows[:max_samples]
-
-    emit("input_rows_loaded", f"Loaded {len(rows)} input rows from {input_path.name}.",
-         total_samples=len(rows))
-
-    # Build feature array.
-    feature_cols = list(schema.input_feature.feature_columns)
-    features = np.zeros((len(rows), len(feature_cols)), dtype=np.float32)
-    for i, row in enumerate(rows):
-        for j, col in enumerate(feature_cols):
-            features[i, j] = float(row[col])
-
-    # --- Load ground-truth array from pickle ---
-    # data_dir is reused to hold the pkl file path for numpy_array format.
-    gt_path_str = schema.ground_truth.data_dir
-    if gt_path_str:
-        gt_path = sources.dataset_root / gt_path_str
-    else:
-        raise FileNotFoundError("numpy_array format requires data_dir to point to the pickle file path.")
-
-    emit("cache_build_started", f"Loading ground-truth array from {gt_path.name}.",
-         total_samples=len(rows))
-
-    with gt_path.open("rb") as fh:
-        gt_data = pickle.load(fh)
-
-    if not isinstance(gt_data, np.ndarray):
-        raise TypeError(f"Expected numpy array in {gt_path.name}, got {type(gt_data).__name__}")
-
-    if max_samples is not None:
-        gt_data = gt_data[:max_samples]
-
-    # Validate shape: (num_samples, num_frequencies, num_channels)
-    if gt_data.ndim != 3:
-        raise ValueError(f"Expected 3D array (samples, frequencies, channels), got shape {gt_data.shape}")
-
-    num_samples, num_freq, num_channels = gt_data.shape
-    expected_channels = len(schema.ground_truth.ground_truth_parameters) * len(schema.ground_truth.ground_truth_parts)
-    if num_channels != expected_channels:
-        raise ValueError(
-            f"Array has {num_channels} channels but schema expects "
-            f"{len(schema.ground_truth.ground_truth_parameters)} params × "
-            f"{len(schema.ground_truth.ground_truth_parts)} parts = {expected_channels} channels."
-        )
-
-    if num_samples != len(rows):
-        raise ValueError(
-            f"Feature CSV has {len(rows)} rows but ground-truth array has {num_samples} samples."
-        )
-
-    # Drop first frequency if requested.
-    if schema.ground_truth.drop_first_frequency and num_freq > 1:
-        gt_data = gt_data[:, 1:, :]
-        num_freq = gt_data.shape[1]
-
-    # Targets shape: (num_samples, num_channels, num_frequencies) — transpose last two dims.
-    targets = gt_data.transpose(0, 2, 1).astype(np.float32)
-
-    # Frequency array from schema fields, or placeholder if not specified.
-    freq_start = schema.ground_truth.frequency_start_hz
-    freq_stop = schema.ground_truth.frequency_stop_hz
-    if freq_stop > freq_start:
-        frequency_hz = np.linspace(freq_start, freq_stop, num_freq, dtype=np.float64)
-    else:
-        frequency_hz = np.linspace(0, 1, num_freq, dtype=np.float64)
-
-    emit("cache_progress", f"Loaded ground-truth array: {gt_data.shape}.",
-         current=num_samples, total=num_samples)
-
-    return features, targets, frequency_hz

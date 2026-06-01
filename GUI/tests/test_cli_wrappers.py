@@ -132,8 +132,6 @@ def test_quick_search_cli_passes_arguments_and_prints_compact_summary(
             "3",
             "--epochs-per-trial",
             "8",
-            "--patience-per-trial",
-            "4",
             "--objective",
             "best_accuracy",
             "--variance-threshold",
@@ -171,7 +169,6 @@ def test_quick_search_cli_passes_arguments_and_prints_compact_summary(
     assert seen["config"].search_max_samples == 10
     assert seen["config"].trial_count == 3
     assert seen["config"].epochs_per_trial == 8
-    assert seen["config"].patience_per_trial == 4
     assert seen["config"].objective == "best_accuracy"
     assert seen["config"].variance_threshold == pytest.approx(0.92)
     assert seen["config"].show_trial_progress is True

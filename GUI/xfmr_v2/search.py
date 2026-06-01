@@ -43,7 +43,6 @@ class SearchConfig:
     model_type: str = "FlatMLP"
     trial_count: int = 6
     epochs_per_trial: int = 60
-    patience_per_trial: int | None = None
     objective: str = "balanced"
     variance_threshold: float = 0.95
     show_trial_progress: bool = False
@@ -104,7 +103,6 @@ def quick_hyperparameter_search(
     base_trial_config = TrainConfig(**suggestion["suggested_baseline_config"])
     base_trial_config.model_type = config.model_type
     base_trial_config.epochs = config.epochs_per_trial
-    base_trial_config.patience = _resolve_patience(config.patience_per_trial, config.epochs_per_trial)
     base_trial_config.max_samples = search_sample_cap
 
     # `base_full_config` preserves the same candidate settings but without the short-run
@@ -165,7 +163,6 @@ def quick_hyperparameter_search(
                 config=config,
                 objective=objective,
                 suggestion=suggestion,
-                patience_per_trial=base_trial_config.patience,
                 search_sample_cap=search_sample_cap,
                 trial_results=trial_results,
             )
@@ -214,7 +211,6 @@ def quick_hyperparameter_search(
         config=config,
         objective=objective,
         suggestion=suggestion,
-        patience_per_trial=base_trial_config.patience,
         search_sample_cap=search_sample_cap,
         trial_results=trial_results,
     )
@@ -235,7 +231,6 @@ def _build_search_summary(
     config: SearchConfig,
     objective: str,
     suggestion: dict[str, Any],
-    patience_per_trial: int,
     search_sample_cap: int | None,
     trial_results: list[dict[str, Any]],
 ) -> dict[str, Any]:
@@ -266,7 +261,6 @@ def _build_search_summary(
         "objective_label": _objective_label(objective),
         "score_formula": score_formula,
         "epochs_per_trial": int(config.epochs_per_trial),
-        "patience_per_trial": int(patience_per_trial),
         "search_max_samples": search_sample_cap,
         "trial_count_requested": int(config.trial_count),
         "trial_count_completed": int(len(trial_results)),
@@ -286,7 +280,6 @@ def _build_search_summary(
                 "depth",
                 "batch_size",
                 "learning_rate",
-                "dropout",
                 "weight_decay",
             }
         },
@@ -308,8 +301,6 @@ def _validate_search_config(config: SearchConfig, objective: str) -> None:
         raise ValueError("trial_count must be at least 1.")
     if config.epochs_per_trial <= 0:
         raise ValueError("epochs_per_trial must be at least 1.")
-    if config.patience_per_trial is not None and config.patience_per_trial <= 0:
-        raise ValueError("patience_per_trial must be at least 1 when provided.")
     if not 0.0 < config.train_frac < 1.0:
         raise ValueError("train_frac must be between 0 and 1.")
     if not 0.0 <= config.val_frac < 1.0:
@@ -350,14 +341,6 @@ def _objective_label(objective: str) -> str:
     return "Fastest acceptable"
 
 
-def _resolve_patience(patience: int | None, epochs_per_trial: int) -> int:
-    # Short search runs should still have some room for early stopping, but the
-    # patience must never exceed the total epoch budget.
-    if patience is not None:
-        return min(max(patience, 1), epochs_per_trial)
-    return max(5, min(epochs_per_trial, max(epochs_per_trial // 3, 8)))
-
-
 def _build_candidate_entries(
     base_trial_config: TrainConfig,
     base_full_config: TrainConfig,
@@ -394,14 +377,12 @@ def _build_candidate_entries(
         (
             "lighter_regularization",
             {
-                "dropout": lower("dropout", base_trial_config.dropout),
                 "weight_decay": lower("weight_decay", base_trial_config.weight_decay),
             },
         ),
         (
             "stronger_regularization",
             {
-                "dropout": higher("dropout", base_trial_config.dropout),
                 "weight_decay": higher("weight_decay", base_trial_config.weight_decay),
             },
         ),
@@ -462,7 +443,6 @@ def _config_signature(config: TrainConfig) -> tuple[Any, ...]:
         config.depth,
         config.batch_size,
         float(config.learning_rate),
-        float(config.dropout),
         float(config.weight_decay),
     )
 
@@ -485,7 +465,6 @@ def _fallback_candidate_updates(base_config: TrainConfig, ranges: dict[str, dict
         "width": list(ranges.get("width", {}).get("candidates", [base_config.width])),
         "depth": list(ranges.get("depth", {}).get("candidates", [base_config.depth])),
         "learning_rate": list(ranges.get("learning_rate", {}).get("candidates", [base_config.learning_rate])),
-        "dropout": list(ranges.get("dropout", {}).get("candidates", [base_config.dropout])),
         "batch_size": list(ranges.get("batch_size", {}).get("candidates", [base_config.batch_size])),
         "weight_decay": list(ranges.get("weight_decay", {}).get("candidates", [base_config.weight_decay])),
     }

@@ -32,7 +32,6 @@ def main() -> None:
     parser.add_argument("--search-max-samples", type=int, default=defaults.search_max_samples)
     parser.add_argument("--trial-count", type=int, default=defaults.trial_count)
     parser.add_argument("--epochs-per-trial", type=int, default=defaults.epochs_per_trial)
-    parser.add_argument("--patience-per-trial", type=int, default=defaults.patience_per_trial)
     parser.add_argument(
         "--objective",
         default=defaults.objective,
@@ -64,7 +63,6 @@ def main() -> None:
             search_max_samples=args.search_max_samples,
             trial_count=args.trial_count,
             epochs_per_trial=args.epochs_per_trial,
-            patience_per_trial=args.patience_per_trial,
             objective=args.objective,
             variance_threshold=args.variance_threshold,
             show_trial_progress=args.show_trial_progress,

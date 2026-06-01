@@ -16,7 +16,6 @@ Supported loading strategies (``source``):
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -69,10 +68,6 @@ class InputFeatureSchema:
     def sample_id_index(self) -> int:
         return self.columns.index(self.sample_id_column)
 
-    @property
-    def parameter_key_map(self) -> dict[str, tuple[str, float]]:
-        return {csv_key: (col, scale) for csv_key, col, scale in self.parameter_keys}
-
 
 # ---------------------------------------------------------------------------
 # Ground-truth metadata
@@ -108,18 +103,6 @@ class Ground_TruthSchema:
             return list(self.ground_truth_parameters)
         return [f"{name}_{part}" for name in self.ground_truth_parameters for part in self.ground_truth_parts]
 
-    @property
-    def channel_file_map(self) -> dict[str, str]:
-        return dict(self.channel_files)
-
-    @property
-    def channel_unit_map(self) -> dict[str, str]:
-        return dict(self.channel_units)
-
-    @property
-    def channel_transform_map(self) -> dict[str, str]:
-        return dict(self.channel_transforms)
-
 
 # ---------------------------------------------------------------------------
 # Full dataset metadata
@@ -130,57 +113,6 @@ class DatasetSchema:
     input_feature: InputFeatureSchema
     ground_truth: Ground_TruthSchema
     readme_path: Path | None = None
-
-    @property
-    def schema_hash(self) -> str:
-        payload = json.dumps(self.to_metadata(), sort_keys=True)
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-    def to_metadata(self) -> dict[str, Any]:
-        input_meta: dict[str, Any] = {
-            "columns": list(self.input_feature.columns),
-            "feature_columns": list(self.input_feature.feature_columns),
-            "source": self.input_feature.source,
-        }
-        if self.input_feature.source == "file":
-            input_meta["sample_id_column"] = self.input_feature.sample_id_column
-        if self.input_feature.parameter_keys:
-            input_meta["parameter_keys"] = {
-                csv_key: [col, scale] for csv_key, col, scale in self.input_feature.parameter_keys
-            }
-        if self.input_feature.file_path:
-            input_meta["file_path"] = self.input_feature.file_path
-
-        gt = self.ground_truth
-        gt_meta: dict[str, Any] = {
-            "source": gt.source,
-            "ground_truth_parameters": list(gt.ground_truth_parameters),
-            "ground_truth_parts": list(gt.ground_truth_parts),
-            "drop_first_frequency": gt.drop_first_frequency,
-        }
-        if gt.file_extension:
-            gt_meta["file_extension"] = gt.file_extension
-        if gt.data_dir:
-            gt_meta["data_dir"] = gt.data_dir
-        if gt.frequency_column:
-            gt_meta["frequency_column"] = gt.frequency_column
-        if gt.sweep_label:
-            gt_meta["sweep_label"] = gt.sweep_label
-        if gt.frequency_start_hz or gt.frequency_stop_hz:
-            gt_meta["frequency_start_hz"] = gt.frequency_start_hz
-            gt_meta["frequency_stop_hz"] = gt.frequency_stop_hz
-        if gt.channel_files:
-            gt_meta["channel_files"] = dict(gt.channel_files)
-        if gt.channel_units:
-            gt_meta["channel_units"] = dict(gt.channel_units)
-        if gt.channel_transforms:
-            gt_meta["channel_transforms"] = dict(gt.channel_transforms)
-
-        return {
-            "dataset_name": self.dataset_name,
-            "input_feature": input_meta,
-            "ground_truth": gt_meta,
-        }
 
 
 # ---------------------------------------------------------------------------

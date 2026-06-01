@@ -44,15 +44,16 @@ from PySide6.QtWidgets import (
 
 from .app_paths import current_runtime_paths
 from .gui_backend import (
+    build_and_scan_dataset,
     build_suggest_result,
     check_transfer_compatibility,
     default_run_name,
+    export_model_to_onnx,
     list_available_devices,
     load_last_session,
     make_run_roots,
     run_training_workflow,
     save_last_session,
-    scan_dataset,
 )
 from .gui_theme import APP_THEME, apply_application_theme, configure_plot_widget, plot_color_cycle, status_colors
 from .gui_workers import QtTaskExecutor
@@ -220,6 +221,7 @@ class MlpTrainingStudio(QMainWindow):
         self.last_workflow_summary: dict[str, Any] | None = None
         self.last_baseline_summary: dict[str, Any] | None = None
         self.last_transfer_base_summary: dict[str, Any] | None = None
+        self.last_onnx_export_path: str | None = None
         self.selected_search_full_config: dict[str, Any] | None = None
         self.search_row_configs: list[dict[str, Any]] = []
         self.current_task_name = "idle"
@@ -468,6 +470,9 @@ class MlpTrainingStudio(QMainWindow):
         self.dataset_schema_status_badge = StatusBadge("Not Scanned")
         button_row.addWidget(self.dataset_schema_status_badge)
         button_row.addStretch()
+        self.scan_dataset_button = self._make_button("Scan Dataset")
+        self.scan_dataset_button.clicked.connect(self.scan_dataset)
+        button_row.addWidget(self.scan_dataset_button)
         layout.addLayout(button_row)
 
         layout.addWidget(self.advanced_paths_section)
@@ -599,14 +604,12 @@ class MlpTrainingStudio(QMainWindow):
         self.baseline_model_type_combo_box.addItems(list(MODEL_TYPES))
         self.baseline_model_type_combo_box.setCurrentText("FlatMLP")
         self.baseline_epochs_spin_box = self._make_int_spin(1, 5000, 300)
-        self.baseline_patience_spin_box = self._make_int_spin(1, 1000, 20)
         self.baseline_batch_size_spin_box = self._make_int_spin(1, 4096, 16)
         self.baseline_learning_rate_spin_box = self._make_float_spin(1e-6, 1.0, 1e-4, decimals=6, step=1e-5, scientific=True)
         self.baseline_weight_decay_spin_box = self._make_float_spin(0.0, 1.0, 1e-4, decimals=6, step=1e-5, scientific=True)
         self.baseline_gradient_clip_spin_box = self._make_float_spin(0.0, 100.0, 1.0, decimals=3, step=0.1)
         self.baseline_width_spin_box = self._make_int_spin(16, 8192, 512)
         self.baseline_depth_spin_box = self._make_int_spin(1, 20, 5)
-        self.baseline_dropout_spin_box = self._make_float_spin(0.0, 0.95, 0.05, decimals=3, step=0.01)
         self.baseline_loss_function_combo_box = _NoScrollComboBox()
         self.baseline_loss_function_combo_box.addItems(list(LOSS_FUNCTIONS))
         self.baseline_loss_function_combo_box.setCurrentText("rmse")
@@ -624,14 +627,12 @@ class MlpTrainingStudio(QMainWindow):
         fields = [
             ("Model Type", self.baseline_model_type_combo_box),
             ("Full Training Epochs", self.baseline_epochs_spin_box),
-            ("Early Stopping Patience", self.baseline_patience_spin_box),
             ("Batch Size", self.baseline_batch_size_spin_box),
             ("Learning Rate", self.baseline_learning_rate_spin_box),
             ("Weight Decay", self.baseline_weight_decay_spin_box),
             ("Gradient Clip", self.baseline_gradient_clip_spin_box),
             ("Network Width", self.baseline_width_spin_box),
             ("Network Depth", self.baseline_depth_spin_box),
-            ("Dropout", self.baseline_dropout_spin_box),
             ("Loss Function", self.baseline_loss_function_combo_box),
             ("LR Scheduler", self.baseline_scheduler_combo_box),
             ("Train Fraction", self.baseline_train_fraction_spin_box),
@@ -713,16 +714,19 @@ class MlpTrainingStudio(QMainWindow):
         self.stop_training_button.setEnabled(False)
         self.open_output_folder_button = self._make_button("Open Output Folder", secondary=True)
         self.export_run_summary_button = self._make_button("Export Summary", secondary=True)
+        self.export_onnx_button = self._make_button("Export to ONNX", secondary=True)
         self.start_baseline_button.clicked.connect(self.start_baseline_training)
         self.start_transfer_button.clicked.connect(self.start_transfer_learning)
         self.stop_training_button.clicked.connect(self.stop_current_task)
         self.open_output_folder_button.clicked.connect(self.open_output_folder)
         self.export_run_summary_button.clicked.connect(self.export_run_summary)
+        self.export_onnx_button.clicked.connect(self.export_baseline_to_onnx)
         buttons.addWidget(self.start_baseline_button)
         buttons.addWidget(self.start_transfer_button)
         buttons.addWidget(self.stop_training_button)
         buttons.addWidget(self.open_output_folder_button)
         buttons.addWidget(self.export_run_summary_button)
+        buttons.addWidget(self.export_onnx_button)
         layout.addLayout(buttons)
 
         status_row = QHBoxLayout()
@@ -1064,17 +1068,18 @@ class MlpTrainingStudio(QMainWindow):
                         f"gt_dir={payload.get('ground_truth_data_dir', '')!r}")
         self.last_scan_result = None
         self.dataset_schema_status_badge.set_status("Scanning")
-        pass  # scan progress is shown via metric cards
-        self._fill_table(self.data_preview_table, [("Status", "Scanning dataset and preparing cache...")])
+        self._fill_table(self.data_preview_table, [("Status", "Building cache from the dataset folder and scanning...")])
         self._start_task(
-            scan_dataset,
+            build_and_scan_dataset,
             kwargs={
                 **payload,
                 "train_frac": self.baseline_train_fraction_spin_box.value(),
                 "val_frac": self.baseline_validation_fraction_spin_box.value(),
                 "seed": self.baseline_seed_spin_box.value(),
                 "max_samples": None,
-                "overwrite_mismatched_cache": not self._cache_path_manually_selected,
+                # Auto-managed cache: rebuild from the folder. Manually-selected cache:
+                # reuse it if present (only build when missing).
+                "overwrite": not self._cache_path_manually_selected,
             },
             task_name="scan",
             busy_state="Scanning",
@@ -1232,6 +1237,37 @@ class MlpTrainingStudio(QMainWindow):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
         self.append_log(f"Exported GUI summary to {path}")
+
+    def export_baseline_to_onnx(self) -> None:
+        """Export the most recent baseline checkpoint to ONNX (e.g. for MATLAB)."""
+        run_dir = self._current_baseline_run_dir()
+        if not run_dir:
+            self._show_warning("No baseline run is available yet. Complete a baseline training run first.")
+            return
+        checkpoint_path = Path(run_dir) / "best_model.pt"
+        if not checkpoint_path.exists():
+            self._show_warning(f"No checkpoint was found at {checkpoint_path}.")
+            return
+        default_path = checkpoint_path.with_suffix(".onnx")
+        path, _ = QFileDialog.getSaveFileName(self, "Export to ONNX", str(default_path), "ONNX Files (*.onnx)")
+        if not path:
+            return
+        self.append_log(f"Exporting baseline checkpoint to ONNX: {checkpoint_path}")
+        self._start_task(
+            export_model_to_onnx,
+            kwargs={"checkpoint_path": str(checkpoint_path), "out_path": path},
+            task_name="export",
+            busy_state="Exporting",
+            on_result=self._on_onnx_export_completed,
+        )
+
+    def _on_onnx_export_completed(self, result: dict[str, Any]) -> None:
+        onnx_path = result.get("onnx_path", "")
+        meta_path = result.get("meta_path", "")
+        self.last_onnx_export_path = onnx_path or None
+        self.append_log(f"Exported ONNX model to {onnx_path}")
+        if meta_path:
+            self.append_log(f"Wrote metadata sidecar to {meta_path}")
 
     def run_license_connection_test(self) -> None:
         server_url = normalize_server_url(self.license_server_url_edit.text())
@@ -1391,7 +1427,7 @@ class MlpTrainingStudio(QMainWindow):
         self.current_task_name = "idle"
         self._set_action_controls_enabled(True)
         self.stop_training_button.setEnabled(False)
-        if self.run_state_badge.text() in {"Training", "Transfer", "Searching", "Scanning", "Suggesting", "Checking"}:
+        if self.run_state_badge.text() in {"Training", "Transfer", "Searching", "Scanning", "Suggesting", "Checking", "Exporting"}:
             self.run_state_badge.set_status("Idle")
 
     # ------------------------------------------------------------------
@@ -1848,14 +1884,12 @@ class MlpTrainingStudio(QMainWindow):
         return {
             "model_type": self.baseline_model_type_combo_box.currentText(),
             "epochs": self.baseline_epochs_spin_box.value(),
-            "patience": self.baseline_patience_spin_box.value(),
             "batch_size": self.baseline_batch_size_spin_box.value(),
             "learning_rate": float(self.baseline_learning_rate_spin_box.value()),
             "weight_decay": float(self.baseline_weight_decay_spin_box.value()),
             "gradient_clip": float(self.baseline_gradient_clip_spin_box.value()),
             "width": self.baseline_width_spin_box.value(),
             "depth": self.baseline_depth_spin_box.value(),
-            "dropout": float(self.baseline_dropout_spin_box.value()),
             "loss_function": self.baseline_loss_function_combo_box.currentText(),
             "scheduler": self.baseline_scheduler_combo_box.currentText(),
             "train_frac": float(self.baseline_train_fraction_spin_box.value()),
@@ -1870,14 +1904,12 @@ class MlpTrainingStudio(QMainWindow):
         if model_type in MODEL_TYPES:
             self.baseline_model_type_combo_box.setCurrentText(model_type)
         self.baseline_epochs_spin_box.setValue(int(payload.get("epochs", self.baseline_epochs_spin_box.value())))
-        self.baseline_patience_spin_box.setValue(int(payload.get("patience", self.baseline_patience_spin_box.value())))
         self.baseline_batch_size_spin_box.setValue(int(payload.get("batch_size", self.baseline_batch_size_spin_box.value())))
         self.baseline_learning_rate_spin_box.setValue(float(payload.get("learning_rate", self.baseline_learning_rate_spin_box.value())))
         self.baseline_weight_decay_spin_box.setValue(float(payload.get("weight_decay", self.baseline_weight_decay_spin_box.value())))
         self.baseline_gradient_clip_spin_box.setValue(float(payload.get("gradient_clip", self.baseline_gradient_clip_spin_box.value())))
         self.baseline_width_spin_box.setValue(int(payload.get("width", self.baseline_width_spin_box.value())))
         self.baseline_depth_spin_box.setValue(int(payload.get("depth", self.baseline_depth_spin_box.value())))
-        self.baseline_dropout_spin_box.setValue(float(payload.get("dropout", self.baseline_dropout_spin_box.value())))
         loss_fn = payload.get("loss_function", "rmse")
         if loss_fn in LOSS_FUNCTIONS:
             self.baseline_loss_function_combo_box.setCurrentText(loss_fn)
@@ -1938,7 +1970,6 @@ class MlpTrainingStudio(QMainWindow):
             seed=form["seed"],
             batch_size=form["batch_size"],
             epochs=form["epochs"],
-            patience=form["patience"],
             learning_rate=form["learning_rate"],
             weight_decay=form["weight_decay"],
             gradient_clip=form["gradient_clip"],
@@ -1946,7 +1977,6 @@ class MlpTrainingStudio(QMainWindow):
             val_frac=form["val_frac"],
             width=form["width"],
             depth=form["depth"],
-            dropout=form["dropout"],
             loss_function=form["loss_function"],
             scheduler=form["scheduler"],
             use_amp=form.get("use_amp", True),
@@ -2078,6 +2108,7 @@ class MlpTrainingStudio(QMainWindow):
             self.start_transfer_button,
             self.open_output_folder_button,
             self.export_run_summary_button,
+            self.export_onnx_button,
             self.apply_initial_settings_button,
             self.restore_recommended_baseline_button,
             self.ctle_preset_button,
@@ -2277,7 +2308,7 @@ class MlpTrainingStudio(QMainWindow):
         baseline = result["suggested_baseline_config"]
         baseline_ranges = result["suggested_baseline_ranges"]
         baseline_rationale = result["baseline_rationale"]
-        for name in ["width", "depth", "batch_size", "learning_rate", "dropout", "weight_decay", "epochs", "patience"]:
+        for name in ["model_type", "width", "depth", "batch_size", "learning_rate", "weight_decay", "epochs"]:
             range_info = baseline_ranges.get(name, {})
             rows.append((f"Baseline: {self._prettify_key(name)}", self._stringify(baseline[name]), self._stringify(range_info.get("candidates", [])), baseline_rationale.get(name, "")))
         transfer = result["suggested_transfer_config"]
@@ -2296,7 +2327,6 @@ class MlpTrainingStudio(QMainWindow):
             str(config["depth"]),
             f"{config['learning_rate']:.1e}",
             str(config["batch_size"]),
-            f"{config['dropout']:.3f}",
             f"{trial['best_val_loss']:.6f}",
             f"{trial['average_val_mae']:.6f}",
             self._format_seconds(trial["runtime_seconds"]),

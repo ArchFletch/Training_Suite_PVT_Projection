@@ -360,3 +360,106 @@ def test_window_transfer_training_uses_latest_baseline_from_session(
     assert gui_window._transfer_iteration_mae_x == [1]
     assert gui_window.metric_cards["elapsed"].value_label.text() == "9s"
     assert gui_window.metric_cards["eta"].value_label.text() == "0s"
+
+
+def _write_minimal_baseline_checkpoint(run_dir: Path) -> None:
+    """Write a tiny but valid best_model.pt the ONNX exporter can consume."""
+    import numpy as np
+    import torch
+
+    from xfmr_v2.runner import build_model
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    n_features, channels, freqs, width, depth = 4, 2, 8, 16, 3
+    model = build_model(
+        "CTLE_MLP",
+        num_frequencies=freqs,
+        input_feature_dim=n_features,
+        ground_truth_channels=channels,
+        width=width,
+        depth=depth,
+    )
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "config": {"model_type": "CTLE_MLP", "width": width, "depth": depth, "cache_path": ""},
+            "active_input_feature_names": [f"f{i}" for i in range(n_features)],
+            "target_channel_names": ["gain", "phase"],
+            "input_feature_mean": np.zeros(n_features, dtype=np.float32),
+            "input_feature_std": np.ones(n_features, dtype=np.float32),
+            "target_mean": np.zeros((channels, freqs), dtype=np.float32),
+            "target_std": np.ones((channels, freqs), dtype=np.float32),
+        },
+        run_dir / "best_model.pt",
+    )
+
+
+def test_window_export_baseline_to_onnx(gui_window, tmp_path, monkeypatch) -> None:
+    pytest.importorskip("onnx")
+    run_dir = tmp_path / "baseline_run"
+    _write_minimal_baseline_checkpoint(run_dir)
+    gui_window.last_baseline_summary = {"run_dir": str(run_dir)}
+
+    out_path = tmp_path / "exported.onnx"
+    monkeypatch.setattr(
+        gui_window_module.QFileDialog,
+        "getSaveFileName",
+        lambda *args, **kwargs: (str(out_path), "ONNX Files (*.onnx)"),
+    )
+
+    gui_window.export_baseline_to_onnx()
+
+    assert out_path.exists()
+    assert out_path.with_suffix(".meta.json").exists()
+    assert gui_window.last_onnx_export_path == str(out_path)
+    assert "Exported ONNX model to" in gui_window.run_log_text_edit.toPlainText()
+    # The transient "Exporting" badge must settle back to Idle when the task finishes.
+    assert gui_window.run_state_badge.text() == "Idle"
+
+
+def test_window_export_to_onnx_without_run_warns(gui_window, monkeypatch) -> None:
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        gui_window_module.QMessageBox,
+        "warning",
+        lambda *args, **kwargs: warnings.append(args[-1]) or QMessageBox.StandardButton.Ok,
+    )
+    dialog_calls: list[bool] = []
+    monkeypatch.setattr(
+        gui_window_module.QFileDialog,
+        "getSaveFileName",
+        lambda *args, **kwargs: dialog_calls.append(True) or ("", ""),
+    )
+    gui_window.last_baseline_summary = None
+    gui_window.last_workflow_summary = None
+
+    gui_window.export_baseline_to_onnx()
+
+    assert warnings, "expected a warning when no baseline run exists"
+    assert not dialog_calls, "save dialog should not open without a run"
+
+
+def test_window_export_to_onnx_handles_backend_error(gui_window, tmp_path, monkeypatch) -> None:
+    run_dir = tmp_path / "baseline_run"
+    _write_minimal_baseline_checkpoint(run_dir)
+    gui_window.last_baseline_summary = {"run_dir": str(run_dir)}
+
+    monkeypatch.setattr(
+        gui_window_module.QFileDialog,
+        "getSaveFileName",
+        lambda *args, **kwargs: (str(tmp_path / "out.onnx"), "ONNX Files (*.onnx)"),
+    )
+
+    def boom(**kwargs):
+        raise RuntimeError("simulated export failure")
+
+    monkeypatch.setattr(gui_window_module, "export_model_to_onnx", boom)
+
+    gui_window.export_baseline_to_onnx()
+
+    # The task-error path must surface the failure and leave the UI usable
+    # (controls re-enabled, no task left running), not crash or hang.
+    assert gui_window.run_state_badge.text() == "Error"
+    assert gui_window.current_task is None
+    assert gui_window.export_onnx_button.isEnabled()
+    assert "Error: simulated export failure" in gui_window.run_log_text_edit.toPlainText()

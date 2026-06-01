@@ -8,6 +8,7 @@ GUI-friendly surface that can:
 - enumerate the CUDA / CPU devices available for training
 - validate transfer-learning compatibility
 - orchestrate baseline-only or baseline-plus-transfer runs
+- export trained checkpoints to ONNX (for MATLAB or other runtimes)
 - save and load GUI config files
 """
 
@@ -21,7 +22,8 @@ import numpy as np
 import torch
 
 from .app_paths import current_runtime_paths
-from .data import load_existing_cache, load_split_bundle
+from .data import build_cache_from_dataset, load_existing_cache, load_split_bundle
+from .export_onnx import export_checkpoint_to_onnx
 from .runner import TrainConfig, TransferConfig, run_self_transfer, train_baseline
 from .search import SearchConfig, quick_hyperparameter_search
 from .suggest import SuggestConfig, suggest_initial_settings
@@ -143,6 +145,50 @@ def scan_dataset(
             }
         )
     return result
+
+
+def build_and_scan_dataset(
+    *,
+    cache_path: str,
+    train_frac: float,
+    val_frac: float,
+    seed: int,
+    max_samples: int | None = None,
+    dataset_root: str = "",
+    input_feature_path: str = "",
+    ground_truth_data_dir: str = "",
+    overwrite: bool = False,
+    progress_callback=None,
+    should_stop=None,
+) -> dict[str, Any]:
+    """Build a cache from the chosen dataset folder (if needed), then scan it.
+
+    Builds the cache from the dataset README schema via ``build_cache_from_dataset``
+    when no cache exists yet (or when ``overwrite`` is set), then loads and summarizes
+    it for the GUI. This is the folder -> cache -> preview entry point.
+    """
+    build_root = dataset_root or ground_truth_data_dir or (
+        str(Path(input_feature_path).parent) if input_feature_path else ""
+    )
+    if overwrite or not Path(cache_path).is_file():
+        if not build_root:
+            raise ValueError("Select a dataset folder (containing a README schema) to build the cache.")
+        build_cache_from_dataset(
+            build_root,
+            cache_path,
+            max_samples=max_samples,
+            progress_callback=progress_callback,
+        )
+
+    return scan_dataset(
+        cache_path=cache_path,
+        train_frac=train_frac,
+        val_frac=val_frac,
+        seed=seed,
+        max_samples=max_samples,
+        progress_callback=progress_callback,
+        should_stop=should_stop,
+    )
 
 
 def check_transfer_compatibility(
@@ -267,6 +313,59 @@ def run_training_workflow(
         "baseline": baseline_summary,
         "transfer": transfer_summary,
     }
+
+
+def export_model_to_onnx(
+    *,
+    checkpoint_path: str,
+    out_path: str | None = None,
+    bake_normalization: bool = True,
+    progress_callback=None,
+    should_stop=None,
+) -> dict[str, Any]:
+    """Export a trained checkpoint to ONNX (for MATLAB or any ONNX runtime).
+
+    Writes ``<out>.onnx`` plus a ``<out>.meta.json`` sidecar and returns their paths.
+    Normalization is baked into the graph, so the exported model maps raw design
+    parameters straight to physical-unit curves.
+    """
+    if progress_callback is not None:
+        progress_callback(
+            {
+                "phase": "export",
+                "event": "started",
+                "message": f"Exporting {Path(checkpoint_path).name} to ONNX...",
+                "checkpoint_path": checkpoint_path,
+            }
+        )
+
+    # torch.onnx.export serializes through the `onnx` package; surface a clear,
+    # actionable error instead of a deep torch traceback when it is missing.
+    try:
+        import onnx  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError(
+            "The 'onnx' package is required to export ONNX models. Install it with: pip install onnx"
+        ) from exc
+
+    onnx_path = export_checkpoint_to_onnx(
+        checkpoint_path,
+        out_path,
+        bake_normalization=bake_normalization,
+    )
+    meta_path = onnx_path.with_suffix(".meta.json")
+
+    if progress_callback is not None:
+        progress_callback(
+            {
+                "phase": "export",
+                "event": "completed",
+                "message": f"ONNX export complete: {onnx_path}",
+                "onnx_path": str(onnx_path),
+            }
+        )
+
+    return {"status": "ok", "onnx_path": str(onnx_path), "meta_path": str(meta_path)}
 
 
 def save_gui_config(path: str | Path, payload: dict[str, Any]) -> None:
