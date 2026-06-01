@@ -8,6 +8,7 @@ GUI-friendly surface that can:
 - enumerate the CUDA / CPU devices available for training
 - validate transfer-learning compatibility
 - orchestrate baseline-only or baseline-plus-transfer runs
+- export trained checkpoints to ONNX (for MATLAB or other runtimes)
 - save and load GUI config files
 """
 
@@ -22,6 +23,7 @@ import torch
 
 from .app_paths import current_runtime_paths
 from .data import build_cache_from_dataset, load_existing_cache, load_split_bundle
+from .export_onnx import export_checkpoint_to_onnx
 from .runner import TrainConfig, TransferConfig, run_self_transfer, train_baseline
 from .search import SearchConfig, quick_hyperparameter_search
 from .suggest import SuggestConfig, suggest_initial_settings
@@ -311,6 +313,59 @@ def run_training_workflow(
         "baseline": baseline_summary,
         "transfer": transfer_summary,
     }
+
+
+def export_model_to_onnx(
+    *,
+    checkpoint_path: str,
+    out_path: str | None = None,
+    bake_normalization: bool = True,
+    progress_callback=None,
+    should_stop=None,
+) -> dict[str, Any]:
+    """Export a trained checkpoint to ONNX (for MATLAB or any ONNX runtime).
+
+    Writes ``<out>.onnx`` plus a ``<out>.meta.json`` sidecar and returns their paths.
+    Normalization is baked into the graph, so the exported model maps raw design
+    parameters straight to physical-unit curves.
+    """
+    if progress_callback is not None:
+        progress_callback(
+            {
+                "phase": "export",
+                "event": "started",
+                "message": f"Exporting {Path(checkpoint_path).name} to ONNX...",
+                "checkpoint_path": checkpoint_path,
+            }
+        )
+
+    # torch.onnx.export serializes through the `onnx` package; surface a clear,
+    # actionable error instead of a deep torch traceback when it is missing.
+    try:
+        import onnx  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError(
+            "The 'onnx' package is required to export ONNX models. Install it with: pip install onnx"
+        ) from exc
+
+    onnx_path = export_checkpoint_to_onnx(
+        checkpoint_path,
+        out_path,
+        bake_normalization=bake_normalization,
+    )
+    meta_path = onnx_path.with_suffix(".meta.json")
+
+    if progress_callback is not None:
+        progress_callback(
+            {
+                "phase": "export",
+                "event": "completed",
+                "message": f"ONNX export complete: {onnx_path}",
+                "onnx_path": str(onnx_path),
+            }
+        )
+
+    return {"status": "ok", "onnx_path": str(onnx_path), "meta_path": str(meta_path)}
 
 
 def save_gui_config(path: str | Path, payload: dict[str, Any]) -> None:

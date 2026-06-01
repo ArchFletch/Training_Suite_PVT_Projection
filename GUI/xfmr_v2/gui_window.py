@@ -48,6 +48,7 @@ from .gui_backend import (
     build_suggest_result,
     check_transfer_compatibility,
     default_run_name,
+    export_model_to_onnx,
     list_available_devices,
     load_last_session,
     make_run_roots,
@@ -220,6 +221,7 @@ class MlpTrainingStudio(QMainWindow):
         self.last_workflow_summary: dict[str, Any] | None = None
         self.last_baseline_summary: dict[str, Any] | None = None
         self.last_transfer_base_summary: dict[str, Any] | None = None
+        self.last_onnx_export_path: str | None = None
         self.selected_search_full_config: dict[str, Any] | None = None
         self.search_row_configs: list[dict[str, Any]] = []
         self.current_task_name = "idle"
@@ -712,16 +714,19 @@ class MlpTrainingStudio(QMainWindow):
         self.stop_training_button.setEnabled(False)
         self.open_output_folder_button = self._make_button("Open Output Folder", secondary=True)
         self.export_run_summary_button = self._make_button("Export Summary", secondary=True)
+        self.export_onnx_button = self._make_button("Export to ONNX", secondary=True)
         self.start_baseline_button.clicked.connect(self.start_baseline_training)
         self.start_transfer_button.clicked.connect(self.start_transfer_learning)
         self.stop_training_button.clicked.connect(self.stop_current_task)
         self.open_output_folder_button.clicked.connect(self.open_output_folder)
         self.export_run_summary_button.clicked.connect(self.export_run_summary)
+        self.export_onnx_button.clicked.connect(self.export_baseline_to_onnx)
         buttons.addWidget(self.start_baseline_button)
         buttons.addWidget(self.start_transfer_button)
         buttons.addWidget(self.stop_training_button)
         buttons.addWidget(self.open_output_folder_button)
         buttons.addWidget(self.export_run_summary_button)
+        buttons.addWidget(self.export_onnx_button)
         layout.addLayout(buttons)
 
         status_row = QHBoxLayout()
@@ -1233,6 +1238,37 @@ class MlpTrainingStudio(QMainWindow):
         Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
         self.append_log(f"Exported GUI summary to {path}")
 
+    def export_baseline_to_onnx(self) -> None:
+        """Export the most recent baseline checkpoint to ONNX (e.g. for MATLAB)."""
+        run_dir = self._current_baseline_run_dir()
+        if not run_dir:
+            self._show_warning("No baseline run is available yet. Complete a baseline training run first.")
+            return
+        checkpoint_path = Path(run_dir) / "best_model.pt"
+        if not checkpoint_path.exists():
+            self._show_warning(f"No checkpoint was found at {checkpoint_path}.")
+            return
+        default_path = checkpoint_path.with_suffix(".onnx")
+        path, _ = QFileDialog.getSaveFileName(self, "Export to ONNX", str(default_path), "ONNX Files (*.onnx)")
+        if not path:
+            return
+        self.append_log(f"Exporting baseline checkpoint to ONNX: {checkpoint_path}")
+        self._start_task(
+            export_model_to_onnx,
+            kwargs={"checkpoint_path": str(checkpoint_path), "out_path": path},
+            task_name="export",
+            busy_state="Exporting",
+            on_result=self._on_onnx_export_completed,
+        )
+
+    def _on_onnx_export_completed(self, result: dict[str, Any]) -> None:
+        onnx_path = result.get("onnx_path", "")
+        meta_path = result.get("meta_path", "")
+        self.last_onnx_export_path = onnx_path or None
+        self.append_log(f"Exported ONNX model to {onnx_path}")
+        if meta_path:
+            self.append_log(f"Wrote metadata sidecar to {meta_path}")
+
     def run_license_connection_test(self) -> None:
         server_url = normalize_server_url(self.license_server_url_edit.text())
         if not server_url:
@@ -1391,7 +1427,7 @@ class MlpTrainingStudio(QMainWindow):
         self.current_task_name = "idle"
         self._set_action_controls_enabled(True)
         self.stop_training_button.setEnabled(False)
-        if self.run_state_badge.text() in {"Training", "Transfer", "Searching", "Scanning", "Suggesting", "Checking"}:
+        if self.run_state_badge.text() in {"Training", "Transfer", "Searching", "Scanning", "Suggesting", "Checking", "Exporting"}:
             self.run_state_badge.set_status("Idle")
 
     # ------------------------------------------------------------------
@@ -2072,6 +2108,7 @@ class MlpTrainingStudio(QMainWindow):
             self.start_transfer_button,
             self.open_output_folder_button,
             self.export_run_summary_button,
+            self.export_onnx_button,
             self.apply_initial_settings_button,
             self.restore_recommended_baseline_button,
             self.ctle_preset_button,
