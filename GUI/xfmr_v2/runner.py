@@ -75,13 +75,22 @@ class TrainConfig:
 
 @dataclass
 class TransferConfig:
-    """Self-transfer configuration."""
+    """Standalone self-transfer configuration (no baseline run required).
 
-    # `base_run_dir` points to a completed baseline run whose checkpoint seeds transfer.
-    base_run_dir: str
+    Band 0 is trained from scratch on its frequency slice; later bands are seeded
+    from their neighbours during the forward/backward sweep. Normalization and the
+    train/val/test split are computed from the cache's training split, exactly as
+    baseline training does, so reported MAE is comparable.
+    """
+
     cache_path: str = str(CACHE_PATH)
     output_dir: str = "artifacts/runs/self_transfer_v2"
+    model_type: str = "FlatMLP"
+    width: int = 512
+    depth: int = 5
     seed: int = 42
+    train_frac: float = 0.8
+    val_frac: float = 0.1
     num_bands: int = 10
     iterations: int = 10
     transfer_epochs: int = 100
@@ -633,17 +642,13 @@ def run_self_transfer(
     amp = config.use_amp and device.type == "cuda"
     run_dir = make_run_dir(config.output_dir)
     results: list[dict[str, Any]] = []
-    base_average: float | None = None
-    base_freq_mae: list[float] | None = None
-    base_band_mae: list[float] | None = None
     original_frequency_count: int | None = None
     effective_frequency_count: int | None = None
     trimmed_frequency_count: int | None = None
     try:
         request_stop(should_stop)
-        # Load the baseline checkpoint and the cache it was trained against.
-        checkpoint = torch.load(Path(config.base_run_dir) / "best_model.pt", map_location="cpu", weights_only=False)
-        cfg = checkpoint["config"]
+        # Standalone (no baseline run): load the cache and compute the split +
+        # normalization from the training split, exactly as baseline training does.
         with np.load(config.cache_path, allow_pickle=False) as data:
             features = data["features"].astype(np.float32)
             targets = data["targets"].astype(np.float32)
@@ -653,38 +658,45 @@ def run_self_transfer(
                 else data["feature_names"].astype(str).tolist()
             )
             frequency_hz = data["frequency_hz"].astype(np.float32)
+            channel_names = (
+                data["channel_names"].astype(str).tolist()
+                if "channel_names" in data
+                else [f"ch{i}" for i in range(targets.shape[1])]
+            )
+            channel_transforms = (
+                data["channel_transforms"].astype(str).tolist()
+                if "channel_transforms" in data
+                else [""] * targets.shape[1]
+            )
+            channel_units = (
+                data["channel_units"].astype(str).tolist()
+                if "channel_units" in data
+                else [""] * targets.shape[1]
+            )
 
-        # Recreate the original baseline split so the transfer experiment compares
-        # against the same held-out test set.
-        train_frac = float(cfg["train_fraction"] if "train_fraction" in cfg else cfg["train_frac"])
-        val_frac = float(cfg["val_fraction"] if "val_fraction" in cfg else cfg["val_frac"])
-        split = split_indices(len(features), train_frac, val_frac, int(cfg["seed"]))
-        active_names = list(
-            checkpoint["active_input_feature_names"]
-            if "active_input_feature_names" in checkpoint
-            else checkpoint["active_feature_names"]
-        )
-        active_idx = [input_feature_names.index(name) for name in active_names]
-        # Normalize with the exact training statistics saved in the baseline checkpoint.
-        input_feature_mean = (
-            checkpoint["input_feature_mean"] if "input_feature_mean" in checkpoint else checkpoint["input_mean"]
-        )
-        input_feature_std = (
-            checkpoint["input_feature_std"] if "input_feature_std" in checkpoint else checkpoint["input_std"]
-        )
+        split = split_indices(len(features), config.train_frac, config.val_frac, config.seed)
+        # Drop constant input features using the training split only (matches baseline).
+        train_feats = features[split["train"]]
+        active_mask = train_feats.max(axis=0) != train_feats.min(axis=0)
+        if not active_mask.any():
+            active_mask[:] = True
+        active_names = [n for n, keep in zip(input_feature_names, active_mask, strict=True) if keep]
+        active_idx = [i for i, keep in enumerate(active_mask) if keep]
+        # Input normalization from the training split.
+        input_feature_mean = train_feats[:, active_idx].mean(axis=0).astype(np.float32)
+        input_feature_std = train_feats[:, active_idx].std(axis=0).astype(np.float32)
+        input_feature_std[input_feature_std == 0] = 1.0
         x = (features[:, active_idx] - input_feature_mean) / input_feature_std
         train_x, test_x = x[split["train"]], x[split["test"]]
         train_y, test_y = targets[split["train"]], targets[split["test"]]
-        # Per-channel, per-frequency target normalization saved with the baseline.
-        # Band fine-tuning runs in this SAME normalized space the baseline trained in,
-        # then MAE is reported back in original units. Older checkpoints without these
-        # stats fall back to identity (raw-space) behavior.
-        if "target_mean" in checkpoint and "target_std" in checkpoint:
-            target_mean = np.asarray(checkpoint["target_mean"], dtype=np.float32)
-            target_std = np.asarray(checkpoint["target_std"], dtype=np.float32)
-        else:
-            target_mean = np.zeros((train_y.shape[1], train_y.shape[2]), dtype=np.float32)
-            target_std = np.ones((train_y.shape[1], train_y.shape[2]), dtype=np.float32)
+        # Per-channel, per-frequency target normalization from the training split, with a
+        # per-channel std floor — identical to baseline training so MAE is comparable.
+        target_mean = train_y.mean(axis=0).astype(np.float32)
+        target_std = train_y.std(axis=0).astype(np.float32)
+        for ch in range(target_std.shape[0]):
+            ch_global_std = float(train_y[:, ch, :].std())
+            floor = max(ch_global_std * 0.01, 1e-30)
+            target_std[ch][target_std[ch] < floor] = floor
         freq_ghz = frequency_hz / 1.0e9
         freq_norm = normalize_frequency(freq_ghz)
         original_frequency_count = int(len(freq_norm))
@@ -720,61 +732,33 @@ def run_self_transfer(
             trimmed_frequency_count=trimmed_frequency_count,
             frequency_min_ghz=float(freq_ghz.min()),
             frequency_max_ghz=float(freq_ghz.max()),
-            base_run_dir=str(Path(config.base_run_dir).resolve()),
         )
 
-        # Rebuild the model shape from the saved config. A few legacy field names are
-        # still accepted here so older checkpoints remain loadable.
-        saved_model_type = cfg.get("model_type", "FlatMLP")
+        # Band-model architecture comes from the transfer config (standalone — no baseline).
+        saved_model_type = config.model_type
         model_kwargs = {
             "input_feature_dim": len(active_names),
-            "ground_truth_channels": len(checkpoint["target_channel_names"]),
-            "width": int(cfg["width"]),
-            "depth": int(cfg["depth"]),
+            "ground_truth_channels": int(targets.shape[1]),
+            "width": int(config.width),
+            "depth": int(config.depth),
         }
-        base_state = clone_state(
-            checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint["model_state"]
-        )
-        weight_decay = float(cfg["weight_decay"]) if config.weight_decay is None else float(config.weight_decay)
+        weight_decay = 1e-4 if config.weight_decay is None else float(config.weight_decay)
         # Each band predicts only its own frequencies, so band models are built at the
-        # band width (the per-frequency output layer is what differs from the baseline).
+        # band width (the per-frequency output layer is what differs between bands).
         band_width = int(len(bands[0]))
-        # Train in the baseline's normalized target space; MAE is denormalized for reports.
+        # Train in normalized target space; MAE is denormalized for reports.
         train_y_norm = (train_y - target_mean) / target_std
         loaders = _band_loaders(train_x, train_y_norm, bands, config.batch_size, device.type == "cuda")
         eval_model = build_model(saved_model_type, num_frequencies=band_width, **model_kwargs).to(device)
-        # Seed each band by slicing the full-spectrum baseline output layer down to that
-        # band's frequency positions, so every band starts from the baseline's knowledge
-        # of exactly those frequencies.
-        base_states = [
-            _seed_band_state(base_state, saved_model_type, model_kwargs, original_frequency_count, band)
-            for band in bands
-        ]
-
-        # Measure the baseline checkpoint in the "stitched" band-evaluation framework
-        # so transfer iterations can be compared directly against it.
-        base_average, base_freq_mae, base_band_mae = _stitched_mae(
-            eval_model, base_states, bands, test_x, test_y, freq_norm, device, amp, config.batch_size,
-            target_mean=target_mean, target_std=target_std,
-        )
-        emit_progress(
-            progress_callback,
-            event="baseline_metrics_ready",
-            phase="transfer",
-            message="Baseline transfer metrics are ready.",
-            base_average_mae=float(base_average),
-            base_frequency_mae=base_freq_mae,
-            base_band_mae=base_band_mae,
-            frequency_ghz=freq_ghz.tolist(),
-        )
         # `states[i]` will hold the latest checkpoint for band `i`.
         states: list[dict[str, torch.Tensor]] = [None] * config.num_bands  # type: ignore[list-item]
         total_band_runs = 1 + config.iterations * max(2 * (config.num_bands - 1), 0)
         band_run_index = 1
-        # Initialize the first band by fine-tuning directly from the baseline checkpoint.
+        # Initialize the first band by training a fresh (randomly initialized) model on
+        # its frequency slice — no baseline seeding.
         states[0] = _train_band(
             model_kwargs,
-            base_states[0],
+            None,
             loaders[0],
             freq_norm[bands[0]],
             device,
@@ -872,11 +856,17 @@ def run_self_transfer(
                 )
             # Reassemble the per-band models into one full-spectrum prediction and
             # record its error profile.
-            average_mae, freq_mae, band_mae = _stitched_mae(
+            average_mae, freq_mae, band_mae, per_channel_mae = _stitched_mae(
                 eval_model, states, bands, test_x, test_y, freq_norm, device, amp, config.batch_size,
-                target_mean=target_mean, target_std=target_std,
+                target_mean=target_mean, target_std=target_std, channel_transforms=channel_transforms,
             )
-            result = {"transfer_iteration": t, "average_mae": average_mae, "frequency_mae": freq_mae, "band_mae": band_mae}
+            result = {
+                "transfer_iteration": t,
+                "average_mae": average_mae,
+                "frequency_mae": freq_mae,
+                "band_mae": band_mae,
+                "per_channel_mae": per_channel_mae,
+            }
             results.append(result)
             (run_dir / f"iteration_{t:02d}.json").write_text(json.dumps(result, indent=2))
             elapsed_seconds = perf_counter() - start_time
@@ -896,6 +886,8 @@ def run_self_transfer(
                 average_mae=float(average_mae),
                 frequency_mae=freq_mae,
                 band_mae=band_mae,
+                per_channel_mae=per_channel_mae,
+                channel_names=channel_names,
                 frequency_ghz=freq_ghz.tolist(),
                 elapsed_seconds=float(elapsed_seconds),
                 eta_seconds=float(eta_seconds),
@@ -906,32 +898,48 @@ def run_self_transfer(
             freq_ghz,
             results,
             run_dir / "mae_vs_frequency_by_iteration.png",
-            base_frequency_mae=base_freq_mae,
+            base_frequency_mae=None,
         )
-        _plot_average_curve(results, run_dir / "average_mae_vs_iteration.png", base_average=base_average)
-        _plot_band_curve(results, bands, freq_ghz, run_dir / "band_mae_vs_iteration.png", base_band_mae=base_band_mae)
+        _plot_average_curve(results, run_dir / "average_mae_vs_iteration.png", base_average=None)
+        _plot_band_curve(results, bands, freq_ghz, run_dir / "band_mae_vs_iteration.png", base_band_mae=None)
         final_average_plot_path = run_dir / "final_average_mae.png"
-        final_average = results[-1]["average_mae"] if results else base_average
+        final_average = float(results[-1]["average_mae"]) if results else 0.0
         _plot_average_mae_bars(
-            labels=["Base", f"Final (T={config.iterations})"],
-            values=[float(base_average), float(final_average)],
+            labels=[f"Final (T={config.iterations})"],
+            values=[final_average],
             path=final_average_plot_path,
             title="Average MAE at End of Transfer",
             ylabel="Average MAE",
         )
-        torch.save({"states": states, "model_kwargs": model_kwargs, "bands": bands}, run_dir / "final_submodels.pt")
+        # Save all band submodels plus the normalization + metadata needed to use them
+        # standalone (e.g. ONNX export), since there is no baseline checkpoint to read.
+        torch.save(
+            {
+                "states": states,
+                "model_kwargs": model_kwargs,
+                "bands": bands,
+                "model_type": saved_model_type,
+                "active_input_feature_names": active_names,
+                "target_channel_names": channel_names,
+                "channel_transforms": channel_transforms,
+                "channel_units": channel_units,
+                "input_feature_mean": input_feature_mean,
+                "input_feature_std": input_feature_std,
+                "target_mean": target_mean,
+                "target_std": target_std,
+                "frequency_hz": frequency_hz,
+            },
+            run_dir / "final_submodels.pt",
+        )
 
         summary = {
             "status": "ok",
             "run_dir": str(run_dir.resolve()),
-            "base_run_dir": str(Path(config.base_run_dir).resolve()),
+            "channel_names": channel_names,
             "frequency_count": original_frequency_count,
             "effective_frequency_count": effective_frequency_count,
             "trimmed_frequency_count": trimmed_frequency_count,
-            "base_average_mae": float(base_average),
             "final_average_mae": float(final_average),
-            "base_band_mae": base_band_mae,
-            "base_frequency_mae": base_freq_mae,
             "iteration_results": results,
             "frequency_mae_plot_path": str((run_dir / "mae_vs_frequency_by_iteration.png").resolve()),
             "average_mae_plot_path": str((run_dir / "average_mae_vs_iteration.png").resolve()),
@@ -956,7 +964,6 @@ def run_self_transfer(
             phase="transfer",
             message="Frequency-domain self-transfer completed.",
             run_dir=str(run_dir.resolve()),
-            base_average_mae=float(base_average),
             final_average_mae=float(final_average),
             total_iterations=config.iterations,
             elapsed_seconds=float(perf_counter() - start_time),
@@ -969,14 +976,10 @@ def run_self_transfer(
         summary = {
             "status": "stopped",
             "run_dir": str(run_dir.resolve()),
-            "base_run_dir": str(Path(config.base_run_dir).resolve()),
             "frequency_count": original_frequency_count,
             "effective_frequency_count": effective_frequency_count,
             "trimmed_frequency_count": trimmed_frequency_count,
-            "base_average_mae": float(base_average) if base_average is not None else None,
             "final_average_mae": float(results[-1]["average_mae"]) if results else None,
-            "base_band_mae": base_band_mae,
-            "base_frequency_mae": base_freq_mae,
             "iteration_results": results,
         }
         (run_dir / "summary.json").write_text(json.dumps(summary, indent=2))
@@ -1164,7 +1167,7 @@ def _band_loaders(train_x: np.ndarray, train_y: np.ndarray, bands: list[np.ndarr
 
 def _train_band(
     model_kwargs: dict[str, Any],
-    init_state: dict[str, torch.Tensor],
+    init_state: dict[str, torch.Tensor] | None,
     loader: DataLoader,
     freq_slice: np.ndarray,
     device: torch.device,
@@ -1180,10 +1183,13 @@ def _train_band(
     model_type: str = "FlatMLP",
     num_frequencies: int = 0,
 ) -> dict[str, torch.Tensor]:
-    # Each band fine-tunes a fresh model instance starting from `init_state`.
+    # Each band trains a model instance. When ``init_state`` is given the model starts
+    # from those weights (a neighbour band during the sweep); when it is None the model
+    # keeps its fresh random initialization (band 0).
     band_start_time = perf_counter()
     model = build_model(model_type, num_frequencies=num_frequencies, **model_kwargs).to(device)
-    model.load_state_dict(init_state)
+    if init_state is not None:
+        model.load_state_dict(init_state)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=amp)
     freq = torch.from_numpy(freq_slice.astype(np.float32)).to(device)
@@ -1258,13 +1264,17 @@ def _stitched_mae(
     batch_size: int,
     target_mean: np.ndarray | None = None,
     target_std: np.ndarray | None = None,
-) -> tuple[float, list[float], list[float]]:
+    channel_transforms: list[str] | None = None,
+) -> tuple[float, list[float], list[float], list[float]]:
     # Evaluate each band-specific state on its own frequency slice, then stitch the
     # predictions back together into a full-spectrum tensor.
     #
-    # Band models predict in the baseline's normalized target space.  When the
-    # normalization stats are supplied, predictions are denormalized per band so the
-    # MAE is reported in the original (raw) units of ``test_y``.
+    # Band models predict in the normalized target space. When the normalization stats
+    # are supplied, predictions are denormalized per band so the MAE is reported in the
+    # original (raw) units of ``test_y`` — matching the baseline's MAE calculation,
+    # including per-channel values (e.g. gain and phase reported separately).
+    from .data import _inverse_channel_transforms
+
     pred = np.zeros_like(test_y, dtype=np.float32)
     x = torch.from_numpy(test_x.astype(np.float32))
     for state, band in zip(states, bands, strict=True):
@@ -1280,74 +1290,21 @@ def _stitched_mae(
             if target_mean is not None and target_std is not None:
                 out_np = out_np * target_std[:, band][np.newaxis, :, :] + target_mean[:, band][np.newaxis, :, :]
             pred[start:stop, :, band] = out_np
-    abs_err = np.abs(pred - test_y)
-    return float(abs_err.mean()), abs_err.mean(axis=(0, 1)).tolist(), [float(abs_err[:, :, band].mean()) for band in bands]
-
-
-def _seed_band_state(
-    base_state: dict[str, torch.Tensor],
-    model_type: str,
-    model_kwargs: dict[str, Any],
-    original_frequency_count: int,
-    band: np.ndarray,
-) -> dict[str, torch.Tensor]:
-    """Build a band-width initial state from a full-spectrum baseline state.
-
-    Every parameter except the final per-frequency output layer keeps the exact
-    baseline values (those shapes are identical for full- and band-width models).
-    The output layer is sliced to the band's frequency positions for each channel so
-    the band model starts from the baseline's knowledge of exactly those frequencies.
-    """
-    full = build_model(model_type, num_frequencies=original_frequency_count, **model_kwargs)
-    full.load_state_dict(base_state)
-    band_width = int(len(band))
-    band_model = build_model(model_type, num_frequencies=band_width, **model_kwargs)
-    channels = int(model_kwargs["ground_truth_channels"])
-    idx = torch.as_tensor(np.asarray(band), dtype=torch.long)
-
-    full_sd = full.state_dict()
-    target_sd = band_model.state_dict()
-    new_sd: dict[str, torch.Tensor] = {}
-    for key, target_param in target_sd.items():
-        source_param = full_sd[key]
-        if source_param.shape == target_param.shape:
-            # Only the output layer changes size, so everything else copies verbatim.
-            new_sd[key] = source_param.detach().clone()
-        else:
-            new_sd[key] = _slice_output_param(source_param, channels, original_frequency_count, idx)
-    band_model.load_state_dict(new_sd)
-    return clone_state(band_model.state_dict())
-
-
-def _slice_output_param(
-    param: torch.Tensor,
-    channels: int,
-    original_frequency_count: int,
-    idx: torch.Tensor,
-) -> torch.Tensor:
-    """Slice a full-spectrum output-layer parameter down to a band's frequencies.
-
-    Handles both output conventions used by the models here:
-    - FlatMLP: one flat output of ``channels * num_frequencies`` ordered by channel.
-    - CTLE_MLP: one ``num_frequencies``-wide head per channel.
-    Reached only for parameters whose shape actually differs between the full- and
-    band-width models, i.e. the per-frequency output layer.
-    """
-    band_width = int(idx.numel())
-    if param.dim() == 2:
-        if param.shape[0] == channels * original_frequency_count:  # FlatMLP output weight
-            reshaped = param.view(channels, original_frequency_count, param.shape[1])
-            return reshaped.index_select(1, idx).reshape(channels * band_width, param.shape[1]).detach().clone()
-        if param.shape[0] == original_frequency_count:  # CTLE per-channel head weight
-            return param.index_select(0, idx).detach().clone()
-    if param.dim() == 1:
-        if param.shape[0] == channels * original_frequency_count:  # FlatMLP output bias
-            reshaped = param.view(channels, original_frequency_count)
-            return reshaped.index_select(1, idx).reshape(channels * band_width).detach().clone()
-        if param.shape[0] == original_frequency_count:  # CTLE per-channel head bias
-            return param.index_select(0, idx).detach().clone()
-    raise ValueError(
-        f"Cannot slice output parameter of shape {tuple(param.shape)} to band width {band_width}."
+    true = test_y
+    # Undo per-channel transforms (e.g. log10) so MAE is in the original data space,
+    # exactly as the baseline evaluation does.
+    if channel_transforms and any(t for t in channel_transforms):
+        pred = _inverse_channel_transforms(pred, channel_transforms)
+        true = _inverse_channel_transforms(test_y, channel_transforms)
+    abs_err = np.abs(pred - true)
+    # per_channel_mae averages over samples and frequencies for each channel — same
+    # formula as the baseline's _eval_metrics (axis=(0, 2)).
+    per_channel_mae = abs_err.mean(axis=(0, 2)).tolist()
+    return (
+        float(abs_err.mean()),
+        abs_err.mean(axis=(0, 1)).tolist(),
+        [float(abs_err[:, :, band].mean()) for band in bands],
+        per_channel_mae,
     )
 
 

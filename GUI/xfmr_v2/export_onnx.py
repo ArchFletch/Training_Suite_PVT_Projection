@@ -279,12 +279,12 @@ def export_transfer_to_onnx(
 ) -> Path:
     """Export a self-transfer (per-band) model to a single stitched ONNX graph.
 
-    ``transfer_run_dir`` must contain ``final_submodels.pt``.  The normalization stats,
-    model type, and frequency axis are taken from the baseline run the transfer was
-    seeded from (resolved via the transfer ``summary.json``'s ``base_run_dir``, or
-    overridden with ``baseline_checkpoint``).  Writes ``<out>.onnx`` + ``<out>.meta.json``
-    and returns the ``.onnx`` path.  The output contract matches the baseline exporter,
-    so the same MATLAB loader works unchanged.
+    ``transfer_run_dir`` must contain ``final_submodels.pt``. Standalone transfer runs
+    embed their own normalization stats, model type, channel names, and frequency axis,
+    so no baseline is needed. Older runs that were seeded from a baseline resolve those
+    from the baseline (via the transfer ``summary.json``'s ``base_run_dir``, or an
+    explicit ``baseline_checkpoint``). Writes ``<out>.onnx`` + ``<out>.meta.json``; the
+    output contract matches the baseline exporter, so the same MATLAB loader works.
     """
     transfer_run_dir = Path(transfer_run_dir)
     bundle = torch.load(transfer_run_dir / "final_submodels.pt", map_location="cpu", weights_only=False)
@@ -292,37 +292,52 @@ def export_transfer_to_onnx(
     model_kwargs = dict(bundle["model_kwargs"])
     bands = [np.asarray(b, dtype=np.int64) for b in bundle["bands"]]
 
-    # The baseline run supplies model_type + normalization (the transfer file omits them).
-    if baseline_checkpoint is None:
-        summary = json.loads((transfer_run_dir / "summary.json").read_text())
-        base_run_dir = summary.get("base_run_dir")
-        if not base_run_dir:
-            raise ValueError(
-                "Transfer summary.json has no 'base_run_dir'; pass baseline_checkpoint explicitly."
-            )
-        baseline_checkpoint = Path(base_run_dir) / "best_model.pt"
-    baseline_checkpoint = Path(baseline_checkpoint)
-    base = torch.load(baseline_checkpoint, map_location="cpu", weights_only=False)
-    config = base["config"]
-    model_type = config.get("model_type", "FlatMLP")
-
-    active_names = list(_get(base, "active_input_feature_names", "active_feature_names"))
-    channel_names = list(base["target_channel_names"])
-    input_mean = np.asarray(_get(base, "input_feature_mean", "input_mean"), dtype=np.float32)
-    input_std = np.asarray(_get(base, "input_feature_std", "input_std"), dtype=np.float32)
-    target_mean_full = np.asarray(base["target_mean"], dtype=np.float32)
-    target_std_full = np.asarray(base["target_std"], dtype=np.float32)
+    if "target_mean" in bundle and baseline_checkpoint is None:
+        # Standalone transfer run: normalization + metadata are embedded in the bundle.
+        model_type = bundle.get("model_type", "FlatMLP")
+        active_names = list(bundle["active_input_feature_names"])
+        channel_names = list(bundle["target_channel_names"])
+        input_mean = np.asarray(bundle["input_feature_mean"], dtype=np.float32)
+        input_std = np.asarray(bundle["input_feature_std"], dtype=np.float32)
+        target_mean_full = np.asarray(bundle["target_mean"], dtype=np.float32)
+        target_std_full = np.asarray(bundle["target_std"], dtype=np.float32)
+        transforms = list(bundle.get("channel_transforms") or [""] * len(channel_names))
+        units = list(bundle.get("channel_units") or [""] * len(channel_names))
+        freq_full = np.asarray(bundle["frequency_hz"], dtype=float).tolist() if "frequency_hz" in bundle else []
+        sweep_label = "Frequency (GHz)"
+    else:
+        # Legacy: the baseline run supplies model_type + normalization.
+        if baseline_checkpoint is None:
+            summary = json.loads((transfer_run_dir / "summary.json").read_text())
+            base_run_dir = summary.get("base_run_dir")
+            if not base_run_dir:
+                raise ValueError(
+                    "Transfer run has no embedded normalization and summary.json has no "
+                    "'base_run_dir'; pass baseline_checkpoint explicitly."
+                )
+            baseline_checkpoint = Path(base_run_dir) / "best_model.pt"
+        baseline_checkpoint = Path(baseline_checkpoint)
+        base = torch.load(baseline_checkpoint, map_location="cpu", weights_only=False)
+        config = base["config"]
+        model_type = config.get("model_type", "FlatMLP")
+        active_names = list(_get(base, "active_input_feature_names", "active_feature_names"))
+        channel_names = list(base["target_channel_names"])
+        input_mean = np.asarray(_get(base, "input_feature_mean", "input_mean"), dtype=np.float32)
+        input_std = np.asarray(_get(base, "input_feature_std", "input_std"), dtype=np.float32)
+        target_mean_full = np.asarray(base["target_mean"], dtype=np.float32)
+        target_std_full = np.asarray(base["target_std"], dtype=np.float32)
+        axis_meta = _load_axis_metadata(config.get("cache_path"), target_mean_full.shape[0])
+        transforms = axis_meta["channel_transforms"] or [""] * len(channel_names)
+        units = axis_meta["channel_units"]
+        freq_full = axis_meta["frequency_hz"]
+        sweep_label = axis_meta["sweep_label"]
 
     # The transfer model covers the (possibly trimmed) union of band indices, in band order.
     eff_idx = np.concatenate(bands)
     target_mean = target_mean_full[:, eff_idx]
     target_std = target_std_full[:, eff_idx]
     num_channels = target_mean.shape[0]
-
-    axis_meta = _load_axis_metadata(config.get("cache_path"), num_channels)
-    transforms = axis_meta["channel_transforms"] or [""] * num_channels
     log10_mask = [t == "log10" for t in transforms]
-    freq_full = axis_meta["frequency_hz"]
     freq_eff = [float(freq_full[int(i)]) for i in eff_idx] if freq_full else []
 
     submodels: list[nn.Module] = []
@@ -354,19 +369,19 @@ def export_transfer_to_onnx(
         "model_type": f"{model_type} (self-transfer, {len(bands)} bands)",
         "input_feature_names": active_names,
         "channel_names": channel_names,
-        "channel_units": axis_meta["channel_units"],
+        "channel_units": units,
         "channel_transforms": transforms,
         "num_channels": int(num_channels),
         "num_frequencies": int(len(eff_idx)),
         "frequency_hz": freq_eff,
-        "sweep_label": axis_meta["sweep_label"],
+        "sweep_label": sweep_label,
         "normalization_baked_in": bool(bake_normalization),
         "input_mean": input_mean.tolist(),
         "input_std": input_std.tolist(),
         "target_mean": target_mean.tolist(),
         "target_std": target_std.tolist(),
         "transfer_bands": [[int(i) for i in band] for band in bands],
-        "baseline_checkpoint": str(baseline_checkpoint),
+        "baseline_checkpoint": str(baseline_checkpoint) if baseline_checkpoint else None,
         "output_layout": "row-major (channel, frequency); reshape to [num_frequencies, num_channels].' in MATLAB",
     }
     out_path.with_suffix(".meta.json").write_text(json.dumps(sidecar, indent=2))

@@ -191,93 +191,19 @@ def build_and_scan_dataset(
     )
 
 
-def check_transfer_compatibility(
-    *,
-    base_run_dir: str,
-    cache_path: str,
-    input_feature_path: str | None = None,
-    ground_truth_data_dir: str | None = None,
-    progress_callback=None,
-    should_stop=None,
-) -> dict[str, Any]:
-    """Check whether one baseline run can be used with the current dataset cache."""
-
-    run_dir = Path(base_run_dir)
-    checkpoint_path = run_dir / "best_model.pt"
-    summary_path = run_dir / "summary.json"
-    if not checkpoint_path.is_file():
-        return {
-            "status": "Mismatch",
-            "message": "The selected baseline run does not contain best_model.pt.",
-        }
-    if not Path(cache_path).is_file():
-        return {
-            "status": "Mismatch",
-            "message": "The selected cache file does not exist yet.",
-        }
-
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    with np.load(cache_path, allow_pickle=False) as data:
-        cache_input_feature_names = _array_names(data, "input_feature_names", "feature_names")
-        cache_channel_names = _array_names(data, "channel_names")
-        frequency_count = int(data["frequency_hz"].shape[0])
-
-    checkpoint_active_names = list(
-        checkpoint["active_input_feature_names"]
-        if "active_input_feature_names" in checkpoint
-        else checkpoint["active_feature_names"]
-    )
-    checkpoint_channel_names = list(checkpoint["target_channel_names"])
-    if any(name not in cache_input_feature_names for name in checkpoint_active_names):
-        return {
-            "status": "Mismatch",
-            "message": "The selected baseline run expects input features that are not present in the current cache.",
-        }
-    if checkpoint_channel_names != cache_channel_names:
-        return {
-            "status": "Mismatch",
-            "message": "The selected baseline run predicts different ground-truth channels than the current cache.",
-        }
-
-    cfg = checkpoint.get("config", {})
-    mismatch_notes: list[str] = []
-    if input_feature_path:
-        checkpoint_input_feature_path = cfg.get("input_feature_path") or cfg.get("input_path")
-        if checkpoint_input_feature_path not in (None, "", input_feature_path):
-            mismatch_notes.append("Baseline run was created from a different input-feature path.")
-    if ground_truth_data_dir:
-        checkpoint_ground_truth_path = cfg.get("ground_truth_data_dir") or cfg.get("output_data_dir")
-        if checkpoint_ground_truth_path not in (None, "", ground_truth_data_dir):
-            mismatch_notes.append("Baseline run was created from a different ground-truth data folder.")
-
-    message = "The selected baseline run is compatible with the current cache."
-    if mismatch_notes:
-        message += " " + " ".join(mismatch_notes)
-
-    summary: dict[str, Any] = {}
-    if summary_path.is_file():
-        summary = json.loads(summary_path.read_text(encoding="utf-8"))
-
-    return {
-        "status": "Compatible",
-        "message": message,
-        "frequency_count": frequency_count,
-        "active_input_feature_names": checkpoint_active_names,
-        "ground_truth_channels": checkpoint_channel_names,
-        "base_run_dir": str(run_dir.resolve()),
-        "summary": summary,
-    }
-
-
 def run_training_workflow(
     *,
     baseline_config: TrainConfig | None,
     transfer_config: TransferConfig | None,
-    transfer_base_run_dir: str | None,
     progress_callback=None,
     should_stop=None,
 ) -> dict[str, Any]:
-    """Run baseline-only, transfer-only, or baseline-plus-transfer from the GUI."""
+    """Run baseline-only, transfer-only, or baseline-plus-transfer from the GUI.
+
+    Self-transfer is standalone: it trains its own per-band models from scratch and
+    computes normalization from the dataset cache, so it does not depend on a baseline
+    run.
+    """
 
     baseline_summary: dict[str, Any] | None = None
     transfer_summary: dict[str, Any] | None = None
@@ -293,12 +219,6 @@ def run_training_workflow(
             return {"status": "stopped", "baseline": baseline_summary, "transfer": None}
 
     if transfer_config is not None:
-        if transfer_base_run_dir:
-            transfer_config.base_run_dir = transfer_base_run_dir
-        elif baseline_summary is not None:
-            transfer_config.base_run_dir = baseline_summary["run_dir"]
-        else:
-            raise ValueError("Transfer learning requires either a baseline run from this session or an existing base run.")
         transfer_summary = run_self_transfer(
             transfer_config,
             show_progress=False,
@@ -506,10 +426,3 @@ def _should_forward_search_progress(payload: dict[str, Any]) -> bool:
 
 def _join_values(values: list[str] | tuple[str, ...]) -> str:
     return ", ".join(values)
-
-
-def _array_names(data: np.lib.npyio.NpzFile, *keys: str) -> list[str]:
-    for key in keys:
-        if key in data:
-            return data[key].astype(str).tolist()
-    raise KeyError(f"None of the expected array keys were present: {keys}")

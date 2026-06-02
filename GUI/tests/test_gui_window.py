@@ -144,29 +144,6 @@ def test_manual_cache_path_is_preserved_on_run_name_change(gui_window, tmp_path:
     assert gui_window.cache_path_edit.text() == manual_cache_path
 
 
-def test_window_existing_transfer_base_updates_compatibility_status(
-    gui_window,
-    synthetic_dataset: dict[str, Path],
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _configure_dataset_paths(gui_window, synthetic_dataset, tmp_path)
-    gui_window.scan_dataset()
-
-    monkeypatch.setattr(
-        gui_window_module,
-        "check_transfer_compatibility",
-        lambda **kwargs: {"status": "Compatible", "message": "Compatible synthetic baseline."},
-    )
-
-    gui_window.transfer_base_model_source_combo_box.setCurrentIndex(1)
-    gui_window.transfer_base_run_path_edit.setText(str(tmp_path / "existing_baseline"))
-    gui_window.validate_transfer_compatibility()
-
-    assert gui_window.transfer_compatibility_status_badge.text() == "Compatible"
-    assert "Compatible synthetic baseline" in gui_window.transfer_notes_label.text()
-
-
 def test_window_baseline_training_progress_updates_live_metrics_and_plots(
     gui_window,
     synthetic_dataset: dict[str, Path],
@@ -180,13 +157,11 @@ def test_window_baseline_training_progress_updates_live_metrics_and_plots(
         *,
         baseline_config,
         transfer_config,
-        transfer_base_run_dir,
         progress_callback=None,
         should_stop=None,
     ):
         assert baseline_config is not None
         assert transfer_config is None
-        assert transfer_base_run_dir is None
         emit_progress(progress_callback, event="started", phase="baseline", message="Baseline started.")
         emit_progress(
             progress_callback,
@@ -260,7 +235,7 @@ def test_window_baseline_training_progress_updates_live_metrics_and_plots(
     assert gui_window.last_baseline_summary["run_dir"].endswith("baseline_run")
 
 
-def test_window_transfer_training_uses_latest_baseline_from_session(
+def test_window_transfer_training_standalone_reports_per_channel_mae(
     gui_window,
     synthetic_dataset: dict[str, Path],
     tmp_path: Path,
@@ -268,61 +243,18 @@ def test_window_transfer_training_uses_latest_baseline_from_session(
 ) -> None:
     _configure_dataset_paths(gui_window, synthetic_dataset, tmp_path)
     gui_window.scan_dataset()
-    gui_window.last_baseline_summary = {"run_dir": str(tmp_path / "baseline_run")}
-    gui_window.transfer_base_model_source_combo_box.setCurrentIndex(0)
     gui_window.transfer_num_bands_spin_box.setValue(3)
-    gui_window.validate_transfer_compatibility()
 
     def fake_run_training_workflow(
         *,
         baseline_config,
         transfer_config,
-        transfer_base_run_dir,
         progress_callback=None,
         should_stop=None,
     ):
+        # Standalone transfer: no baseline involved.
         assert baseline_config is None
         assert transfer_config is not None
-        assert transfer_base_run_dir == str(tmp_path / "baseline_run")
-        emit_progress(
-            progress_callback,
-            event="baseline_metrics_ready",
-            phase="transfer",
-            base_average_mae=0.05,
-            base_frequency_mae=[0.05, 0.04, 0.03],
-            base_band_mae=[0.05, 0.04, 0.03],
-            frequency_ghz=[2.0, 3.0, 4.0],
-            message="Transfer baseline metrics ready.",
-        )
-        emit_progress(
-            progress_callback,
-            event="band_started",
-            phase="transfer",
-            transfer_iteration=1,
-            direction="forward",
-            band_index=1,
-            num_bands=3,
-            band_run_index=2,
-            total_band_runs=5,
-            message="Band training started.",
-        )
-        emit_progress(
-            progress_callback,
-            event="band_epoch_end",
-            phase="transfer",
-            transfer_iteration=1,
-            direction="forward",
-            band_index=1,
-            num_bands=3,
-            band_run_index=2,
-            total_band_runs=5,
-            epoch=1,
-            total_epochs=2,
-            train_loss=0.08,
-            elapsed_seconds=5.0,
-            eta_seconds=7.0,
-            message="Band epoch 1 complete.",
-        )
         emit_progress(
             progress_callback,
             event="iteration_completed",
@@ -330,6 +262,8 @@ def test_window_transfer_training_uses_latest_baseline_from_session(
             transfer_iteration=1,
             total_iterations=1,
             average_mae=0.025,
+            per_channel_mae=[0.03, 0.02],
+            channel_names=["gain", "phase"],
             frequency_ghz=[2.0, 3.0, 4.0],
             frequency_mae=[0.03, 0.02, 0.01],
             band_mae=[0.03, 0.02, 0.01],
@@ -358,6 +292,8 @@ def test_window_transfer_training_uses_latest_baseline_from_session(
     assert gui_window.last_workflow_summary["status"] == "ok"
     assert gui_window.run_state_badge.text() == "Completed"
     assert gui_window._transfer_iteration_mae_x == [1]
+    # Gain and phase are tracked separately for the per-channel transfer plot.
+    assert gui_window._transfer_channel_mae == {"gain": [0.03], "phase": [0.02]}
     assert gui_window.metric_cards["elapsed"].value_label.text() == "9s"
     assert gui_window.metric_cards["eta"].value_label.text() == "0s"
 
