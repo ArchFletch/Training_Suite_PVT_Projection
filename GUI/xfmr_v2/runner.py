@@ -72,40 +72,6 @@ class TrainConfig:
     # ``None`` means auto-select (first CUDA device when available, else CPU).
     device: str | None = None
 
-    # Presets — notebook-validated defaults for known dataset families.
-    PRESETS: dict[str, dict[str, Any]] = None  # type: ignore[assignment]
-
-    def __post_init__(self) -> None:
-        # Class-level constant; defined here to keep the dataclass clean.
-        object.__setattr__(self, "PRESETS", {
-            "CTLE": {
-                "model_type": "CTLE_MLP",
-                "batch_size": 64,
-                "epochs": 500,
-                "learning_rate": 1e-3,
-                "weight_decay": 1e-4,
-                "width": 1024,
-                "depth": 5,
-                "loss_function": "mse",
-                "scheduler": "plateau",
-            },
-        })
-
-    @classmethod
-    def preset(cls, name: str, **overrides: Any) -> "TrainConfig":
-        """Return a TrainConfig populated with a named preset's values."""
-        instance = cls()
-        presets = instance.PRESETS
-        if name not in presets:
-            raise ValueError(f"Unknown preset {name!r}. Available: {list(presets)}")
-        kwargs = {**presets[name], **overrides}
-        return cls(**kwargs)
-
-    @classmethod
-    def preset_names(cls) -> list[str]:
-        """Return available preset names."""
-        return list(cls().PRESETS.keys())
-
 
 @dataclass
 class TransferConfig:

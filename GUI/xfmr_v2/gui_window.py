@@ -618,8 +618,6 @@ class MlpTrainingStudio(QMainWindow):
         self.baseline_seed_spin_box = self._make_int_spin(0, 1000000, 42)
         self.restore_recommended_baseline_button = self._make_button("Restore Recommended", secondary=True)
         self.restore_recommended_baseline_button.clicked.connect(self._restore_recommended_baseline)
-        self.ctle_preset_button = self._make_button("CTLE Defaults", secondary=True)
-        self.ctle_preset_button.clicked.connect(self._apply_ctle_preset)
 
         fields = [
             ("Model Type", self.baseline_model_type_combo_box),
@@ -638,7 +636,6 @@ class MlpTrainingStudio(QMainWindow):
         for row, (label, widget) in enumerate(fields):
             self._add_form_row(grid, row, label, widget)
         grid.addWidget(self.restore_recommended_baseline_button, len(fields), 1)
-        grid.addWidget(self.ctle_preset_button, len(fields), 2)
         return tab
 
     def _build_transfer_tab(self) -> QWidget:
@@ -2099,7 +2096,6 @@ class MlpTrainingStudio(QMainWindow):
             self.export_onnx_button,
             self.apply_initial_settings_button,
             self.restore_recommended_baseline_button,
-            self.ctle_preset_button,
             self.input_feature_path_edit,
             self.browse_input_feature_button,
             self.ground_truth_data_folder_path_edit,
@@ -2338,12 +2334,6 @@ class MlpTrainingStudio(QMainWindow):
             self.append_log("Restored the scan-only baseline recommendation.")
             return
         self._show_warning("No recommended baseline configuration is available yet.")
-
-    def _apply_ctle_preset(self) -> None:
-        from .runner import TrainConfig
-        config = TrainConfig.preset("CTLE")
-        self._apply_baseline_form(asdict(config))
-        self.append_log("Applied CTLE preset (notebook-validated defaults).")
 
     def _validate_split_fractions(self) -> bool:
         train_frac = float(self.baseline_train_fraction_spin_box.value())
