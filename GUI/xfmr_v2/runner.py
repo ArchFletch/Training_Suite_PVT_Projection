@@ -609,6 +609,11 @@ def train_baseline(
         progress_callback=progress_callback,
         should_stop=should_stop,
     )
+    # A cancelled run returns a partial result (status "stopped") that lacks the
+    # completed-run keys (run_dir, test_loss, plot paths). Pass it straight through
+    # so callers see the stopped status instead of a KeyError on those keys.
+    if result.get("status") == "stopped":
+        return result
     summary = {
         "run_dir": result["run_dir"],
         "device": result["device"],

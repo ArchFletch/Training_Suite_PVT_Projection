@@ -82,3 +82,21 @@ def test_legacy_model_type_names_still_build() -> None:
     kwargs = {"input_feature_dim": 1, "ground_truth_channels": 1, "width": 8, "depth": 2}
     assert isinstance(runner.build_model("FlatMLP", num_frequencies=3, **kwargs), SpectraNet)
     assert isinstance(runner.build_model("CTLE_MLP", num_frequencies=3, **kwargs), SpectraHydra)
+
+
+def test_train_baseline_stop_returns_stopped_summary() -> None:
+    """Stopping a baseline run must return a 'stopped' summary, not raise KeyError.
+
+    Regression: a cancelled run yields a partial result without 'run_dir' (and the
+    other completed-run keys); train_baseline used to index those unconditionally and
+    crash with KeyError('run_dir'). The stop check fires before any data is touched.
+    """
+    summary = runner.train_baseline(
+        runner.TrainConfig(),
+        show_progress=False,
+        should_stop=lambda: True,
+    )
+    assert summary["status"] == "stopped"
+    # The completed-run keys must be absent rather than raising.
+    assert "run_dir" not in summary
+    assert "test_loss" not in summary
