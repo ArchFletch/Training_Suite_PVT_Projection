@@ -105,7 +105,7 @@ def _reference(ref: dict, x: np.ndarray) -> np.ndarray:
     return y.reshape(x.shape[0], ref["channels"] * ref["freqs"])
 
 
-@pytest.mark.parametrize("model_type", ["CTLE_MLP", "FlatMLP"])
+@pytest.mark.parametrize("model_type", ["SpectraHydra", "SpectraNet"])
 def test_export_matches_torch_pipeline(tmp_path: Path, model_type: str) -> None:
     ckpt, ref = _make_checkpoint(tmp_path / model_type, model_type=model_type, with_cache=True)
     out = export_checkpoint_to_onnx(ckpt)
@@ -125,7 +125,7 @@ def test_export_matches_torch_pipeline(tmp_path: Path, model_type: str) -> None:
 def test_log10_channel_is_inverted_in_graph(tmp_path: Path) -> None:
     transforms = ["log10", ""]
     ckpt, ref = _make_checkpoint(
-        tmp_path / "log10", model_type="CTLE_MLP", channels=2, transforms=transforms, with_cache=True
+        tmp_path / "log10", model_type="SpectraHydra", channels=2, transforms=transforms, with_cache=True
     )
     out = export_checkpoint_to_onnx(ckpt)
 
@@ -140,11 +140,11 @@ def test_log10_channel_is_inverted_in_graph(tmp_path: Path) -> None:
 
 
 def test_meta_sidecar_contract_and_reshape(tmp_path: Path) -> None:
-    ckpt, ref = _make_checkpoint(tmp_path / "meta", model_type="CTLE_MLP", channels=2, freqs=8, with_cache=True)
+    ckpt, ref = _make_checkpoint(tmp_path / "meta", model_type="SpectraHydra", channels=2, freqs=8, with_cache=True)
     out = export_checkpoint_to_onnx(ckpt)
     meta = json.loads(out.with_suffix(".meta.json").read_text())
 
-    assert meta["model_type"] == "CTLE_MLP"
+    assert meta["model_type"] == "SpectraHydra"
     assert meta["num_channels"] == ref["channels"]
     assert meta["num_frequencies"] == ref["freqs"]
     assert meta["normalization_baked_in"] is True
@@ -162,7 +162,7 @@ def test_meta_sidecar_contract_and_reshape(tmp_path: Path) -> None:
 
 
 def test_missing_cache_still_exports_with_empty_axis_meta(tmp_path: Path) -> None:
-    ckpt, _ = _make_checkpoint(tmp_path / "nocache", model_type="CTLE_MLP", with_cache=False)
+    ckpt, _ = _make_checkpoint(tmp_path / "nocache", model_type="SpectraHydra", with_cache=False)
     out = export_checkpoint_to_onnx(ckpt)
     meta = json.loads(out.with_suffix(".meta.json").read_text())
     # Export succeeds; axis labels are empty placeholders when no cache is present.
@@ -178,7 +178,7 @@ def test_no_nan_with_large_nonlog10_outputs(tmp_path: Path) -> None:
     bug and passes once the inverse is applied only to log10 channels.
     """
     ckpt, ref = _make_checkpoint(
-        tmp_path / "big", model_type="CTLE_MLP", channels=2, target_scale=60.0, with_cache=True
+        tmp_path / "big", model_type="SpectraHydra", channels=2, target_scale=60.0, with_cache=True
     )
     out = export_checkpoint_to_onnx(ckpt)
     rng = np.random.default_rng(7)
@@ -194,13 +194,13 @@ def _make_transfer_run(tmp_path: Path, *, freqs: int = 9, num_bands: int = 3, ch
                        n_features: int = 4, width: int = 16, depth: int = 3) -> tuple[Path, dict]:
     """Build a synthetic self-transfer run dir (baseline + per-band submodels)."""
     base_dir = tmp_path / "baseline"
-    ckpt, ref = _make_checkpoint(base_dir, model_type="CTLE_MLP", n_features=n_features,
+    ckpt, ref = _make_checkpoint(base_dir, model_type="SpectraHydra", n_features=n_features,
                                  channels=channels, freqs=freqs, width=width, depth=depth, with_cache=True)
     size = freqs // num_bands
     bands = [np.arange(i * size, (i + 1) * size, dtype=np.int64) for i in range(num_bands)]
     states = []
     for band in bands:
-        sub = build_model("CTLE_MLP", num_frequencies=int(len(band)), input_feature_dim=n_features,
+        sub = build_model("SpectraHydra", num_frequencies=int(len(band)), input_feature_dim=n_features,
                           ground_truth_channels=channels, width=width, depth=depth)
         states.append(sub.state_dict())
     trun = tmp_path / "transfer"
@@ -233,7 +233,7 @@ def test_transfer_export_matches_stitched_torch(tmp_path: Path) -> None:
     C, F = info["channels"], info["freqs"]
     stitched = np.zeros((len(x), C, F), dtype=np.float32)
     for state, band in zip(info["states"], info["bands"]):
-        m = build_model("CTLE_MLP", num_frequencies=int(len(band)), **info["model_kwargs"])
+        m = build_model("SpectraHydra", num_frequencies=int(len(band)), **info["model_kwargs"])
         m.load_state_dict(state)
         m.eval()
         with torch.no_grad():

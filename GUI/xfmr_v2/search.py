@@ -40,7 +40,7 @@ class SearchConfig:
     val_frac: float = 0.1
     max_samples: int | None = None
     search_max_samples: int | None = None
-    model_type: str = "FlatMLP"
+    model_type: str = "SpectraNet"
     trial_count: int = 6
     epochs_per_trial: int = 60
     objective: str = "balanced"

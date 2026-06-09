@@ -64,7 +64,14 @@ from .licensing import (
     normalize_server_url,
     test_license_connection,
 )
-from .runner import LOSS_FUNCTIONS, MODEL_TYPES, SCHEDULER_TYPES, TrainConfig, TransferConfig
+from .runner import (
+    LOSS_FUNCTIONS,
+    MODEL_TYPES,
+    SCHEDULER_TYPES,
+    TrainConfig,
+    TransferConfig,
+    canonical_model_type,
+)
 from .search import SearchConfig
 
 
@@ -237,7 +244,7 @@ class MlpTrainingStudio(QMainWindow):
         self._transfer_iteration_mae_x: list[float] = []
         self._transfer_channel_mae: dict[str, list[float]] = {}
 
-        self.setWindowTitle("Surrogate Model Traning Suite")
+        self.setWindowTitle("Surrogate Model Training Suite")
         self.resize(1440, 920)
         self.setMinimumSize(1280, 800)
 
@@ -279,7 +286,7 @@ class MlpTrainingStudio(QMainWindow):
         layout.setSpacing(16)
 
         title_col = QVBoxLayout()
-        title_label = QLabel("Surrogate Model Traning Suite")
+        title_label = QLabel("Surrogate Model Training Suite")
         title_label.setObjectName("TopBarTitle")
         title_col.addWidget(title_label)
         layout.addLayout(title_col, 1)
@@ -599,7 +606,7 @@ class MlpTrainingStudio(QMainWindow):
 
         self.baseline_model_type_combo_box = _NoScrollComboBox()
         self.baseline_model_type_combo_box.addItems(list(MODEL_TYPES))
-        self.baseline_model_type_combo_box.setCurrentText("FlatMLP")
+        self.baseline_model_type_combo_box.setCurrentText("SpectraNet")
         self.baseline_epochs_spin_box = self._make_int_spin(1, 5000, 300)
         self.baseline_batch_size_spin_box = self._make_int_spin(1, 4096, 16)
         self.baseline_learning_rate_spin_box = self._make_float_spin(1e-6, 1.0, 1e-4, decimals=6, step=1e-5, scientific=True)
@@ -1714,13 +1721,10 @@ class MlpTrainingStudio(QMainWindow):
             self.run_progress_bar.setValue(int(100.0 * epoch / max(total_epochs, 1)))
         elif event == "evaluation_completed":
             self.baseline_frequency_curve.setData(payload.get("frequency_ghz", []), payload.get("frequency_mae", []))
-            channel_labels = payload.get("channel_mae_with_units")
-            if channel_labels:
-                self.metric_cards["average_mae"].set_value(" | ".join(channel_labels))
-            else:
-                average_mae = payload.get("average_evaluation_mae", payload.get("average_test_mae"))
-                if average_mae is not None:
-                    self.metric_cards["average_mae"].set_value(f"{average_mae:.6f}")
+            # Show a single MAE averaged over all ground-truth channels (no per-channel split).
+            average_mae = payload.get("average_evaluation_mae", payload.get("average_test_mae"))
+            if average_mae is not None:
+                self.metric_cards["average_mae"].set_value(f"{average_mae:.6f}")
         elif event == "completed":
             self.run_progress_bar.setValue(100)
             self.run_state_badge.set_status("Completed")
@@ -1778,18 +1782,15 @@ class MlpTrainingStudio(QMainWindow):
                 return
             transfer_iteration = int(payload["transfer_iteration"])
             self._transfer_iteration_mae_x.append(transfer_iteration)
-            # Record per-channel MAE (e.g. gain, phase) so they can be shown separately.
+            # Record per-channel MAE (e.g. gain, phase) so the plot can show them separately.
             channel_names = list(payload.get("channel_names") or [])
             per_channel = list(payload.get("per_channel_mae") or [])
             for name, value in zip(channel_names, per_channel):
                 self._transfer_channel_mae.setdefault(name, []).append(float(value))
             self._plot_transfer_average()
-            if channel_names and per_channel:
-                self.metric_cards["average_mae"].set_value(
-                    " | ".join(f"{n} {v:.6f}" for n, v in zip(channel_names, per_channel))
-                )
-            else:
-                self.metric_cards["average_mae"].set_value(f"{payload['average_mae']:.6f}")
+            # The card shows a single MAE averaged over all ground-truth channels; the
+            # per-channel breakdown remains in the plot above.
+            self.metric_cards["average_mae"].set_value(f"{payload['average_mae']:.6f}")
             self.metric_cards["current_progress"].set_value(f"Iteration {transfer_iteration}/{payload['total_iterations']} complete")
             if payload.get("elapsed_seconds") is not None:
                 self.metric_cards["elapsed"].set_value(self._format_seconds(payload.get("elapsed_seconds")))
@@ -1835,7 +1836,9 @@ class MlpTrainingStudio(QMainWindow):
     def _apply_baseline_form(self, payload: dict[str, Any]) -> None:
         if not payload:
             return
-        model_type = payload.get("model_type", "FlatMLP")
+        # Normalize legacy names so forms saved before the model rename still
+        # select the right entry in the combo box.
+        model_type = canonical_model_type(payload.get("model_type", "SpectraNet"))
         if model_type in MODEL_TYPES:
             self.baseline_model_type_combo_box.setCurrentText(model_type)
         self.baseline_epochs_spin_box.setValue(int(payload.get("epochs", self.baseline_epochs_spin_box.value())))
@@ -2432,13 +2435,10 @@ class MlpTrainingStudio(QMainWindow):
             self._baseline_val_losses = [float(entry["val_loss"]) for entry in history if "val_loss" in entry]
             self.baseline_train_curve.setData(self._baseline_epochs, self._baseline_train_losses)
             self.baseline_val_curve.setData(self._baseline_epochs, self._baseline_val_losses)
-        channel_labels = summary.get("channel_mae_with_units")
-        if channel_labels:
-            self.metric_cards["average_mae"].set_value(" | ".join(channel_labels))
-        else:
-            average_mae = summary.get("average_evaluation_mae", summary.get("average_test_mae"))
-            if average_mae is not None:
-                self.metric_cards["average_mae"].set_value(f"{float(average_mae):.6f}")
+        # Show a single MAE averaged over all ground-truth channels (no per-channel split).
+        average_mae = summary.get("average_evaluation_mae", summary.get("average_test_mae"))
+        if average_mae is not None:
+            self.metric_cards["average_mae"].set_value(f"{float(average_mae):.6f}")
         best_val_loss = summary.get("best_val_loss")
         if best_val_loss is not None:
             self.metric_cards["best_metric"].set_value(f"Best val {float(best_val_loss):.6f}")
@@ -2584,7 +2584,7 @@ class MlpTrainingStudio(QMainWindow):
         self.run_log_text_edit.verticalScrollBar().setValue(self.run_log_text_edit.verticalScrollBar().maximum())
 
     def _show_warning(self, text: str) -> None:
-        QMessageBox.warning(self, "Surrogate Model Traning Suite", text)
+        QMessageBox.warning(self, "Surrogate Model Training Suite", text)
 
     def _format_seconds(self, value: Any) -> str:
         if value in (None, "", "-"):

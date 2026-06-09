@@ -205,6 +205,10 @@ def test_window_baseline_training_progress_updates_live_metrics_and_plots(
             event="evaluation_completed",
             phase="baseline",
             average_evaluation_mae=0.05,
+            # Per-channel values are still emitted, but the card must ignore them and
+            # show only the single average over all ground-truth channels.
+            per_channel_mae=[0.06, 0.04],
+            channel_mae_with_units=["gain: 0.0600 dB", "phase: 0.0400 deg"],
             frequency_ghz=[2.0, 3.0, 4.0],
             frequency_mae=[0.05, 0.04, 0.03],
             message="Baseline evaluation complete.",
@@ -220,6 +224,7 @@ def test_window_baseline_training_progress_updates_live_metrics_and_plots(
                 ],
                 "best_val_loss": 0.12,
                 "average_evaluation_mae": 0.05,
+                "channel_mae_with_units": ["gain: 0.0600 dB", "phase: 0.0400 deg"],
                 "runtime_seconds": 2.0,
             },
             "transfer": None,
@@ -231,8 +236,12 @@ def test_window_baseline_training_progress_updates_live_metrics_and_plots(
     assert gui_window.last_workflow_summary["status"] == "ok"
     assert gui_window.run_state_badge.text() == "Completed"
     assert gui_window._baseline_epochs == [1, 2]
+    # The card shows the single MAE averaged over all channels, not the per-channel
+    # breakdown that was also emitted (in both the live event and the summary).
     assert gui_window.metric_cards["average_mae"].value_label.text() == "0.050000"
     assert gui_window.last_baseline_summary["run_dir"].endswith("baseline_run")
+    # Elapsed shows the real runtime (runtime_seconds=2.0) once baseline training completes.
+    assert gui_window.metric_cards["elapsed"].value_label.text() == "2s"
 
 
 def test_window_transfer_training_standalone_reports_per_channel_mae(
@@ -294,6 +303,8 @@ def test_window_transfer_training_standalone_reports_per_channel_mae(
     assert gui_window._transfer_iteration_mae_x == [1]
     # Gain and phase are tracked separately for the per-channel transfer plot.
     assert gui_window._transfer_channel_mae == {"gain": [0.03], "phase": [0.02]}
+    # The card itself shows the single MAE averaged over all channels (not per-channel).
+    assert gui_window.metric_cards["average_mae"].value_label.text() == "0.025000"
     assert gui_window.metric_cards["elapsed"].value_label.text() == "9s"
     assert gui_window.metric_cards["eta"].value_label.text() == "0s"
 
@@ -308,7 +319,7 @@ def _write_minimal_baseline_checkpoint(run_dir: Path) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     n_features, channels, freqs, width, depth = 4, 2, 8, 16, 3
     model = build_model(
-        "CTLE_MLP",
+        "SpectraHydra",
         num_frequencies=freqs,
         input_feature_dim=n_features,
         ground_truth_channels=channels,
@@ -318,7 +329,7 @@ def _write_minimal_baseline_checkpoint(run_dir: Path) -> None:
     torch.save(
         {
             "model_state": model.state_dict(),
-            "config": {"model_type": "CTLE_MLP", "width": width, "depth": depth, "cache_path": ""},
+            "config": {"model_type": "SpectraHydra", "width": width, "depth": depth, "cache_path": ""},
             "active_input_feature_names": [f"f{i}" for i in range(n_features)],
             "target_channel_names": ["gain", "phase"],
             "input_feature_mean": np.zeros(n_features, dtype=np.float32),

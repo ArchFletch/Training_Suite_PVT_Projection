@@ -356,14 +356,14 @@ def _capacity_tier(sample_to_ground_truth_rank_ratio: float) -> str:
     return "aggressive"
 
 
-def _estimate_flatmlp_params(
+def _estimate_spectranet_params(
     input_dim: int, channels: int, frequency_point_count: int, width: int, depth: int
 ) -> int:
-    # Parameter count of the default FlatMLP (an MLP from input features straight to the
-    # flattened channels*frequency output). Used purely as a model-size proxy for the
-    # overfit-risk and confidence estimates. NOTE: a CTLE_MLP has ~2-5x more parameters
-    # (its encoder expands to 4*width at the midpoint), so for that model this understates
-    # the parameter count and therefore the overfit risk.
+    # Parameter count of the default SpectraNet (a dense network from input features
+    # straight to the flattened channels*frequency output). Used purely as a model-size
+    # proxy for the overfit-risk and confidence estimates. NOTE: a SpectraHydra has
+    # ~2-5x more parameters (its encoder expands to 4*width at the midpoint), so for that
+    # model this understates the parameter count and therefore the overfit risk.
     out_dim = max(channels * frequency_point_count, 1)
     if depth <= 1:
         return input_dim * out_dim + out_dim
@@ -373,10 +373,10 @@ def _estimate_flatmlp_params(
     return int(params)
 
 
-def _estimate_ctle_mlp_params(
+def _estimate_spectrahydra_params(
     input_dim: int, channels: int, frequency_point_count: int, width: int, depth: int
 ) -> int:
-    # Parameter count of the CTLE_MLP: a Linear->LayerNorm->GELU encoder whose hidden
+    # Parameter count of the SpectraHydra: a Linear->LayerNorm->GELU encoder whose hidden
     # sizes follow the same expand-then-contract schedule the model uses, plus one
     # Linear output head per channel. Mirrors xfmr_v2.model so the size proxy is honest
     # for this (much larger) architecture.
@@ -398,9 +398,9 @@ def _estimate_params(
 ) -> int:
     # Dispatch to the right size proxy so the overfit/confidence estimates reflect the
     # architecture the heuristic actually recommends.
-    if model_type == "CTLE_MLP":
-        return _estimate_ctle_mlp_params(input_dim, channels, frequency_point_count, width, depth)
-    return _estimate_flatmlp_params(input_dim, channels, frequency_point_count, width, depth)
+    if model_type == "SpectraHydra":
+        return _estimate_spectrahydra_params(input_dim, channels, frequency_point_count, width, depth)
+    return _estimate_spectranet_params(input_dim, channels, frequency_point_count, width, depth)
 
 
 def _overfit_risk_from_signal(signal_per_param: float) -> str:
@@ -481,17 +481,17 @@ def _suggest_baseline(
     else:
         depth = 4
 
-    # Architecture choice. The shared-encoder CTLE_MLP (Linear->LayerNorm->GELU blocks
+    # Architecture choice. The shared-encoder SpectraHydra (Linear->LayerNorm->GELU blocks
     # that expand to 4x width at the midpoint, then contract, with one output head per
-    # channel) is substantially more accurate than the flat MLP whenever there is enough
-    # data to support it. The flat MLP is reserved for data-starved (conservative) cases
-    # where the larger model would mostly add overfitting risk.
+    # channel) is substantially more accurate than the flat SpectraNet whenever there is
+    # enough data to support it. SpectraNet is reserved for data-starved (conservative)
+    # cases where the larger model would mostly add overfitting risk.
     if capacity_tier == "conservative":
-        model_type = "FlatMLP"
+        model_type = "SpectraNet"
         loss_function = "rmse"
         scheduler = "plateau"
     else:
-        model_type = "CTLE_MLP"
+        model_type = "SpectraHydra"
         depth = 5  # yields the validated [w, 2w, 4w, 2w, w] encoder
         loss_function = "mse"
         scheduler = "cosine"
@@ -511,7 +511,7 @@ def _suggest_baseline(
     signal_per_param = (train_count * ground_truth_channels * frequency_point_count) / max(param_count, 1)
     overfit_risk = _overfit_risk_from_signal(signal_per_param)
 
-    if model_type == "CTLE_MLP":
+    if model_type == "SpectraHydra":
         # Notebook-validated AdamW recipe for the shared-encoder model (with cosine LR).
         learning_rate = 1e-3
         weight_decay = 1e-4
@@ -546,7 +546,7 @@ def _suggest_baseline(
         epochs = 300
     else:
         epochs = 200
-    if model_type == "CTLE_MLP":
+    if model_type == "SpectraHydra":
         # The larger encoder under a cosine schedule needs a longer budget to converge;
         # with early stopping removed, the validated recipe trains the full 500 epochs.
         epochs = max(epochs, 500)
@@ -590,20 +590,20 @@ def _suggest_baseline(
     }
     rationale = {
         "model_type": (
-            f"{model_type} chosen for {capacity_tier} capacity: the shared-encoder CTLE_MLP "
+            f"{model_type} chosen for {capacity_tier} capacity: the shared-encoder SpectraHydra "
             "(with MSE loss + cosine LR) is used whenever the data supports it, and the flat "
-            "MLP only for data-starved cases."
+            "SpectraNet only for data-starved cases."
         ),
         "width": f"Width is anchored to the ground-truth effective rank ({ground_truth_rank}) and adjusted for {capacity_tier} capacity with {spectral_tier} spectral complexity.",
         "depth": (
-            f"Depth {depth} gives the validated expand-then-contract CTLE encoder."
-            if model_type == "CTLE_MLP"
+            f"Depth {depth} gives the validated expand-then-contract SpectraHydra encoder."
+            if model_type == "SpectraHydra"
             else f"Depth {depth} balances train-set size {train_count} with {spectral_tier} spectral complexity."
         ),
         "batch_size": _batch_rationale(batch_size, gpu_info, width, frequency_point_count),
         "learning_rate": (
-            f"Learning rate {learning_rate:.1e} is the notebook-validated AdamW rate for the CTLE_MLP encoder."
-            if model_type == "CTLE_MLP"
+            f"Learning rate {learning_rate:.1e} is the notebook-validated AdamW rate for the SpectraHydra encoder."
+            if model_type == "SpectraHydra"
             else f"Learning rate {learning_rate:.1e} is a safe AdamW default; it cannot be inferred from a static scan, so refine it with a quick search."
         ),
         "weight_decay": f"Weight decay {weight_decay:.1e} reflects a {overfit_risk} overfit estimate ({signal_per_param:.1f} supervised values per parameter).",

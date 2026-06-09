@@ -213,7 +213,7 @@ def export_checkpoint_to_onnx(
     log10_mask = [t == "log10" for t in transforms]
 
     model = build_model(
-        config.get("model_type", "FlatMLP"),
+        config.get("model_type", "SpectraNet"),
         num_frequencies=num_frequencies,
         input_feature_dim=len(active_names),
         ground_truth_channels=num_channels,
@@ -242,7 +242,7 @@ def export_checkpoint_to_onnx(
     )
 
     sidecar = {
-        "model_type": config.get("model_type", "FlatMLP"),
+        "model_type": config.get("model_type", "SpectraNet"),
         "input_feature_names": active_names,
         "channel_names": channel_names,
         "channel_units": axis_meta["channel_units"],
@@ -294,7 +294,7 @@ def export_transfer_to_onnx(
 
     if "target_mean" in bundle and baseline_checkpoint is None:
         # Standalone transfer run: normalization + metadata are embedded in the bundle.
-        model_type = bundle.get("model_type", "FlatMLP")
+        model_type = bundle.get("model_type", "SpectraNet")
         active_names = list(bundle["active_input_feature_names"])
         channel_names = list(bundle["target_channel_names"])
         input_mean = np.asarray(bundle["input_feature_mean"], dtype=np.float32)
@@ -319,7 +319,7 @@ def export_transfer_to_onnx(
         baseline_checkpoint = Path(baseline_checkpoint)
         base = torch.load(baseline_checkpoint, map_location="cpu", weights_only=False)
         config = base["config"]
-        model_type = config.get("model_type", "FlatMLP")
+        model_type = config.get("model_type", "SpectraNet")
         active_names = list(_get(base, "active_input_feature_names", "active_feature_names"))
         channel_names = list(base["target_channel_names"])
         input_mean = np.asarray(_get(base, "input_feature_mean", "input_mean"), dtype=np.float32)

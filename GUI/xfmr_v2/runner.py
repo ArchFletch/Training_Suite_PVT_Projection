@@ -27,7 +27,7 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from .data import CACHE_PATH, DATA_ROOT, ensure_cache, load_split_bundle, normalize_frequency, split_indices
-from .model import CTLEMultiTaskMLP, FlatMLPNet
+from .model import SpectraHydra, SpectraNet
 from .progress import ProgressCallback, RunCancelled, StopChecker, emit_progress, request_stop
 
 
@@ -57,7 +57,7 @@ class TrainConfig:
     val_frac: float = 0.1
 
     # Model architecture settings.
-    model_type: str = "FlatMLP"  # "FlatMLP" or "CTLE_MLP"
+    model_type: str = "SpectraNet"  # "SpectraNet" or "SpectraHydra"
     width: int = 512
     depth: int = 5
 
@@ -85,7 +85,7 @@ class TransferConfig:
 
     cache_path: str = str(CACHE_PATH)
     output_dir: str = "artifacts/runs/self_transfer_v2"
-    model_type: str = "FlatMLP"
+    model_type: str = "SpectraNet"
     width: int = 512
     depth: int = 5
     seed: int = 42
@@ -103,7 +103,20 @@ class TransferConfig:
     device: str | None = None
 
 
-MODEL_TYPES = ("FlatMLP", "CTLE_MLP")
+MODEL_TYPES = ("SpectraNet", "SpectraHydra")
+
+# Back-compat: runs saved under the old model-type names still load. Map the legacy
+# string to its current equivalent so old checkpoints, configs, and saved GUI forms
+# keep working after the rename.
+_MODEL_TYPE_ALIASES = {
+    "FlatMLP": "SpectraNet",
+    "CTLE_MLP": "SpectraHydra",
+}
+
+
+def canonical_model_type(model_type: str) -> str:
+    """Normalize a (possibly legacy) model-type string to its current name."""
+    return _MODEL_TYPE_ALIASES.get(model_type, model_type)
 
 # LR-reduction patience for the "plateau" scheduler. Training no longer early-stops,
 # so this only controls when ReduceLROnPlateau lowers the learning rate.
@@ -133,11 +146,16 @@ def resolve_device(spec: str | None) -> torch.device:
 
 
 def build_model(model_type: str, *, num_frequencies: int, **kwargs: Any) -> nn.Module:
-    """Instantiate a model by name, forwarding architecture kwargs."""
-    if model_type == "FlatMLP":
-        return FlatMLPNet(num_frequencies=num_frequencies, **kwargs)
-    if model_type == "CTLE_MLP":
-        return CTLEMultiTaskMLP(num_frequencies=num_frequencies, **kwargs)
+    """Instantiate a model by name, forwarding architecture kwargs.
+
+    Legacy model-type names (e.g. saved before the rename) are accepted and
+    normalized via :func:`canonical_model_type`.
+    """
+    model_type = canonical_model_type(model_type)
+    if model_type == "SpectraNet":
+        return SpectraNet(num_frequencies=num_frequencies, **kwargs)
+    if model_type == "SpectraHydra":
+        return SpectraHydra(num_frequencies=num_frequencies, **kwargs)
     raise ValueError(f"Unknown model_type {model_type!r}. Choose from {MODEL_TYPES}.")
 
 
@@ -1180,7 +1198,7 @@ def _train_band(
     should_stop: StopChecker | None = None,
     event_context: dict[str, Any] | None = None,
     run_start_time: float | None = None,
-    model_type: str = "FlatMLP",
+    model_type: str = "SpectraNet",
     num_frequencies: int = 0,
 ) -> dict[str, torch.Tensor]:
     # Each band trains a model instance. When ``init_state`` is given the model starts
