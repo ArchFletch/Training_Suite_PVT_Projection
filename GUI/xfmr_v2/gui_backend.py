@@ -1,4 +1,4 @@
-"""GUI-facing backend helpers for the Surrogate Model Traning Suite.
+"""GUI-facing backend helpers for the Surrogate Model Training Suite.
 
 This module keeps the PySide window code focused on presentation and user
 interaction. It wraps the existing training/search/suggestion pipeline with a
@@ -163,21 +163,23 @@ def build_and_scan_dataset(
 ) -> dict[str, Any]:
     """Build a cache from the chosen dataset folder (if needed), then scan it.
 
-    Builds the cache from the dataset README schema via ``build_cache_from_dataset``
-    when no cache exists yet (or when ``overwrite`` is set), then loads and summarizes
-    it for the GUI. This is the folder -> cache -> preview entry point.
+    Builds the cache via ``build_cache_from_dataset`` (format auto-detected from the
+    folder contents) when no cache exists yet (or when ``overwrite`` is set), then
+    loads and summarizes it for the GUI. This is the folder -> cache -> preview
+    entry point.
     """
     build_root = dataset_root or ground_truth_data_dir or (
         str(Path(input_feature_path).parent) if input_feature_path else ""
     )
     if overwrite or not Path(cache_path).is_file():
         if not build_root:
-            raise ValueError("Select a dataset folder (containing a README schema) to build the cache.")
+            raise ValueError("Select a dataset folder so the cache can be built.")
         build_cache_from_dataset(
             build_root,
             cache_path,
             max_samples=max_samples,
             progress_callback=progress_callback,
+            should_stop=should_stop,
         )
 
     return scan_dataset(
@@ -412,15 +414,22 @@ def _gui_search_progress_filter(progress_callback):
 
 
 def _should_forward_search_progress(payload: dict[str, Any]) -> bool:
-    if payload.get("phase") != "baseline" or payload.get("trial_index") is None:
+    # emit_progress (runner/search) nests per-run fields under "data" (see
+    # ProgressEvent.to_dict), while scan callbacks emit them flat — accept both.
+    data = payload.get("data") or {}
+
+    def field(key: str) -> Any:
+        return data.get(key, payload.get(key))
+
+    if payload.get("phase") != "baseline" or field("trial_index") is None:
         return True
     event = payload.get("event")
     if event == "checkpoint_updated":
         return False
     if event != "epoch_end":
         return True
-    epoch = int(payload.get("epoch", 0) or 0)
-    total_epochs = int(payload.get("total_epochs", 0) or 0)
+    epoch = int(field("epoch") or 0)
+    total_epochs = int(field("total_epochs") or 0)
     return epoch <= 1 or epoch == total_epochs or epoch % 5 == 0
 
 

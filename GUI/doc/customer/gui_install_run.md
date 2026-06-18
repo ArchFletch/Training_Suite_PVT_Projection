@@ -1,25 +1,25 @@
 # GUI Install And Run Notes
 
 These notes describe how the packaged desktop app for
-`Surrogate Model Traning Suite` is expected to be installed and where it stores
+`Surrogate Model Training Suite` is expected to be installed and where it stores
 user-writable state.
 
 ## Windows
 
 1. Run the provided Windows installer.
 2. Accept the default per-user install location:
-   `%LOCALAPPDATA%\Programs\Surrogate Model Traning Suite\`
-3. Launch `Surrogate Model Traning Suite` from the Start menu or desktop shortcut.
+   `%LOCALAPPDATA%\Programs\Surrogate Model Training Suite\`
+3. Launch `Surrogate Model Training Suite` from the Start menu or desktop shortcut.
 
 The Windows GUI install is intended for a normal design-engineer user account
 and should not require administrator rights.
 
 ### Windows User Data Locations
 
-- license server settings: `%APPDATA%\Surrogate Model Traning Suite\license_client.json`
-- last GUI session: `%LOCALAPPDATA%\Surrogate Model Traning Suite\last_session.json`
-- logs: `%LOCALAPPDATA%\Surrogate Model Traning Suite\logs\`
-- default outputs and auto-managed cache: `%USERPROFILE%\Documents\Surrogate Model Traning Suite\Runs\`
+- license server settings: `%APPDATA%\Surrogate Model Training Suite\license_client.json`
+- last GUI session: `%LOCALAPPDATA%\Surrogate Model Training Suite\last_session.json`
+- logs: `%LOCALAPPDATA%\Surrogate Model Training Suite\logs\`
+- default outputs and auto-managed cache: `%USERPROFILE%\Documents\Surrogate Model Training Suite\Runs\`
 
 ### Silent Install And Uninstall
 
@@ -30,7 +30,7 @@ Representative examples:
 
 ```powershell
 SurrogateModelTrainingSuite-Windows.exe /VERYSILENT /NORESTART
-%LOCALAPPDATA%\Programs\Surrogate Model Traning Suite\unins000.exe /VERYSILENT /NORESTART
+%LOCALAPPDATA%\Programs\Surrogate Model Training Suite\unins000.exe /VERYSILENT /NORESTART
 ```
 
 ## Linux
@@ -48,7 +48,7 @@ Writable files are not stored in the extracted bundle directory.
 
 - license server settings: `~/.config/mlp-training-studio/license_client.json`
 - last GUI session: `~/.local/state/mlp-training-studio/last_session.json`
-- default outputs and auto-managed cache: `~/Documents/Surrogate Model Traning Suite/runs/`
+- default outputs and auto-managed cache: `~/Documents/Surrogate Model Training Suite/runs/`
 
 ## License Server Settings
 

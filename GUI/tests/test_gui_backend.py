@@ -109,6 +109,10 @@ def test_run_search_filters_noisy_trial_progress(monkeypatch: pytest.MonkeyPatch
             {"phase": "baseline", "event": "epoch_end", "trial_index": 2, "trial_count": 6, "trial_label": "larger_model", "epoch": 2, "total_epochs": 10},
             {"phase": "baseline", "event": "epoch_end", "trial_index": 2, "trial_count": 6, "trial_label": "larger_model", "epoch": 5, "total_epochs": 10},
             {"phase": "baseline", "event": "epoch_end", "trial_index": 2, "trial_count": 6, "trial_label": "larger_model", "epoch": 10, "total_epochs": 10},
+            # Real runner events nest the per-run fields under "data" (emit_progress);
+            # the filter must throttle that shape too.
+            {"phase": "baseline", "event": "checkpoint_updated", "data": {"trial_index": 2, "epoch": 3}},
+            {"phase": "baseline", "event": "epoch_end", "data": {"trial_index": 2, "epoch": 3, "total_epochs": 10}},
             {"phase": "search", "event": "trial_completed", "trial_index": 2, "trial_count": 6, "trial_label": "larger_model"},
         ]:
             if progress_callback is not None:

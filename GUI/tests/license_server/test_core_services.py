@@ -85,7 +85,7 @@ def _make_signed_license(
 
 def _checkout_request(machine_id: str, hostname: str) -> CheckoutRequest:
     return CheckoutRequest(
-        product="Surrogate Model Traning Suite",
+        product="Surrogate Model Training Suite",
         product_version="0.1.0",
         machine_id=machine_id,
         hostname=hostname,

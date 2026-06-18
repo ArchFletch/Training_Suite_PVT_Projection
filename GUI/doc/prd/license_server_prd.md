@@ -2,7 +2,7 @@
 
 ## Product
 
-On-prem floating license server for `Surrogate Model Traning Suite`.
+On-prem floating license server for `Surrogate Model Training Suite`.
 
 ## Goal
 

@@ -2,7 +2,7 @@
 
 ## Purpose
 
-High-level architecture for `Surrogate Model Traning Suite`.
+High-level architecture for `Surrogate Model Training Suite`.
 
 ## Product Components
 

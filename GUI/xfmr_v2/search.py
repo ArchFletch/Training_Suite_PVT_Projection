@@ -516,7 +516,8 @@ def _score_trials(trials: list[dict[str, Any]], objective: str) -> tuple[list[di
         else:
             # "Fastest acceptable" prefers short runtime, but penalizes trials whose
             # validation MAE drifts too far above the best observed accuracy.
-            penalty = max(0.0, trial["average_val_mae"] / acceptable_mae - 1.0)
+            # Guard the degenerate perfect-trial case (best MAE of exactly 0).
+            penalty = max(0.0, trial["average_val_mae"] / acceptable_mae - 1.0) if acceptable_mae > 0 else 0.0
             score = 0.70 * runtime_norm[index] + 0.20 * mae_norm[index] + 0.10 * loss_norm[index] + 2.0 * penalty
         enriched = dict(trial)
         enriched["score"] = float(score)

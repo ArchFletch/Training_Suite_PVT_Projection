@@ -12,6 +12,7 @@ the full training flow can be read top-to-bottom in one place.
 from __future__ import annotations
 
 import json
+import math
 import random
 import shutil
 import subprocess
@@ -141,7 +142,12 @@ def resolve_device(spec: str | None) -> torch.device:
     else:
         device = torch.device(spec)
     if device.type == "cuda" and device.index is not None:
-        torch.cuda.set_device(device)
+        if device.index >= torch.cuda.device_count():
+            # A persisted selection like "cuda:1" after moving to a one-GPU
+            # machine would otherwise raise "invalid device ordinal".
+            device = torch.device("cuda")
+        else:
+            torch.cuda.set_device(device)
     return device
 
 
@@ -250,6 +256,7 @@ def run_baseline_trial(
             max_samples=config.max_samples,
             input_feature_path=config.input_feature_path,
             ground_truth_data_dir=config.ground_truth_data_dir,
+            should_stop=should_stop,
         )
         emit_progress(
             progress_callback,
@@ -354,7 +361,9 @@ def run_baseline_trial(
             history.append({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss})
             if show_progress:
                 print(f"epoch={epoch:03d} train_loss={train_loss:.6f} val_loss={val_loss:.6f}")
-            improved = best_state is None or val_loss < best_val
+            # A NaN best_val (e.g. an AMP loss spike at epoch 1) must not pin the
+            # checkpoint forever: every later `x < nan` comparison is False.
+            improved = best_state is None or math.isnan(best_val) or val_loss < best_val
             if improved:
                 # Clone the state dict so later optimizer steps cannot mutate the stored
                 # "best so far" checkpoint in place.
@@ -416,6 +425,7 @@ def run_baseline_trial(
             target_mean=bundle.target_mean,
             target_std=bundle.target_std,
             channel_transforms=bundle.channel_transforms,
+            loss_fn=loss_fn,
         )
         # Build per-channel MAE strings with units for display.
         # Only show per-channel breakdown when channel_units are defined (e.g. CTLE
@@ -696,6 +706,7 @@ def run_self_transfer(
                 if "channel_units" in data
                 else [""] * targets.shape[1]
             )
+            sweep_label = str(data["sweep_label"]) if "sweep_label" in data else "Frequency (GHz)"
 
         split = split_indices(len(features), config.train_frac, config.val_frac, config.seed)
         # Drop constant input features using the training split only (matches baseline).
@@ -720,7 +731,10 @@ def run_self_transfer(
             ch_global_std = float(train_y[:, ch, :].std())
             floor = max(ch_global_std * 0.01, 1e-30)
             target_std[ch][target_std[ch] < floor] = floor
-        freq_ghz = frequency_hz / 1.0e9
+        # Match load_split_bundle: only a frequency sweep axis is stored in Hz and
+        # displayed in GHz; other sweep axes (e.g. a CTLE VDIFF sweep) are used as-is.
+        is_frequency = "freq" in sweep_label.lower()
+        freq_ghz = (frequency_hz / 1.0e9) if is_frequency else frequency_hz
         freq_norm = normalize_frequency(freq_ghz)
         original_frequency_count = int(len(freq_norm))
         bands = _band_indices(original_frequency_count, config.num_bands)
@@ -1084,6 +1098,7 @@ def _eval_metrics(
     target_mean: np.ndarray | None = None,
     target_std: np.ndarray | None = None,
     channel_transforms: list[str] | None = None,
+    loss_fn=frequency_rmse,
 ) -> tuple[float, float, list[float], list[float]]:
     """Evaluate and return (loss, avg_mae, freq_mae, per_channel_mae).
 
@@ -1097,7 +1112,7 @@ def _eval_metrics(
     model.eval()
     preds: list[torch.Tensor] = []
     trues: list[torch.Tensor] = []
-    loss = _eval_loss(model, loader, freq, device, amp, should_stop=should_stop)
+    loss = _eval_loss(model, loader, freq, device, amp, should_stop=should_stop, loss_fn=loss_fn)
     with torch.no_grad():
         for x, y in loader:
             request_stop(should_stop)
@@ -1106,6 +1121,8 @@ def _eval_metrics(
                 pred = model(x, freq)
             preds.append(pred.cpu())
             trues.append(y)
+    if not preds:
+        raise ValueError("Evaluation split is empty; cannot compute metrics.")
     pred_all = torch.cat(preds, dim=0).numpy()
     true_all = torch.cat(trues, dim=0).numpy()
     # Denormalize predictions and targets to compute MAE in original units.
@@ -1369,9 +1386,17 @@ def open_in_vscode(paths: list[str | Path]) -> bool:
 
 def make_run_dir(root: str | Path) -> Path:
     """Create one timestamped artifact folder."""
-    path = Path(root) / datetime.now().strftime("%Y%m%d-%H%M%S")
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    # Timestamps have second resolution; suffix on collision so two runs started
+    # within the same second cannot share (and overwrite) one artifact folder.
+    for attempt in range(1000):
+        path = Path(root) / (stamp if attempt == 0 else f"{stamp}-{attempt + 1}")
+        try:
+            path.mkdir(parents=True, exist_ok=False)
+            return path
+        except FileExistsError:
+            continue
+    raise FileExistsError(f"Could not create a unique run directory under {root}.")
 
 
 #

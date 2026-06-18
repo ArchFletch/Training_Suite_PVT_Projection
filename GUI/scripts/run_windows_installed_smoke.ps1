@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$ServerBundleRoot = "$env:ProgramFiles\MLP License Server",
-    [string]$GuiExecutablePath = "$env:LOCALAPPDATA\Programs\Surrogate Model Traning Suite\SurrogateModelTrainingSuite.exe",
+    [string]$GuiExecutablePath = "$env:LOCALAPPDATA\Programs\Surrogate Model Training Suite\SurrogateModelTrainingSuite.exe",
     [string]$SmokeRoot = "",
     [string]$LicensePython = "",
     [string]$ServerHost = "127.0.0.1",

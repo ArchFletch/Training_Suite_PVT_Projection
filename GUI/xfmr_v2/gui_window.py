@@ -1323,7 +1323,10 @@ class MlpTrainingStudio(QMainWindow):
         self.run_state_badge.set_status("Error")
         if self.current_task_name == "scan":
             self.dataset_schema_status_badge.set_status("Error")
-            pass
+        elif self.current_task_name == "suggest":
+            # Don't leave the confidence badge frozen at "Checking".
+            self.initial_suggestion_confidence_badge.set_status("Error")
+            self.initial_suggestion_status_text.setText("Suggestion failed; see the log for details.")
         self.append_log(f"Error: {message}")
         self._show_warning(f"{message}\n\n{traceback_text}")
 
@@ -1400,6 +1403,11 @@ class MlpTrainingStudio(QMainWindow):
             self._update_transfer_progress(payload)
 
     def _on_scan_completed(self, result: dict[str, Any]) -> None:
+        if result.get("status") == "stopped":
+            self.dataset_schema_status_badge.set_status("Not Scanned")
+            self.run_state_badge.set_status("Stopped")
+            self.append_log("Dataset scan stopped before completion.")
+            return
         self.last_scan_result = result
         self._sweep_label = result.get("sweep_label", "Frequency (GHz)")
         self.dataset_schema_status_badge.set_status(result.get("schema_status", "Valid"))
@@ -1413,6 +1421,12 @@ class MlpTrainingStudio(QMainWindow):
         self.run_state_badge.set_status("Completed")
 
     def _on_suggest_completed(self, result: dict[str, Any]) -> None:
+        if result.get("status") == "stopped":
+            self.initial_suggestion_confidence_badge.set_status("Stopped")
+            self.initial_suggestion_status_text.setText("Suggestion stopped before completion.")
+            self.run_state_badge.set_status("Stopped")
+            self.append_log("Initial settings suggestion stopped before completion.")
+            return
         self.last_suggest_result = result
         self.initial_suggestion_confidence_badge.set_status(result["confidence"].title())
         self.initial_suggestion_status_text.setText(result["confidence_reason"])
@@ -1429,6 +1443,10 @@ class MlpTrainingStudio(QMainWindow):
     def _on_search_completed(self, result: dict[str, Any]) -> None:
         if not hasattr(self, "search_results_table"):
             self.append_log("Quick search results are not shown because quick search has been removed from the GUI.")
+            return
+        if result.get("status") == "stopped":
+            self.run_state_badge.set_status("Stopped")
+            self.append_log("Quick search stopped before completion.")
             return
         self.last_search_result = result
         self.search_row_configs = [trial["recommended_full_config"] for trial in result["trial_results"]]
@@ -2606,7 +2624,12 @@ class MlpTrainingStudio(QMainWindow):
         if self.current_task is not None and self.current_task.thread is not None and self.current_task.thread.isRunning():
             self.current_task.stop()
             self.current_task.thread.quit()
-            self.current_task.thread.wait(3000)
+            # Workers poll should_stop between batches/samples, so give them time
+            # to unwind. Destroying a QThread that is still running aborts the
+            # whole process, so fall back to terminate() as the lesser evil.
+            if not self.current_task.thread.wait(10000):
+                self.current_task.thread.terminate()
+                self.current_task.thread.wait(2000)
         self.license_controller.shutdown()
         super().closeEvent(event)
 

@@ -2,7 +2,7 @@
 
 ## Product
 
-Core modeling workflow for `Surrogate Model Traning Suite`.
+Core modeling workflow for `Surrogate Model Training Suite`.
 
 ## Goal
 

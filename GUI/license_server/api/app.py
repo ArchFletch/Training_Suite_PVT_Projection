@@ -23,7 +23,7 @@ def create_app(
     app = FastAPI(
         title="MLP License Server",
         version="0.1.0",
-        description="On-prem floating license server for Surrogate Model Traning Suite.",
+        description="On-prem floating license server for Surrogate Model Training Suite.",
     )
     app.state.runtime = service_runtime
     app.include_router(client_router)

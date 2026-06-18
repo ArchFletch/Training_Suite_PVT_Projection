@@ -17,6 +17,8 @@ from typing import Any, Callable
 
 from PySide6.QtCore import QObject, QMetaObject, QThread, Qt, Signal, Slot
 
+from .progress import RunCancelled
+
 
 TaskFunction = Callable[..., Any]
 ProgressHandler = Callable[[dict[str, Any]], None]
@@ -68,6 +70,10 @@ class _TaskRunner(QObject):
                 progress_callback=self.signals.progress.emit,
                 should_stop=self._stop_event.is_set,
             )
+        except RunCancelled:
+            # A user-requested stop is a normal outcome, not an error: report it
+            # the same way runner-level stops are reported.
+            self.signals.result.emit({"status": "stopped"})
         except Exception as exc:  # pragma: no cover - exercised through GUI tests indirectly
             self.signals.error.emit(str(exc), traceback.format_exc())
         else:
@@ -137,6 +143,8 @@ class ImmediateTaskExecutor:
                 progress_callback=on_progress,
                 should_stop=stop_event.is_set,
             )
+        except RunCancelled:
+            on_result({"status": "stopped"})
         except Exception as exc:  # pragma: no cover - intentionally mirrors production code
             on_error(str(exc), traceback.format_exc())
         else:

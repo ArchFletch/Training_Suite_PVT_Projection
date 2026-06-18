@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Version=1.0
-Name=Surrogate Model Traning Suite
+Name=Surrogate Model Training Suite
 Comment=README-driven baseline training and self-transfer workflow
 Exec=__INSTALL_ROOT__/bin/mlp-training-studio
 Terminal=false

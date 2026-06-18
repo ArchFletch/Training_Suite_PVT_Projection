@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$ServerUrl = "http://mlp-license-01:27850",
-    [string]$ConfigPath = "$env:APPDATA\Surrogate Model Traning Suite\license_client.json"
+    [string]$ConfigPath = "$env:APPDATA\Surrogate Model Training Suite\license_client.json"
 )
 
 Set-StrictMode -Version Latest

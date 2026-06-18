@@ -1,4 +1,4 @@
-"""GUI interaction tests for the Surrogate Model Traning Suite."""
+"""GUI interaction tests for the Surrogate Model Training Suite."""
 
 from __future__ import annotations
 
@@ -64,10 +64,9 @@ def test_window_scan_and_suggest_populate_preview_and_forms(
 
     gui_window.scan_dataset()
     assert gui_window.dataset_schema_status_badge.text() == "Valid"
-    assert gui_window.detected_dataset_readme_value.text().endswith("README.md")
     assert gui_window.data_preview_table.rowCount() >= 10
-    assert gui_window.scan_data_button.text() == "Scan Data"
-    assert "[Scan] Loaded ground-truth sample" in gui_window.run_log_text_edit.toPlainText()
+    assert gui_window.scan_dataset_button.text() == "Scan Dataset"
+    assert "[Scan] Dataset scan completed" in gui_window.run_log_text_edit.toPlainText()
     assert gui_window.metric_cards["current_phase"].value_label.text() == "Scan"
 
     gui_window.run_suggest_initial_settings()
@@ -94,11 +93,13 @@ def test_window_exposes_separate_baseline_and_transfer_actions(gui_window) -> No
     assert [gui_window.monitor_tabs.tabText(index) for index in range(gui_window.monitor_tabs.count())] == [
         "Baseline Monitor",
         "Transfer Results",
+        "Test Samples",
     ]
     transfer_tab = gui_window.monitor_tabs.widget(1)
     assert transfer_tab.layout().count() == 1
     assert not hasattr(gui_window, "transfer_training_loss_plot")
-    assert not hasattr(gui_window, "transfer_average_mae_plot")
+    # The average-MAE-per-iteration plot was reintroduced with the avg-MAE display.
+    assert hasattr(gui_window, "transfer_average_mae_plot")
     assert not hasattr(gui_window, "transfer_band_mae_plot")
 
 

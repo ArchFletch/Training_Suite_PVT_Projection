@@ -2,7 +2,7 @@
 
 ## Product
 
-Desktop GUI for `Surrogate Model Traning Suite`.
+Desktop GUI for `Surrogate Model Training Suite`.
 
 ## Goal
 
@@ -42,7 +42,7 @@ validation, licensing state, and scientific outputs they care about.
 
 ## Main Window
 
-- window title: `Surrogate Model Traning Suite`
+- window title: `Surrogate Model Training Suite`
 - minimum size: `1280 x 800`
 - preferred working size: about `1440 x 900`
 - layout: configuration on the left, monitoring on the right
@@ -83,7 +83,7 @@ Ordered sections:
 
 ### Workflow A: Licensed Baseline Training
 
-1. User launches `Surrogate Model Traning Suite`.
+1. User launches `Surrogate Model Training Suite`.
 2. If a server URL is configured, the GUI tests connectivity and attempts startup checkout.
 3. The GUI auto-detects available compute devices; the user picks the `Training Device` (e.g. `cuda:0`, `cuda:1`, `cpu`).
 4. User selects input-feature file, ground-truth folder, and output folder.

@@ -66,6 +66,7 @@ def suggest_initial_settings(
         max_samples=config.max_samples,
         input_feature_path=config.input_feature_path,
         ground_truth_data_dir=config.ground_truth_data_dir,
+        should_stop=should_stop,
     )
     emit_progress(
         progress_callback,
@@ -92,7 +93,10 @@ def suggest_initial_settings(
     # the information a real training pipeline should legitimately use.
     split = split_indices(len(features), config.train_frac, config.val_frac, config.seed)
     train_features_raw = features[split["train"]]
-    active_mask = train_features_raw.std(axis=0) > 1e-8
+    # Match the training pipeline's active-feature criterion (data.py / runner.py):
+    # max != min keeps features with tiny but meaningful SI-unit values (e.g.
+    # capacitance in farads ~1e-13) that an absolute std threshold would drop.
+    active_mask = train_features_raw.max(axis=0) != train_features_raw.min(axis=0)
     if not np.any(active_mask):
         raise ValueError("All input-feature columns are constant in the training split.")
 
@@ -100,7 +104,7 @@ def suggest_initial_settings(
     dropped_names = [name for name, keep in zip(input_feature_names, active_mask, strict=True) if not keep]
     input_feature_mean = train_features_raw[:, active_mask].mean(axis=0).astype(np.float32)
     input_feature_std = train_features_raw[:, active_mask].std(axis=0).astype(np.float32)
-    input_feature_std[input_feature_std < 1e-8] = 1.0
+    input_feature_std[input_feature_std == 0] = 1.0
 
     train_features = (train_features_raw[:, active_mask] - input_feature_mean) / input_feature_std
     train_targets = targets[split["train"]]

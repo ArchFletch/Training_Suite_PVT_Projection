@@ -56,6 +56,7 @@ class LeaseService:
                 return license_or_denial
 
             imported_license = license_or_denial
+            license_ends_at = coerce_utc_datetime(imported_license.payload.ends_at)
             active_count = self.repository.count_active_leases(connection, now=now)
             if active_count >= imported_license.payload.seat_count:
                 self.repository.add_audit_event(
@@ -74,7 +75,10 @@ class LeaseService:
                     message="All floating seats are currently in use.",
                 )
 
-            expires_at = format_utc_datetime(coerce_utc_datetime(now) + self._lease_ttl_delta)
+            # A lease never outlives the license term itself.
+            expires_at = format_utc_datetime(
+                min(coerce_utc_datetime(now) + self._lease_ttl_delta, license_ends_at)
+            )
             lease = LeaseRecord(
                 lease_id=f"lease_{os.urandom(6).hex()}",
                 machine_id=request.machine_id,
@@ -132,7 +136,35 @@ class LeaseService:
                     reason_code="machine_mismatch",
                     message="The lease is owned by a different machine_id.",
                 )
-            expires_at = format_utc_datetime(coerce_utc_datetime(now) + self._lease_ttl_delta)
+            # Re-check the license term: without this, a client that checked out
+            # just before the license ended could renew its lease forever.
+            imported_license = self.repository.get_active_license(connection)
+            license_ends_at = (
+                coerce_utc_datetime(imported_license.payload.ends_at)
+                if imported_license is not None
+                else None
+            )
+            if license_ends_at is None or coerce_utc_datetime(now) > license_ends_at:
+                self.repository.release_lease(
+                    connection,
+                    lease_id=request.lease_id,
+                    released_at=now,
+                    release_reason="license_expired",
+                )
+                self.repository.add_audit_event(
+                    connection,
+                    event_type="lease_released",
+                    event_time=now,
+                    details={"lease_id": request.lease_id, "reason": "license_expired"},
+                )
+                return HeartbeatResponse(
+                    ok=False,
+                    reason_code="license_expired",
+                    message="The imported license term has ended.",
+                )
+            expires_at = format_utc_datetime(
+                min(coerce_utc_datetime(now) + self._lease_ttl_delta, license_ends_at)
+            )
             updated = self.repository.update_lease_expiry(
                 connection,
                 lease_id=request.lease_id,

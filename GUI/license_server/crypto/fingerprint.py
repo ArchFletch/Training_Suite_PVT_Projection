@@ -28,7 +28,9 @@ def read_machine_token(os_family: str | None = None) -> str:
                 machine_guid, _ = winreg.QueryValueEx(registry_key, "MachineGuid")
             if isinstance(machine_guid, str) and machine_guid.strip():
                 return machine_guid.strip()
-        except OSError:
+        except (OSError, ImportError):
+            # ImportError: winreg does not exist off-Windows; fall through to the
+            # Linux machine-id files / MAC fallback instead of crashing.
             pass
 
     for candidate in (Path("/etc/machine-id"), Path("/var/lib/dbus/machine-id")):
