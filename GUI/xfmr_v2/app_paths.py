@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
-APP_NAME = "Surrogate Model Traning Suite"
+APP_NAME = "Surrogate Model Training Suite"
 APP_SLUG = "mlp-training-studio"
 LICENSE_CLIENT_FILENAME = "license_client.json"
 LAST_SESSION_FILENAME = "last_session.json"

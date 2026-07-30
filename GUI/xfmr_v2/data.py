@@ -1,12 +1,14 @@
-"""Build caches and training splits from README-described raw data.
+"""Build caches and training splits from raw dataset folders.
 
 This module handles the entire data journey:
 
-1. Resolve where the input-feature table and output files live on disk.
-2. Read the README schema that explains how those files should be interpreted.
-3. Convert the raw files into a compact `.npz` cache for repeated training runs.
-4. Load the cache back, create deterministic train/validation/test splits,
-   normalize the features, and build PyTorch `DataLoader` objects.
+1. Build a compact `.npz` cache (plus a `.json` metadata sidecar) from a raw
+   dataset folder by auto-detecting its layout. Supported layouts are
+   SPData/Touchstone (`log.txt` + a folder of `.sNp` files) and Cadence-export
+   `.csv` files.
+2. Load the cache back, create deterministic train/validation/test splits, drop
+   constant input features, normalize features and per-channel targets using
+   training-split statistics only, and build PyTorch `DataLoader` objects.
 
 The module is intentionally split into small helpers so each stage is easy to
 trace in isolation.
@@ -27,6 +29,7 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from .dataset_schema import DatasetSchema, Ground_TruthSchema, InputFeatureSchema
+from .progress import request_stop
 
 # Default paths for the current XFMR dataset layout on disk.
 DATA_ROOT = Path(r"C:\Users\tc57\Box\Rice_AIDRFIC\XFMR\XFMR_1to1\XFMR_2503_1x1_SameXY")
@@ -75,11 +78,9 @@ class SplitBundle:
     # Statistics computed from the training split and reused for all splits.
     input_feature_mean: np.ndarray
     input_feature_std: np.ndarray
-    # Frequency axis in three different forms: raw Hz, GHz for display, and normalized
-    # coordinates fed to the model.
+    # Frequency axis in two forms: raw Hz and GHz for display.
     frequency_hz: np.ndarray
     frequency_ghz: np.ndarray
-    frequency_norm: np.ndarray
     # Display label for the swept axis (e.g. "Frequency (GHz)", "VDIFF (mV)").
     sweep_label: str
     # Human-readable names for the predicted outputs.
@@ -96,152 +97,6 @@ class SplitBundle:
     channel_transforms: list[str]
 
 
-# ---------------------------------------------------------------------------
-# Loader-code execution (in-memory, no files saved to disk)
-# ---------------------------------------------------------------------------
-_LOADER_ALLOWED_MODULES = {
-    "csv", "re", "json", "math", "struct", "io", "os.path",
-    "numpy", "pathlib",
-}
-
-
-def run_loader_code(
-    code: str,
-    dataset_root: str | Path,
-    max_samples: int | None = None,
-) -> dict[str, Any]:
-    """Execute loader code in memory and return standardized arrays.
-
-    The code must define ``load_dataset(dataset_root, max_samples=None)``
-    returning a dict with at least ``features``, ``targets``, ``sweep_axis``.
-
-    Raises ValueError on any failure (compilation, execution, validation).
-    """
-    import importlib
-    import builtins
-
-    # Use standard builtins — the loader code is user-provided and trusted.
-    safe_globals: dict[str, Any] = {"__builtins__": builtins}
-
-    for mod_name in _LOADER_ALLOWED_MODULES:
-        try:
-            safe_globals[mod_name.split(".")[0]] = importlib.import_module(mod_name)
-        except ImportError:
-            pass
-    safe_globals["np"] = safe_globals.get("numpy")
-    safe_globals["Path"] = Path
-
-    try:
-        exec(compile(code, "<loader>", "exec"), safe_globals)
-    except Exception as exc:
-        raise ValueError(f"Loader code compilation failed: {exc}") from exc
-
-    load_fn = safe_globals.get("load_dataset")
-    if load_fn is None:
-        raise ValueError("Loader code must define a 'load_dataset' function.")
-
-    try:
-        result = load_fn(str(dataset_root), max_samples=max_samples)
-    except Exception as exc:
-        raise ValueError(f"Loader execution failed: {exc}") from exc
-
-    required = {"features", "targets", "sweep_axis"}
-    missing = required - set(result.keys())
-    if missing:
-        raise ValueError(f"Loader result missing keys: {missing}")
-
-    features = np.asarray(result["features"], dtype=np.float32)
-    targets = np.asarray(result["targets"], dtype=np.float32)
-    sweep = np.asarray(result["sweep_axis"], dtype=np.float32)
-
-    if features.ndim != 2:
-        raise ValueError(f"features must be 2D (samples, features), got shape {features.shape}")
-    if targets.ndim == 2:
-        targets = targets[:, np.newaxis, :]
-    if targets.ndim != 3:
-        raise ValueError(f"targets must be 2D or 3D, got shape {targets.shape}")
-
-    result["features"] = features
-    result["targets"] = targets
-    result["sweep_axis"] = sweep
-
-    # --- Validate the loaded data ---
-    warnings = _validate_loader_output(features, targets, sweep, result)
-    if warnings:
-        result["validation_warnings"] = warnings
-
-    return result
-
-
-def _validate_loader_output(
-    features: np.ndarray,
-    targets: np.ndarray,
-    sweep: np.ndarray,
-    result: dict[str, Any],
-) -> list[str]:
-    """Check for common data loading issues. Returns a list of warning strings."""
-    warnings: list[str] = []
-    num_samples = features.shape[0]
-    num_channels = targets.shape[1]
-    num_sweep = targets.shape[2]
-
-    # 1. Sample count sanity
-    if num_samples < 2:
-        warnings.append(
-            f"Only {num_samples} sample(s) loaded. This is likely a parsing error — "
-            f"check that sample boundaries are detected correctly."
-        )
-
-    # 2. NaN / Inf check
-    nan_features = np.isnan(features).sum()
-    nan_targets = np.isnan(targets).sum()
-    inf_targets = np.isinf(targets).sum()
-    if nan_features > 0:
-        warnings.append(f"Features contain {nan_features} NaN values.")
-    if nan_targets > 0:
-        warnings.append(f"Targets contain {nan_targets} NaN values.")
-    if inf_targets > 0:
-        warnings.append(f"Targets contain {inf_targets} Inf values.")
-
-    # 3. Extreme target values (likely parser bug or simulator error)
-    target_absmax = float(np.abs(targets).max())
-    target_p99 = float(np.percentile(np.abs(targets), 99))
-    if target_absmax > 10 * target_p99 and target_p99 > 0:
-        warnings.append(
-            f"Target max |{target_absmax:.2f}| is >10x the 99th percentile |{target_p99:.2f}|. "
-            f"This suggests extreme outliers or parser errors."
-        )
-
-    # 4. Constant targets (all same value for a channel)
-    for ch in range(num_channels):
-        ch_std = float(targets[:, ch, :].std())
-        ch_name = result.get("channel_names", [f"ch{ch}"])[ch] if ch < len(result.get("channel_names", [])) else f"ch{ch}"
-        if ch_std < 1e-10:
-            warnings.append(f"Channel '{ch_name}' has zero variance — all values are identical.")
-
-    # 5. Sweep axis issues
-    if len(sweep) < 2:
-        warnings.append(f"Sweep axis has only {len(sweep)} point(s).")
-    elif not np.all(np.diff(sweep) > 0) and not np.all(np.diff(sweep) < 0):
-        warnings.append("Sweep axis is not monotonically increasing or decreasing.")
-
-    # 6. Suspiciously many sweep points per sample (likely merged samples)
-    if num_sweep > 10000:
-        warnings.append(
-            f"Each sample has {num_sweep} sweep points — this is unusually high. "
-            f"Check that sample boundaries are being detected correctly."
-        )
-
-    # 7. Feature variance check
-    for i in range(features.shape[1]):
-        col = features[:, i]
-        if col.max() == col.min() and num_samples > 1:
-            fname = result.get("feature_names", [f"x{i}"])[i] if i < len(result.get("feature_names", [])) else f"x{i}"
-            warnings.append(f"Feature '{fname}' is constant (value={col[0]:.6g}) — will be dropped during training.")
-
-    return warnings
-
-
 # Public cache and split API.
 def load_existing_cache(
     cache_path: str | Path,
@@ -249,8 +104,8 @@ def load_existing_cache(
 ) -> dict[str, Any]:
     """Load an existing .npz cache and return its summary metadata.
 
-    This does NOT build a cache from raw data.  Use ``build_cache_from_loader``
-    to create a new cache from a ``loader.py``.
+    This does NOT build a cache from raw data.  Use ``build_cache_from_dataset``
+    to create a new cache from a dataset folder.
     """
     def emit(event: str, message: str, **payload: Any) -> None:
         if progress_callback is not None:
@@ -295,73 +150,6 @@ def load_existing_cache(
          cache_path=summary["cache_path"],
          total_samples=summary["num_samples"],
          frequency_count=summary["num_frequencies"])
-    return summary
-
-
-def build_cache_from_loader(
-    loader_code: str,
-    dataset_root: str | Path,
-    cache_path: str | Path,
-    max_samples: int | None = None,
-    progress_callback=None,
-) -> dict[str, Any]:
-    """Execute loader code in memory and save the result as a cache.
-
-    This is the primary entry point for the loader-based loading flow. The code
-    runs once in memory, produces standardized arrays, and saves them to the
-    cache. No files are written to the dataset directory.
-    """
-    def emit(event: str, message: str, **payload: Any) -> None:
-        if progress_callback is not None:
-            progress_callback({"phase": "scan", "event": event, "message": message, **payload})
-
-    emit("loader_running", "Executing AI-generated loader code...")
-    result = run_loader_code(loader_code, dataset_root, max_samples)
-
-    features = result["features"]
-    targets = result["targets"]
-    frequency_hz = result["sweep_axis"]
-    feature_names = result.get("feature_names", [f"x{i}" for i in range(features.shape[1])])
-    channel_names_list = result.get("channel_names", [f"ch{i}" for i in range(targets.shape[1])])
-    target_names = result.get("target_names", channel_names_list)
-    channel_unit_list = result.get("channel_units", [""] * len(channel_names_list))
-    channel_transform_list = result.get("channel_transforms", [""] * len(channel_names_list))
-    sweep_label = result.get("sweep_label", "Frequency (GHz)")
-    dataset_name = result.get("dataset_name", Path(dataset_root).name)
-
-    # Check for data issues before caching.
-    validation_warnings = result.get("validation_warnings", [])
-    if validation_warnings:
-        warning_text = "\n".join(f"  - {w}" for w in validation_warnings)
-        emit("loader_warning",
-             f"Data validation warnings:\n{warning_text}")
-        # Block caching if there are critical issues (e.g. only 1 sample).
-        if features.shape[0] < 2:
-            raise ValueError(
-                f"Loader produced only {features.shape[0]} sample(s). "
-                f"This is almost certainly a parsing bug.\n"
-                f"Validation warnings:\n{warning_text}"
-            )
-
-    emit("loader_done",
-         f"Loaded {features.shape[0]} samples, {targets.shape[1]} channels, "
-         f"{targets.shape[2]} sweep points.")
-
-    summary = _save_cache(
-        cache_path,
-        dataset_root=dataset_root,
-        dataset_name=dataset_name,
-        features=features,
-        targets=targets,
-        frequency_hz=frequency_hz,
-        feature_names=feature_names,
-        channel_names=channel_names_list,
-        target_names=target_names,
-        channel_units=channel_unit_list,
-        channel_transforms=channel_transform_list,
-        sweep_label=sweep_label,
-    )
-    emit("cache_saved", f"Cache saved: {features.shape[0]} samples.", cache_path=summary["cache_path"])
     return summary
 
 
@@ -455,7 +243,7 @@ def build_cache_from_dataset(
         if progress_callback is not None:
             progress_callback({"phase": "scan", "event": event, "message": message, **payload})
 
-    summary = _build_auto(Path(dataset_root), cache_path, max_samples, emit)
+    summary = _build_auto(Path(dataset_root), cache_path, max_samples, emit, should_stop)
     emit("cache_saved", f"Cache saved: {summary['num_samples']} samples.", cache_path=summary["cache_path"])
     return summary
 
@@ -478,19 +266,31 @@ def _find_sp_dir(root: Path) -> Path | None:
     return None
 
 
-def _build_auto(root: Path, cache_path: str | Path, max_samples: int | None, emit) -> dict[str, Any]:
+def _build_auto(
+    root: Path, cache_path: str | Path, max_samples: int | None, emit, should_stop=None
+) -> dict[str, Any]:
     """Detect a supported dataset layout from folder contents and build the cache."""
     # 1. SPData / Touchstone: log.txt + a directory of .sNp files.
     log_txt = next((root / n for n in ("log.txt", "log.TXT") if (root / n).is_file()), None)
     sp_dir = _find_sp_dir(root)
+    if log_txt is None and sp_dir is None and any(
+        p.is_file() and re.fullmatch(r"\.s\d+p", p.suffix.lower()) for p in root.iterdir()
+    ):
+        # The user pointed at the SPData folder itself (e.g. via the legacy
+        # ground-truth field); the log.txt conventionally lives one level up.
+        parent_log = next(
+            (root.parent / n for n in ("log.txt", "log.TXT") if (root.parent / n).is_file()), None
+        )
+        if parent_log is not None:
+            log_txt, sp_dir = parent_log, root
     if log_txt is not None and sp_dir is not None:
-        result = _build_touchstone_auto(root, log_txt, sp_dir, max_samples, emit)
+        result = _build_touchstone_auto(root, log_txt, sp_dir, max_samples, emit, should_stop)
         return _save_cache(cache_path, dataset_root=root, readme_path="", **result)
 
     # 2. Cadence CSV: one or more Cadence-export .csv files.
     csv_files = [p for p in sorted(root.glob("*.csv")) if not p.name.startswith(".~")]
     if csv_files:
-        result = _build_cadence_auto(root, csv_files, max_samples, emit)
+        result = _build_cadence_auto(root, csv_files, max_samples, emit, should_stop)
         return _save_cache(cache_path, dataset_root=root, readme_path="", **result)
 
     raise FileNotFoundError(
@@ -526,7 +326,7 @@ def _read_logtxt_columns(log_txt: Path) -> list[str]:
 
 
 def _build_touchstone_auto(
-    root: Path, log_txt: Path, sp_dir: Path, max_samples: int | None, emit
+    root: Path, log_txt: Path, sp_dir: Path, max_samples: int | None, emit, should_stop=None
 ) -> dict[str, Any]:
     """Auto-detect a per-sample Touchstone dataset (log.txt + .sNp files)."""
     columns = _read_logtxt_columns(log_txt)
@@ -566,7 +366,7 @@ def _build_touchstone_auto(
         f"{nports}-port, {len(sparams)} S-params x (re, im); first frequency point dropped.",
     )
     sources = resolve_data_sources_from_schema(root, schema)
-    features, targets, frequency_hz = _build_per_sample_arrays(sources, schema, max_samples, emit)
+    features, targets, frequency_hz = _build_per_sample_arrays(sources, schema, max_samples, emit, should_stop)
     channel_names = list(schema.ground_truth.channel_names)
     return {
         "dataset_name": root.name,
@@ -596,7 +396,9 @@ _CTLE_UNITS = {
 }
 
 
-def _build_cadence_auto(root: Path, csv_files: list[Path], max_samples: int | None, emit) -> dict[str, Any]:
+def _build_cadence_auto(
+    root: Path, csv_files: list[Path], max_samples: int | None, emit, should_stop=None
+) -> dict[str, Any]:
     """Auto-detect Cadence-CSV channels and combine those that share a sweep axis.
 
     Channels with different axes (AC gain vs VCM-swept HB gain vs scalar noise) cannot
@@ -605,6 +407,7 @@ def _build_cadence_auto(root: Path, csv_files: list[Path], max_samples: int | No
     """
     parsed: dict[str, tuple[list[dict[str, float]], np.ndarray, np.ndarray]] = {}
     for csv_path in csv_files:
+        request_stop(should_stop)
         try:
             params, freq_ghz, values = _parse_cadence_csv(csv_path, _CTLE_PARAM_KEYS, max_samples)
         except Exception as exc:  # noqa: BLE001 - non-Cadence / odd-format CSVs are skipped
@@ -639,9 +442,28 @@ def _build_cadence_auto(root: Path, csv_files: list[Path], max_samples: int | No
     for ch_idx, channel in enumerate(channels):
         ch_params, _, ch_values = parsed[channel]
         index = {_key(p): i for i, p in enumerate(ch_params)}
+        unmatched = 0
         for i, params in enumerate(params0):
-            j = index.get(_key(params), i if i < len(ch_values) else 0)
+            j = index.get(_key(params))
+            if j is None:
+                # No exact parameter match in this channel's CSV. Row-order
+                # pairing is the best available guess, but never substitute a
+                # different sample's curve silently — that corrupts training
+                # targets without any visible symptom.
+                if i >= len(ch_values):
+                    raise ValueError(
+                        f"Channel '{channel}' has {len(ch_values)} samples but channel "
+                        f"'{channels[0]}' has {num_samples}; sample {i} cannot be aligned."
+                    )
+                unmatched += 1
+                j = i
             targets[i, ch_idx, :] = ch_values[j]
+        if unmatched:
+            emit(
+                "auto_note",
+                f"Channel '{channel}': {unmatched}/{num_samples} samples had no exact "
+                f"parameter match with '{channels[0]}'; paired by row order instead.",
+            )
 
     emit("auto_detected",
          f"Auto-detected Cadence CSV dataset: {num_samples} samples, channels {channels}, {num_freq} points.")
@@ -666,17 +488,27 @@ def ensure_cache(
     max_samples: int | None = None,
     input_feature_path: str | Path | None = None,
     ground_truth_data_dir: str | Path | None = None,
+    should_stop=None,
 ) -> Path:
-    """Return a ready-to-use cache path.
+    """Return a ready-to-use cache path, building it when missing.
 
-    The cache must already exist (created via ``build_cache_from_loader``).
+    When the cache file does not exist, the dataset folder (``data_root``, or one
+    derived from the explicit paths) is built via ``build_cache_from_dataset``
+    format auto-detection.
     """
     p = Path(cache_path)
-    if not p.exists():
+    if p.exists():
+        return p
+    root = data_root or ground_truth_data_dir or (
+        Path(input_feature_path).parent if input_feature_path else None
+    )
+    if root is None or not Path(root).is_dir():
         raise FileNotFoundError(
             f"Cache not found: {p}\n"
-            "Build the cache first."
+            "Build the cache first (scan the dataset), or pass an existing dataset "
+            "folder so it can be built."
         )
+    build_cache_from_dataset(root, p, max_samples=max_samples, should_stop=should_stop)
     return p
 
 
@@ -816,7 +648,6 @@ def load_split_bundle(
         input_feature_std=std,
         frequency_hz=frequency_hz,
         frequency_ghz=frequency_ghz,
-        frequency_norm=normalize_frequency(frequency_ghz),
         target_names=target_names,
         channel_names=channel_names,
         cache_path=Path(cache_path),
@@ -851,18 +682,17 @@ def split_indices(num_samples: int, train_frac: float, val_frac: float, seed: in
         empty = order[:0]
         return {"train": order, "val": empty, "test": empty}
 
-    # Keep at least one training sample and, when possible, one held-out sample.
-    train_end = max(int(num_samples * train_frac), 1)
+    if num_samples == 2:
+        # Two samples: one train, one val. Validation must never be empty —
+        # an empty val split makes early stopping silently keep epoch-1 weights.
+        return {"train": order[:1], "val": order[1:], "test": order[:0]}
+
+    # Keep at least one training sample and at least one sample each in val and
+    # test. The clamps only matter for tiny datasets; for normal sizes the
+    # train/val fractions are honored exactly as before.
+    train_end = min(max(int(num_samples * train_frac), 1), num_samples - 2)
     val_end = min(max(train_end + int(num_samples * val_frac), train_end + 1), num_samples - 1)
     return {"train": order[:train_end], "val": order[train_end:val_end], "test": order[val_end:]}
-
-
-def normalize_frequency(frequency_ghz: np.ndarray) -> np.ndarray:
-    """Map frequency to [-1, 1] for the model's frequency input."""
-    lo, hi = float(frequency_ghz.min()), float(frequency_ghz.max())
-    if np.isclose(lo, hi):
-        return np.zeros_like(frequency_ghz, dtype=np.float32)
-    return (2.0 * (frequency_ghz - lo) / (hi - lo) - 1.0).astype(np.float32)
 
 
 
@@ -892,6 +722,7 @@ def _build_per_sample_arrays(
     schema: DatasetSchema,
     max_samples: int | None,
     emit,
+    should_stop=None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Unified per-sample loader: CSV or Touchstone, auto-detected from extension."""
     assert sources.input_feature_path is not None
@@ -943,6 +774,7 @@ def _build_per_sample_arrays(
     skipped = 0
     valid_idx = 0
     for idx in range(total_samples):
+        request_stop(should_stop)
         # Resolve sample ID and feature values.
         if use_csv:
             row_dict = csv_rows[idx]
@@ -980,9 +812,15 @@ def _build_per_sample_arrays(
         if targets is None:
             frequency_hz = sample_freq
             targets = np.zeros((total_samples, sample_target.shape[0], sample_target.shape[1]), dtype=np.float32)
-        elif not np.allclose(frequency_hz, sample_freq):
+        elif sample_freq.shape != frequency_hz.shape or not np.allclose(frequency_hz, sample_freq):
+            # Shape check first: np.allclose raises on different-length grids
+            # instead of returning False, which would crash the whole build.
             skipped += 1
             emit("cache_progress", f"Skipping sample '{sample_id}': frequency mismatch.")
+            continue
+        elif sample_target.shape != targets.shape[1:]:
+            skipped += 1
+            emit("cache_progress", f"Skipping sample '{sample_id}': target shape mismatch.")
             continue
 
         features[valid_idx] = feat_values
@@ -1063,18 +901,25 @@ def _find_per_sample_file(gt_dir: Path, sample_id: str, extension: str) -> Path 
     candidate = gt_dir / f"{sample_id}{extension}"
     if candidate.exists():
         return candidate
-    for f in gt_dir.iterdir():
-        if f.is_file() and sample_id in f.stem and f.suffix.lower() == extension:
+    # Whole-token match only: a bare substring test would let sample "1" bind to
+    # "sample_10" and silently pair the wrong ground truth with a feature row.
+    id_pattern = re.compile(rf"(?<![0-9A-Za-z]){re.escape(sample_id)}(?![0-9A-Za-z])")
+
+    def _matches(f: Path) -> bool:
+        return f.is_file() and f.suffix.lower() == extension and id_pattern.search(f.stem) is not None
+
+    for f in sorted(gt_dir.iterdir()):
+        if _matches(f):
             return f
     # Search subdirectories one level deep.
-    for sub in gt_dir.iterdir():
+    for sub in sorted(gt_dir.iterdir()):
         if not sub.is_dir():
             continue
         candidate = sub / f"{sample_id}{extension}"
         if candidate.exists():
             return candidate
-        for f in sub.iterdir():
-            if f.is_file() and sample_id in f.stem and f.suffix.lower() == extension:
+        for f in sorted(sub.iterdir()):
+            if _matches(f):
                 return f
     return None
 

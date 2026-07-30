@@ -45,7 +45,7 @@ $manifest = [ordered]@{
     gui_installer = $guiMetadata
     server_bundle_archive = $serverMetadata
     default_paths = [ordered]@{
-        gui_install_root = "$env:LOCALAPPDATA\Programs\Surrogate Model Traning Suite"
+        gui_install_root = "$env:LOCALAPPDATA\Programs\Surrogate Model Training Suite"
         server_install_root = "$env:ProgramFiles\MLP License Server"
         server_runtime_root = "$env:ProgramData\MLP License Server"
     }

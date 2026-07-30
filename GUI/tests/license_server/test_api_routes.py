@@ -78,7 +78,7 @@ def test_client_routes_cover_a_full_single_lease_flow(tmp_path: Path) -> None:
         checkout_response = client.post(
             "/api/v1/checkout",
             json={
-                "product": "Surrogate Model Traning Suite",
+                "product": "Surrogate Model Training Suite",
                 "product_version": "0.1.0",
                 "machine_id": "cli_7bde9f61",
                 "hostname": "eda-win-17",
@@ -96,7 +96,7 @@ def test_client_routes_cover_a_full_single_lease_flow(tmp_path: Path) -> None:
         denied_response = client.post(
             "/api/v1/checkout",
             json={
-                "product": "Surrogate Model Traning Suite",
+                "product": "Surrogate Model Training Suite",
                 "product_version": "0.1.0",
                 "machine_id": "cli_7bde9f62",
                 "hostname": "eda-win-18",

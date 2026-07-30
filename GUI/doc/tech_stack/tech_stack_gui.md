@@ -46,7 +46,7 @@
 - Electron for this local technical workflow
 - Tauri unless there is a future product reason to pivot to web technologies
 - browser-first local web UI for the current single-user desktop workflow
-- writing packaged runtime state into `%LOCALAPPDATA%\Programs\Surrogate Model Traning Suite\`
+- writing packaged runtime state into `%LOCALAPPDATA%\Programs\Surrogate Model Training Suite\`
 
 ## Likely Later Additions
 

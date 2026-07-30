@@ -14,7 +14,7 @@ delivery slice:
 ### GUI
 
 - standalone Windows GUI build from `launch_gui.py`
-- per-user Windows installer for `Surrogate Model Traning Suite`
+- per-user Windows installer for `Surrogate Model Training Suite`
 - silent-install and silent-uninstall support for release validation
 
 ### License Server
@@ -81,10 +81,10 @@ Current tracked assets:
 
 ### GUI
 
-- install root: `%LOCALAPPDATA%\Programs\Surrogate Model Traning Suite\`
-- config path: `%APPDATA%\Surrogate Model Traning Suite\license_client.json`
-- state path: `%LOCALAPPDATA%\Surrogate Model Traning Suite\`
-- output root: `%USERPROFILE%\Documents\Surrogate Model Traning Suite\Runs\`
+- install root: `%LOCALAPPDATA%\Programs\Surrogate Model Training Suite\`
+- config path: `%APPDATA%\Surrogate Model Training Suite\license_client.json`
+- state path: `%LOCALAPPDATA%\Surrogate Model Training Suite\`
+- output root: `%USERPROFILE%\Documents\Surrogate Model Training Suite\Runs\`
 
 ### Server
 

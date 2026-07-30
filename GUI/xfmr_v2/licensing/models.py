@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 
-PRODUCT_NAME = "Surrogate Model Traning Suite"
+PRODUCT_NAME = "Surrogate Model Training Suite"
 DEFAULT_PRODUCT_VERSION = "desktop"
 
 
@@ -165,6 +165,8 @@ class LicenseHeartbeatResult:
 
     ok: bool
     expires_at: datetime | None = None
+    reason_code: str | None = None
+    message: str = ""
     raw: dict[str, Any] = field(default_factory=dict, repr=False)
 
     @classmethod
@@ -172,6 +174,8 @@ class LicenseHeartbeatResult:
         return cls(
             ok=bool(payload.get("ok", False)),
             expires_at=parse_utc_timestamp(_optional_str(payload.get("expires_at"))),
+            reason_code=_optional_str(payload.get("reason_code")),
+            message=_optional_str(payload.get("message")) or "",
             raw=dict(payload),
         )
 

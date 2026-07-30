@@ -11,7 +11,7 @@ from typing import Annotated
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StringConstraints
 
 SCHEMA_VERSION = 1
-PRODUCT_NAME = "Surrogate Model Traning Suite"
+PRODUCT_NAME = "Surrogate Model Training Suite"
 DEFAULT_SCHEMA_VERSION = SCHEMA_VERSION
 DEFAULT_PRODUCT = PRODUCT_NAME
 
@@ -93,6 +93,10 @@ class ClientPlatform(str, Enum):
 
     WINDOWS = "windows"
     LINUX = "linux"
+    # The desktop client reports "macos" on darwin (see
+    # xfmr_v2.licensing.models.current_platform_name); rejecting it here would
+    # turn every macOS checkout into an opaque 422.
+    MACOS = "macos"
 
 
 class LicenseType(str, Enum):

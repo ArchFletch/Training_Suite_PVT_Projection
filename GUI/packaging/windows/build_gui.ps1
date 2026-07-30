@@ -2,7 +2,7 @@ param(
     [string]$Python = "python",
     [string]$OutputDir = "",
     [string]$IconPath = "",
-    [string]$AppTitle = "Surrogate Model Traning Suite",
+    [string]$AppTitle = "Surrogate Model Training Suite",
     [string]$AppExecutableBaseName = "SurrogateModelTrainingSuite"
 )
 

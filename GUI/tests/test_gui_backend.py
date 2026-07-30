@@ -109,6 +109,10 @@ def test_run_search_filters_noisy_trial_progress(monkeypatch: pytest.MonkeyPatch
             {"phase": "baseline", "event": "epoch_end", "trial_index": 2, "trial_count": 6, "trial_label": "larger_model", "epoch": 2, "total_epochs": 10},
             {"phase": "baseline", "event": "epoch_end", "trial_index": 2, "trial_count": 6, "trial_label": "larger_model", "epoch": 5, "total_epochs": 10},
             {"phase": "baseline", "event": "epoch_end", "trial_index": 2, "trial_count": 6, "trial_label": "larger_model", "epoch": 10, "total_epochs": 10},
+            # Real runner events nest the per-run fields under "data" (emit_progress);
+            # the filter must throttle that shape too.
+            {"phase": "baseline", "event": "checkpoint_updated", "data": {"trial_index": 2, "epoch": 3}},
+            {"phase": "baseline", "event": "epoch_end", "data": {"trial_index": 2, "epoch": 3, "total_epochs": 10}},
             {"phase": "search", "event": "trial_completed", "trial_index": 2, "trial_count": 6, "trial_label": "larger_model"},
         ]:
             if progress_callback is not None:
@@ -127,31 +131,3 @@ def test_run_search_filters_noisy_trial_progress(monkeypatch: pytest.MonkeyPatch
     assert any(payload["event"] == "epoch_end" and payload["epoch"] == 5 for payload in forwarded)
     assert any(payload["event"] == "epoch_end" and payload["epoch"] == 10 for payload in forwarded)
     assert not any(payload["event"] == "epoch_end" and payload["epoch"] == 2 for payload in forwarded)
-
-
-def test_check_transfer_compatibility_accepts_matching_checkpoint(synthetic_dataset: dict[str, Path], tmp_path: Path) -> None:
-    cache_summary = data.load_existing_cache(synthetic_dataset["cache_path"])
-    run_dir = tmp_path / "baseline_run"
-    run_dir.mkdir()
-
-    checkpoint = {
-        "config": {
-            "input_feature_path": str(Path(cache_summary["input_feature_path"])),
-            "ground_truth_data_dir": str(Path(cache_summary["ground_truth_data_dir"])),
-        },
-        "active_input_feature_names": ["x", "y"],
-        "target_channel_names": ["S11_re", "S11_im", "S12_re", "S12_im"],
-    }
-    torch.save(checkpoint, run_dir / "best_model.pt")
-    (run_dir / "summary.json").write_text(json.dumps({"best_val_loss": 0.1}, indent=2), encoding="utf-8")
-
-    result = gui_backend.check_transfer_compatibility(
-        base_run_dir=str(run_dir),
-        cache_path=str(synthetic_dataset["cache_path"]),
-        input_feature_path=str(synthetic_dataset["input_file"]),
-        ground_truth_data_dir=str(synthetic_dataset["output_dir"]),
-    )
-
-    assert result["status"] == "Compatible"
-    assert result["active_input_feature_names"] == ["x", "y"]
-    assert result["ground_truth_channels"] == ["S11_re", "S11_im", "S12_re", "S12_im"]

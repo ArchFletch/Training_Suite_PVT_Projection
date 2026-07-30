@@ -10,7 +10,7 @@ deployment, and install guidance now lives in the canonical `doc/` tree:
 
 ## Purpose
 
-This document defines the MVP licensing architecture for `Surrogate Model Traning Suite` as an
+This document defines the MVP licensing architecture for `Surrogate Model Training Suite` as an
 on-prem floating-license product for B2B customers.
 
 The intended commercial motion is:
@@ -125,7 +125,7 @@ flowchart LR
 
 Suggested config location:
 
-- `%APPDATA%\Surrogate Model Traning Suite\license_client.json`
+- `%APPDATA%\Surrogate Model Training Suite\license_client.json`
 
 ### Linux Desktop Client
 
@@ -209,7 +209,7 @@ Example:
 ```json
 {
   "schema_version": 1,
-  "product": "Surrogate Model Traning Suite",
+  "product": "Surrogate Model Training Suite",
   "server_id": "srv_6f9f6a4f7f2e",
   "host_fingerprint": "host_5a7d0d8d3d95",
   "hostname": "mlp-license-01",
@@ -238,7 +238,7 @@ Envelope example:
     "schema_version": 1,
     "license_id": "lic_2026_0001",
     "license_type": "evaluation",
-    "product": "Surrogate Model Traning Suite",
+    "product": "Surrogate Model Training Suite",
     "company_name": "Acme Design House",
     "server_id": "srv_6f9f6a4f7f2e",
     "host_fingerprint": "host_5a7d0d8d3d95",
@@ -279,7 +279,7 @@ Request:
 
 ```json
 {
-  "product": "Surrogate Model Traning Suite",
+  "product": "Surrogate Model Training Suite",
   "product_version": "0.1.0",
   "machine_id": "cli_7bde9f61",
   "hostname": "eda-win-17",
@@ -381,7 +381,7 @@ Response:
 ```json
 {
   "ok": true,
-  "product": "Surrogate Model Traning Suite",
+  "product": "Surrogate Model Training Suite",
   "company_name": "Acme Design House",
   "license_type": "evaluation",
   "starts_at": "2026-04-01T00:00:00Z",

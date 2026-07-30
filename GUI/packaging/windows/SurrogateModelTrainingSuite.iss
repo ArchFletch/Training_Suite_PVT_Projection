@@ -16,10 +16,10 @@
 
 [Setup]
 AppId={{94127F4D-A637-4B80-9307-E463796C92F8}
-AppName=Surrogate Model Traning Suite
+AppName=Surrogate Model Training Suite
 AppVersion={#AppVersion}
-DefaultDirName={localappdata}\Programs\Surrogate Model Traning Suite
-DefaultGroupName=Surrogate Model Traning Suite
+DefaultDirName={localappdata}\Programs\Surrogate Model Training Suite
+DefaultGroupName=Surrogate Model Training Suite
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 ArchitecturesInstallIn64BitMode=x64compatible
@@ -37,8 +37,8 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
 Source: "{#AppBuildDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{autoprograms}\Surrogate Model Traning Suite"; Filename: "{app}\{#AppExecutableBaseName}.exe"
-Name: "{autodesktop}\Surrogate Model Traning Suite"; Filename: "{app}\{#AppExecutableBaseName}.exe"; Tasks: desktopicon
+Name: "{autoprograms}\Surrogate Model Training Suite"; Filename: "{app}\{#AppExecutableBaseName}.exe"
+Name: "{autodesktop}\Surrogate Model Training Suite"; Filename: "{app}\{#AppExecutableBaseName}.exe"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#AppExecutableBaseName}.exe"; Description: "Launch Surrogate Model Traning Suite"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#AppExecutableBaseName}.exe"; Description: "Launch Surrogate Model Training Suite"; Flags: nowait postinstall skipifsilent

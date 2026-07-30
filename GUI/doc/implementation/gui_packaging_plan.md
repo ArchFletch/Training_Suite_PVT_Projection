@@ -16,7 +16,7 @@ tracked in `windows_packaging_and_clean_install.md`.
 1. Build a standalone GUI bundle with `pyside6-deploy` + Nuitka from `launch_gui.py`.
 2. Verify the standalone directory launches and can open datasets, run scans, and save outputs.
 3. Wrap that standalone directory in an Inno Setup installer for per-user install.
-4. Install into `%LOCALAPPDATA%\Programs\Surrogate Model Traning Suite\`.
+4. Install into `%LOCALAPPDATA%\Programs\Surrogate Model Training Suite\`.
 5. Validate normal install, silent install, launch, and uninstall behavior.
 
 Tracked assets:
@@ -61,12 +61,12 @@ The runtime path policy is centralized in `xfmr_v2/app_paths.py`.
 
 | Concern | Location |
 | --- | --- |
-| installed binaries | `%LOCALAPPDATA%\Programs\Surrogate Model Traning Suite\` |
-| license server settings | `%APPDATA%\Surrogate Model Traning Suite\license_client.json` |
-| last restored GUI session | `%LOCALAPPDATA%\Surrogate Model Traning Suite\last_session.json` |
-| reserved file-log directory | `%LOCALAPPDATA%\Surrogate Model Traning Suite\logs\` |
-| default run outputs | `%USERPROFILE%\Documents\Surrogate Model Traning Suite\Runs\` |
-| default auto-managed cache | `%USERPROFILE%\Documents\Surrogate Model Traning Suite\Runs\cache\<run_name>.npz` |
+| installed binaries | `%LOCALAPPDATA%\Programs\Surrogate Model Training Suite\` |
+| license server settings | `%APPDATA%\Surrogate Model Training Suite\license_client.json` |
+| last restored GUI session | `%LOCALAPPDATA%\Surrogate Model Training Suite\last_session.json` |
+| reserved file-log directory | `%LOCALAPPDATA%\Surrogate Model Training Suite\logs\` |
+| default run outputs | `%USERPROFILE%\Documents\Surrogate Model Training Suite\Runs\` |
+| default auto-managed cache | `%USERPROFILE%\Documents\Surrogate Model Training Suite\Runs\cache\<run_name>.npz` |
 
 ### Packaged Linux App
 
@@ -76,8 +76,8 @@ The runtime path policy is centralized in `xfmr_v2/app_paths.py`.
 | license server settings | `~/.config/mlp-training-studio/license_client.json` |
 | last restored GUI session | `~/.local/state/mlp-training-studio/last_session.json` |
 | reserved file-log directory | `~/.local/state/mlp-training-studio/logs/` |
-| default run outputs | `~/Documents/Surrogate Model Traning Suite/runs/` |
-| default auto-managed cache | `~/Documents/Surrogate Model Traning Suite/runs/cache/<run_name>.npz` |
+| default run outputs | `~/Documents/Surrogate Model Training Suite/runs/` |
+| default auto-managed cache | `~/Documents/Surrogate Model Training Suite/runs/cache/<run_name>.npz` |
 
 ### Source Checkout
 

@@ -1,8 +1,8 @@
 {
-  "product": "Surrogate Model Traning Suite",
+  "product": "Surrogate Model Training Suite",
   "product_version": "0.1.0",
   "machine_id": "cli_7bde9f61",
   "hostname": "eda-win-17",
   "username": "jdoe",
-  "platform": "macos"
+  "platform": "solaris"
 }

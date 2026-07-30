@@ -17,10 +17,14 @@ def main() -> None:
     # `TransferConfig` is the source of truth for defaults. Pulling them from the
     # dataclass avoids duplicating numbers in two places.
     defaults = TransferConfig.__dataclass_fields__
-    parser = argparse.ArgumentParser(description="Run self-transfer learning for the v2 XFMR project.")
-    parser.add_argument("--base-run-dir", required=True)
+    parser = argparse.ArgumentParser(description="Run standalone self-transfer learning for the v2 XFMR project.")
     parser.add_argument("--cache-path", default=str(CACHE_PATH))
     parser.add_argument("--output-dir", default=defaults["output_dir"].default)
+    parser.add_argument("--model-type", default=defaults["model_type"].default)
+    parser.add_argument("--width", type=int, default=defaults["width"].default)
+    parser.add_argument("--depth", type=int, default=defaults["depth"].default)
+    parser.add_argument("--train-frac", type=float, default=defaults["train_frac"].default)
+    parser.add_argument("--val-frac", type=float, default=defaults["val_frac"].default)
     parser.add_argument("--iterations", type=int, default=defaults["iterations"].default)
     parser.add_argument("--num-bands", type=int, default=defaults["num_bands"].default)
     parser.add_argument("--transfer-epochs", type=int, default=defaults["transfer_epochs"].default)
@@ -34,9 +38,13 @@ def main() -> None:
     # Build the configuration object exactly once, then hand it off to the runner.
     summary = run_self_transfer(
         TransferConfig(
-            base_run_dir=args.base_run_dir,
             cache_path=args.cache_path,
             output_dir=args.output_dir,
+            model_type=args.model_type,
+            width=args.width,
+            depth=args.depth,
+            train_frac=args.train_frac,
+            val_frac=args.val_frac,
             iterations=args.iterations,
             num_bands=args.num_bands,
             transfer_epochs=args.transfer_epochs,

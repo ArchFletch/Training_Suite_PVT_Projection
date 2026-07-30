@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 import pyqtgraph as pg
-from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
-from PySide6.QtGui import QCloseEvent
+from PySide6.QtCore import QObject, QThread, Qt, QUrl, Signal, Slot
+from PySide6.QtGui import QCloseEvent, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -46,7 +45,6 @@ from .app_paths import current_runtime_paths
 from .gui_backend import (
     build_and_scan_dataset,
     build_suggest_result,
-    check_transfer_compatibility,
     default_run_name,
     export_model_to_onnx,
     list_available_devices,
@@ -66,7 +64,14 @@ from .licensing import (
     normalize_server_url,
     test_license_connection,
 )
-from .runner import LOSS_FUNCTIONS, MODEL_TYPES, SCHEDULER_TYPES, TrainConfig, TransferConfig
+from .runner import (
+    LOSS_FUNCTIONS,
+    MODEL_TYPES,
+    SCHEDULER_TYPES,
+    TrainConfig,
+    TransferConfig,
+    canonical_model_type,
+)
 from .search import SearchConfig
 
 
@@ -220,7 +225,6 @@ class MlpTrainingStudio(QMainWindow):
         self.last_search_result: dict[str, Any] | None = None
         self.last_workflow_summary: dict[str, Any] | None = None
         self.last_baseline_summary: dict[str, Any] | None = None
-        self.last_transfer_base_summary: dict[str, Any] | None = None
         self.last_onnx_export_path: str | None = None
         self.selected_search_full_config: dict[str, Any] | None = None
         self.search_row_configs: list[dict[str, Any]] = []
@@ -231,16 +235,16 @@ class MlpTrainingStudio(QMainWindow):
         self._setting_search_max_samples = False
         self._controls_locked = False
         self._search_text_items: list[pg.TextItem] = []
-        self._transfer_frequency_items: list[Any] = []
 
         self._baseline_epochs: list[float] = []
         self._baseline_train_losses: list[float] = []
         self._baseline_val_losses: list[float] = []
+        # Per-iteration MAE history for the transfer plot: x = iteration index,
+        # channel_mae[channel name] = list of that channel's average MAE per iteration.
         self._transfer_iteration_mae_x: list[float] = []
-        self._transfer_iteration_mae_y: list[float] = []
-        self._transfer_frequency_history: list[list[float]] = []
+        self._transfer_channel_mae: dict[str, list[float]] = {}
 
-        self.setWindowTitle("Surrogate Model Traning Suite")
+        self.setWindowTitle("Surrogate Model Training Suite")
         self.resize(1440, 920)
         self.setMinimumSize(1280, 800)
 
@@ -282,7 +286,7 @@ class MlpTrainingStudio(QMainWindow):
         layout.setSpacing(16)
 
         title_col = QVBoxLayout()
-        title_label = QLabel("Surrogate Model Traning Suite")
+        title_label = QLabel("Surrogate Model Training Suite")
         title_label.setObjectName("TopBarTitle")
         title_col.addWidget(title_label)
         layout.addLayout(title_col, 1)
@@ -602,12 +606,11 @@ class MlpTrainingStudio(QMainWindow):
 
         self.baseline_model_type_combo_box = _NoScrollComboBox()
         self.baseline_model_type_combo_box.addItems(list(MODEL_TYPES))
-        self.baseline_model_type_combo_box.setCurrentText("FlatMLP")
+        self.baseline_model_type_combo_box.setCurrentText("SpectraNet")
         self.baseline_epochs_spin_box = self._make_int_spin(1, 5000, 300)
         self.baseline_batch_size_spin_box = self._make_int_spin(1, 4096, 16)
         self.baseline_learning_rate_spin_box = self._make_float_spin(1e-6, 1.0, 1e-4, decimals=6, step=1e-5, scientific=True)
         self.baseline_weight_decay_spin_box = self._make_float_spin(0.0, 1.0, 1e-4, decimals=6, step=1e-5, scientific=True)
-        self.baseline_gradient_clip_spin_box = self._make_float_spin(0.0, 100.0, 1.0, decimals=3, step=0.1)
         self.baseline_width_spin_box = self._make_int_spin(16, 8192, 512)
         self.baseline_depth_spin_box = self._make_int_spin(1, 20, 5)
         self.baseline_loss_function_combo_box = _NoScrollComboBox()
@@ -621,8 +624,6 @@ class MlpTrainingStudio(QMainWindow):
         self.baseline_seed_spin_box = self._make_int_spin(0, 1000000, 42)
         self.restore_recommended_baseline_button = self._make_button("Restore Recommended", secondary=True)
         self.restore_recommended_baseline_button.clicked.connect(self._restore_recommended_baseline)
-        self.ctle_preset_button = self._make_button("CTLE Defaults", secondary=True)
-        self.ctle_preset_button.clicked.connect(self._apply_ctle_preset)
 
         fields = [
             ("Model Type", self.baseline_model_type_combo_box),
@@ -630,7 +631,6 @@ class MlpTrainingStudio(QMainWindow):
             ("Batch Size", self.baseline_batch_size_spin_box),
             ("Learning Rate", self.baseline_learning_rate_spin_box),
             ("Weight Decay", self.baseline_weight_decay_spin_box),
-            ("Gradient Clip", self.baseline_gradient_clip_spin_box),
             ("Network Width", self.baseline_width_spin_box),
             ("Network Depth", self.baseline_depth_spin_box),
             ("Loss Function", self.baseline_loss_function_combo_box),
@@ -642,7 +642,6 @@ class MlpTrainingStudio(QMainWindow):
         for row, (label, widget) in enumerate(fields):
             self._add_form_row(grid, row, label, widget)
         grid.addWidget(self.restore_recommended_baseline_button, len(fields), 1)
-        grid.addWidget(self.ctle_preset_button, len(fields), 2)
         return tab
 
     def _build_transfer_tab(self) -> QWidget:
@@ -660,18 +659,11 @@ class MlpTrainingStudio(QMainWindow):
         grid.setHorizontalSpacing(10)
         grid.setVerticalSpacing(8)
 
-        self.transfer_base_model_source_combo_box = _NoScrollComboBox()
-        self.transfer_base_model_source_combo_box.addItems(["Use baseline from this session", "Choose existing run..."])
-        self.transfer_base_model_source_combo_box.currentIndexChanged.connect(self._refresh_transfer_source_controls)
-
-        self.transfer_base_run_path_edit = QLineEdit()
-        self.transfer_base_run_path_edit.setPlaceholderText("Select an existing baseline run directory")
-        self.transfer_base_run_path_edit.textChanged.connect(self.validate_transfer_compatibility)
-        self.browse_transfer_base_run_button = self._make_button("Browse...", secondary=True)
-        self.browse_transfer_base_run_button.clicked.connect(self.browse_transfer_base_run)
-
-        self.transfer_compatibility_status_badge = StatusBadge("Not Checked")
-        self.transfer_notes_label = QLabel("Run baseline training first, or choose an existing baseline run.")
+        self.transfer_notes_label = QLabel(
+            "Self-transfer trains per-band models from scratch on the scanned dataset "
+            "(no baseline run required). It uses the Model Type, Network Width, and "
+            "Network Depth from the Baseline tab."
+        )
         self.transfer_notes_label.setWordWrap(True)
 
         self.transfer_num_bands_spin_box = self._make_int_spin(1, 512, 10)
@@ -681,21 +673,16 @@ class MlpTrainingStudio(QMainWindow):
         self.transfer_batch_size_spin_box = self._make_int_spin(1, 4096, 64)
         self.transfer_learning_rate_spin_box = self._make_float_spin(1e-6, 1.0, 5e-5, decimals=6, step=1e-5, scientific=True)
         self.transfer_weight_decay_spin_box = self._make_float_spin(0.0, 1.0, 0.0, decimals=6, step=1e-5, scientific=True)
-        self.transfer_weight_decay_spin_box.setSpecialValueText("Use baseline")
-        self.transfer_gradient_clip_spin_box = self._make_float_spin(0.0, 100.0, 1.0, decimals=3, step=0.1)
+        self.transfer_weight_decay_spin_box.setSpecialValueText("Default")
         self.transfer_seed_spin_box = self._make_int_spin(0, 1000000, 42)
 
-        self._add_form_row(grid, 0, "Base Model Source", self.transfer_base_model_source_combo_box)
-        self._add_path_row(grid, 1, "Baseline Run Folder", self.transfer_base_run_path_edit, self.browse_transfer_base_run_button)
-        self._add_form_row(grid, 2, "Compatibility Status", self.transfer_compatibility_status_badge)
-        self._add_form_row(grid, 3, "Number of Frequency Bands", self.transfer_num_bands_spin_box)
-        self._add_form_row(grid, 4, "Transfer Iterations", self.transfer_iterations_spin_box)
-        self._add_form_row(grid, 5, "Epochs per Transfer Stage", self.transfer_epochs_spin_box)
-        self._add_form_row(grid, 6, "Batch Size", self.transfer_batch_size_spin_box)
-        self._add_form_row(grid, 7, "Learning Rate", self.transfer_learning_rate_spin_box)
-        self._add_form_row(grid, 8, "Weight Decay", self.transfer_weight_decay_spin_box)
-        self._add_form_row(grid, 9, "Gradient Clip", self.transfer_gradient_clip_spin_box)
-        self._add_form_row(grid, 10, "Random Seed", self.transfer_seed_spin_box)
+        self._add_form_row(grid, 0, "Number of Frequency Bands", self.transfer_num_bands_spin_box)
+        self._add_form_row(grid, 1, "Transfer Iterations", self.transfer_iterations_spin_box)
+        self._add_form_row(grid, 2, "Epochs per Transfer Stage", self.transfer_epochs_spin_box)
+        self._add_form_row(grid, 3, "Batch Size", self.transfer_batch_size_spin_box)
+        self._add_form_row(grid, 4, "Learning Rate", self.transfer_learning_rate_spin_box)
+        self._add_form_row(grid, 5, "Weight Decay", self.transfer_weight_decay_spin_box)
+        self._add_form_row(grid, 6, "Random Seed", self.transfer_seed_spin_box)
         layout.addLayout(grid)
         layout.addWidget(self.transfer_notes_label)
         return tab
@@ -795,9 +782,9 @@ class MlpTrainingStudio(QMainWindow):
         transfer_layout = QVBoxLayout(transfer_tab)
         transfer_layout.setContentsMargins(12, 12, 12, 12)
         transfer_layout.setSpacing(10)
-        self.transfer_frequency_mae_plot = pg.PlotWidget(transfer_tab)
-        self.transfer_frequency_mae_plot.setMinimumHeight(200)
-        transfer_layout.addWidget(self.transfer_frequency_mae_plot, 1)
+        self.transfer_average_mae_plot = pg.PlotWidget(transfer_tab)
+        self.transfer_average_mae_plot.setMinimumHeight(200)
+        transfer_layout.addWidget(self.transfer_average_mae_plot, 1)
         tabs.addTab(transfer_tab, "Transfer Results")
 
         # Test Samples tab — shows prediction vs ground truth for test samples.
@@ -834,12 +821,10 @@ class MlpTrainingStudio(QMainWindow):
         self.run_name_edit.setText("mlp_run")
         self.dataset_schema_status_badge.set_status("Not Scanned")
         self.initial_suggestion_confidence_badge.set_status("Not Scanned")
-        self.transfer_compatibility_status_badge.set_status("Not Checked")
         self.license_server_status_badge.set_status("Unconfigured")
         self.license_seat_state_badge.set_status(self.license_lease_state.badge_text)
         self._set_metric_defaults()
         self._refresh_transfer_controls_enabled()
-        self._refresh_transfer_source_controls()
         self._refresh_license_display()
         self._update_topbar_run_name()
         self.append_log("Ready. Select dataset paths and scan the data to begin.")
@@ -867,8 +852,6 @@ class MlpTrainingStudio(QMainWindow):
             "baseline": self._collect_baseline_form(),
             "transfer": {
                 "enabled": True,
-                "base_model_source": self.transfer_base_model_source_combo_box.currentIndex(),
-                "base_run_dir": self.transfer_base_run_path_edit.text().strip(),
                 **self._collect_transfer_form(),
             },
             "licensing": {
@@ -899,11 +882,8 @@ class MlpTrainingStudio(QMainWindow):
 
         transfer = payload.get("transfer", {})
         self.enable_transfer_learning_checkbox.setChecked(True)
-        self.transfer_base_model_source_combo_box.setCurrentIndex(int(transfer.get("base_model_source", 0)))
-        self.transfer_base_run_path_edit.setText(str(transfer.get("base_run_dir", "")))
         self._apply_transfer_form(transfer)
         self._refresh_transfer_controls_enabled()
-        self._refresh_transfer_source_controls()
         self._apply_license_payload(payload.get("licensing", {}))
         self._update_topbar_run_name()
 
@@ -1121,14 +1101,12 @@ class MlpTrainingStudio(QMainWindow):
         self._reset_baseline_plots()
         self._reset_transfer_plots()
         self.last_workflow_summary = None
-        self.last_transfer_base_summary = None
 
         self._start_task(
             run_training_workflow,
             kwargs={
                 "baseline_config": self._build_baseline_train_config(),
                 "transfer_config": None,
-                "transfer_base_run_dir": None,
             },
             task_name="training",
             busy_state="Training",
@@ -1149,19 +1127,12 @@ class MlpTrainingStudio(QMainWindow):
 
         self._reset_transfer_plots()
         self.last_workflow_summary = None
-        self.last_transfer_base_summary = None
-        transfer_base_run_dir = (
-            self.transfer_base_run_path_edit.text().strip()
-            if self.transfer_base_model_source_combo_box.currentIndex() == 1
-            else self._current_baseline_run_dir()
-        )
 
         self._start_task(
             run_training_workflow,
             kwargs={
                 "baseline_config": None,
                 "transfer_config": self._build_transfer_config(),
-                "transfer_base_run_dir": transfer_base_run_dir,
             },
             task_name="training",
             busy_state="Transfer",
@@ -1203,12 +1174,6 @@ class MlpTrainingStudio(QMainWindow):
         if path:
             self._set_cache_path_value(path, manually_selected=True)
 
-    def browse_transfer_base_run(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Select Baseline Run Folder", self.transfer_base_run_path_edit.text())
-        if path:
-            self.transfer_base_run_path_edit.setText(path)
-            self.validate_transfer_compatibility()
-
     def open_output_folder(self) -> None:
         candidate = self._preferred_output_path()
         if candidate is None:
@@ -1218,10 +1183,11 @@ class MlpTrainingStudio(QMainWindow):
         if not path.exists():
             self._show_warning("The selected output path does not exist yet.")
             return
-        try:
-            os.startfile(str(path))  # type: ignore[attr-defined]
-        except OSError as exc:
-            self._show_warning(f"Could not open the output folder: {exc}")
+        # QDesktopServices picks the right opener per platform (xdg-open on Linux,
+        # open on macOS, ShellExecute on Windows) instead of the Windows-only
+        # os.startfile.
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
+            self._show_warning(f"Could not open the output folder: {path}")
 
     def export_run_summary(self) -> None:
         payload = {
@@ -1301,28 +1267,6 @@ class MlpTrainingStudio(QMainWindow):
             on_result=self._on_license_checkout_completed,
         )
 
-    def validate_transfer_compatibility(self) -> None:
-        if self.transfer_base_model_source_combo_box.currentIndex() == 0:
-            if self._current_baseline_run_dir():
-                self.transfer_compatibility_status_badge.set_status("Compatible")
-                self.transfer_notes_label.setText("Self-transfer will use the baseline produced in this session.")
-            else:
-                self.transfer_compatibility_status_badge.set_status("Not Checked")
-                self.transfer_notes_label.setText("Run baseline training first, or choose an existing baseline run.")
-            return
-        if self.last_scan_result is None or not self.transfer_base_run_path_edit.text().strip():
-            self.transfer_compatibility_status_badge.set_status("Not Checked")
-            self.transfer_notes_label.setText("Select a baseline run and scan the dataset to validate compatibility.")
-            return
-        result = check_transfer_compatibility(
-            base_run_dir=self.transfer_base_run_path_edit.text().strip(),
-            cache_path=self._ensure_cache_path(),
-            input_feature_path=self.input_feature_path_edit.text().strip() or None,
-            ground_truth_data_dir=self.ground_truth_data_folder_path_edit.text().strip() or None,
-        )
-        self.transfer_compatibility_status_badge.set_status(result["status"])
-        self.transfer_notes_label.setText(result["message"])
-
     def apply_suggested_settings(self) -> None:
         if self.last_suggest_result is None:
             self._show_warning("No suggestion is available yet.")
@@ -1379,7 +1323,10 @@ class MlpTrainingStudio(QMainWindow):
         self.run_state_badge.set_status("Error")
         if self.current_task_name == "scan":
             self.dataset_schema_status_badge.set_status("Error")
-            pass
+        elif self.current_task_name == "suggest":
+            # Don't leave the confidence badge frozen at "Checking".
+            self.initial_suggestion_confidence_badge.set_status("Error")
+            self.initial_suggestion_status_text.setText("Suggestion failed; see the log for details.")
         self.append_log(f"Error: {message}")
         self._show_warning(f"{message}\n\n{traceback_text}")
 
@@ -1456,6 +1403,11 @@ class MlpTrainingStudio(QMainWindow):
             self._update_transfer_progress(payload)
 
     def _on_scan_completed(self, result: dict[str, Any]) -> None:
+        if result.get("status") == "stopped":
+            self.dataset_schema_status_badge.set_status("Not Scanned")
+            self.run_state_badge.set_status("Stopped")
+            self.append_log("Dataset scan stopped before completion.")
+            return
         self.last_scan_result = result
         self._sweep_label = result.get("sweep_label", "Frequency (GHz)")
         self.dataset_schema_status_badge.set_status(result.get("schema_status", "Valid"))
@@ -1464,12 +1416,17 @@ class MlpTrainingStudio(QMainWindow):
         self.append_log(f"Dataset scan completed for {result['dataset_name']}.")
         self._reset_baseline_plots()
         self._reset_transfer_plots()
-        self.validate_transfer_compatibility()
         self._refresh_transfer_note_text()
         self.run_progress_bar.setValue(100)
         self.run_state_badge.set_status("Completed")
 
     def _on_suggest_completed(self, result: dict[str, Any]) -> None:
+        if result.get("status") == "stopped":
+            self.initial_suggestion_confidence_badge.set_status("Stopped")
+            self.initial_suggestion_status_text.setText("Suggestion stopped before completion.")
+            self.run_state_badge.set_status("Stopped")
+            self.append_log("Initial settings suggestion stopped before completion.")
+            return
         self.last_suggest_result = result
         self.initial_suggestion_confidence_badge.set_status(result["confidence"].title())
         self.initial_suggestion_status_text.setText(result["confidence_reason"])
@@ -1486,6 +1443,10 @@ class MlpTrainingStudio(QMainWindow):
     def _on_search_completed(self, result: dict[str, Any]) -> None:
         if not hasattr(self, "search_results_table"):
             self.append_log("Quick search results are not shown because quick search has been removed from the GUI.")
+            return
+        if result.get("status") == "stopped":
+            self.run_state_badge.set_status("Stopped")
+            self.append_log("Quick search stopped before completion.")
             return
         self.last_search_result = result
         self.search_row_configs = [trial["recommended_full_config"] for trial in result["trial_results"]]
@@ -1539,7 +1500,6 @@ class MlpTrainingStudio(QMainWindow):
             self.monitor_tabs.setCurrentIndex(1)
         else:
             self.monitor_tabs.setCurrentIndex(0)
-        self.validate_transfer_compatibility()
 
     def _update_scan_progress(self, payload: dict[str, Any]) -> None:
         event = payload.get("event")
@@ -1779,13 +1739,10 @@ class MlpTrainingStudio(QMainWindow):
             self.run_progress_bar.setValue(int(100.0 * epoch / max(total_epochs, 1)))
         elif event == "evaluation_completed":
             self.baseline_frequency_curve.setData(payload.get("frequency_ghz", []), payload.get("frequency_mae", []))
-            channel_labels = payload.get("channel_mae_with_units")
-            if channel_labels:
-                self.metric_cards["average_mae"].set_value(" | ".join(channel_labels))
-            else:
-                average_mae = payload.get("average_evaluation_mae", payload.get("average_test_mae"))
-                if average_mae is not None:
-                    self.metric_cards["average_mae"].set_value(f"{average_mae:.6f}")
+            # Show a single MAE averaged over all ground-truth channels (no per-channel split).
+            average_mae = payload.get("average_evaluation_mae", payload.get("average_test_mae"))
+            if average_mae is not None:
+                self.metric_cards["average_mae"].set_value(f"{average_mae:.6f}")
         elif event == "completed":
             self.run_progress_bar.setValue(100)
             self.run_state_badge.set_status("Completed")
@@ -1811,13 +1768,6 @@ class MlpTrainingStudio(QMainWindow):
                 self.metric_cards["secondary_progress"].set_value(progress_text)
             else:
                 self.metric_cards["secondary_progress"].set_value("Transfer data ready")
-        elif event == "baseline_metrics_ready":
-            self.last_transfer_base_summary = payload
-            base_average = payload.get("base_average_mae", payload.get("average_mae"))
-            if base_average is not None:
-                self.metric_cards["best_metric"].set_value(f"Base MAE {base_average:.6f}")
-                self.metric_cards["average_mae"].set_value(f"{base_average:.6f}")
-            self._plot_transfer_base_metrics(payload)
         elif event == "iteration_started":
             if payload.get("transfer_iteration") is not None and payload.get("total_iterations") is not None:
                 self.metric_cards["current_progress"].set_value(f"Iteration {payload['transfer_iteration']}/{payload['total_iterations']}")
@@ -1850,9 +1800,14 @@ class MlpTrainingStudio(QMainWindow):
                 return
             transfer_iteration = int(payload["transfer_iteration"])
             self._transfer_iteration_mae_x.append(transfer_iteration)
-            self._transfer_iteration_mae_y.append(float(payload["average_mae"]))
-            self._transfer_frequency_history.append(list(payload.get("frequency_mae", [])))
-            self._plot_transfer_iteration_metrics(payload)
+            # Record per-channel MAE (e.g. gain, phase) so the plot can show them separately.
+            channel_names = list(payload.get("channel_names") or [])
+            per_channel = list(payload.get("per_channel_mae") or [])
+            for name, value in zip(channel_names, per_channel):
+                self._transfer_channel_mae.setdefault(name, []).append(float(value))
+            self._plot_transfer_average()
+            # The card shows a single MAE averaged over all ground-truth channels; the
+            # per-channel breakdown remains in the plot above.
             self.metric_cards["average_mae"].set_value(f"{payload['average_mae']:.6f}")
             self.metric_cards["current_progress"].set_value(f"Iteration {transfer_iteration}/{payload['total_iterations']} complete")
             if payload.get("elapsed_seconds") is not None:
@@ -1887,7 +1842,6 @@ class MlpTrainingStudio(QMainWindow):
             "batch_size": self.baseline_batch_size_spin_box.value(),
             "learning_rate": float(self.baseline_learning_rate_spin_box.value()),
             "weight_decay": float(self.baseline_weight_decay_spin_box.value()),
-            "gradient_clip": float(self.baseline_gradient_clip_spin_box.value()),
             "width": self.baseline_width_spin_box.value(),
             "depth": self.baseline_depth_spin_box.value(),
             "loss_function": self.baseline_loss_function_combo_box.currentText(),
@@ -1900,14 +1854,15 @@ class MlpTrainingStudio(QMainWindow):
     def _apply_baseline_form(self, payload: dict[str, Any]) -> None:
         if not payload:
             return
-        model_type = payload.get("model_type", "FlatMLP")
+        # Normalize legacy names so forms saved before the model rename still
+        # select the right entry in the combo box.
+        model_type = canonical_model_type(payload.get("model_type", "SpectraNet"))
         if model_type in MODEL_TYPES:
             self.baseline_model_type_combo_box.setCurrentText(model_type)
         self.baseline_epochs_spin_box.setValue(int(payload.get("epochs", self.baseline_epochs_spin_box.value())))
         self.baseline_batch_size_spin_box.setValue(int(payload.get("batch_size", self.baseline_batch_size_spin_box.value())))
         self.baseline_learning_rate_spin_box.setValue(float(payload.get("learning_rate", self.baseline_learning_rate_spin_box.value())))
         self.baseline_weight_decay_spin_box.setValue(float(payload.get("weight_decay", self.baseline_weight_decay_spin_box.value())))
-        self.baseline_gradient_clip_spin_box.setValue(float(payload.get("gradient_clip", self.baseline_gradient_clip_spin_box.value())))
         self.baseline_width_spin_box.setValue(int(payload.get("width", self.baseline_width_spin_box.value())))
         self.baseline_depth_spin_box.setValue(int(payload.get("depth", self.baseline_depth_spin_box.value())))
         loss_fn = payload.get("loss_function", "rmse")
@@ -1928,7 +1883,6 @@ class MlpTrainingStudio(QMainWindow):
             "batch_size": self.transfer_batch_size_spin_box.value(),
             "learning_rate": float(self.transfer_learning_rate_spin_box.value()),
             "weight_decay": None if self.transfer_weight_decay_spin_box.value() <= 0.0 else float(self.transfer_weight_decay_spin_box.value()),
-            "gradient_clip": float(self.transfer_gradient_clip_spin_box.value()),
             "seed": self.transfer_seed_spin_box.value(),
         }
 
@@ -1942,7 +1896,6 @@ class MlpTrainingStudio(QMainWindow):
         self.transfer_learning_rate_spin_box.setValue(float(payload.get("learning_rate", self.transfer_learning_rate_spin_box.value())))
         weight_decay = payload.get("weight_decay", None)
         self.transfer_weight_decay_spin_box.setValue(0.0 if weight_decay in (None, "") else float(weight_decay))
-        self.transfer_gradient_clip_spin_box.setValue(float(payload.get("gradient_clip", self.transfer_gradient_clip_spin_box.value())))
         self.transfer_seed_spin_box.setValue(int(payload.get("seed", self.transfer_seed_spin_box.value())))
         self._refresh_transfer_note_text()
 
@@ -1972,7 +1925,6 @@ class MlpTrainingStudio(QMainWindow):
             epochs=form["epochs"],
             learning_rate=form["learning_rate"],
             weight_decay=form["weight_decay"],
-            gradient_clip=form["gradient_clip"],
             train_frac=form["train_frac"],
             val_frac=form["val_frac"],
             width=form["width"],
@@ -1987,19 +1939,23 @@ class MlpTrainingStudio(QMainWindow):
     def _build_transfer_config(self) -> TransferConfig:
         roots = make_run_roots(self.model_output_folder_path_edit.text().strip(), self.run_name_edit.text().strip())
         form = self._collect_transfer_form()
-        base_run_dir = self.transfer_base_run_path_edit.text().strip() if self.transfer_base_model_source_combo_box.currentIndex() == 1 else ""
+        # Standalone transfer trains from scratch, so it needs the model architecture and
+        # data split itself. Source those from the Baseline tab (the model-settings home).
         return TransferConfig(
-            base_run_dir=base_run_dir,
             cache_path=self._ensure_cache_path(),
             output_dir=roots["transfer"],
+            model_type=self.baseline_model_type_combo_box.currentText(),
+            width=self.baseline_width_spin_box.value(),
+            depth=self.baseline_depth_spin_box.value(),
             seed=form["seed"],
+            train_frac=float(self.baseline_train_fraction_spin_box.value()),
+            val_frac=float(self.baseline_validation_fraction_spin_box.value()),
             num_bands=form["num_bands"],
             iterations=form["iterations"],
             transfer_epochs=form["transfer_epochs"],
             batch_size=form["batch_size"],
             learning_rate=form["learning_rate"],
             weight_decay=form["weight_decay"],
-            gradient_clip=form["gradient_clip"],
             use_amp=True,
             device=self._current_device_id(),
         )
@@ -2025,40 +1981,15 @@ class MlpTrainingStudio(QMainWindow):
     def _refresh_transfer_controls_enabled(self) -> None:
         enabled = self.enable_transfer_learning_checkbox.isChecked() and not self._controls_locked
         for widget in (
-            self.transfer_base_model_source_combo_box,
-            self.transfer_base_run_path_edit,
-            self.browse_transfer_base_run_button,
             self.transfer_num_bands_spin_box,
             self.transfer_iterations_spin_box,
             self.transfer_epochs_spin_box,
             self.transfer_batch_size_spin_box,
             self.transfer_learning_rate_spin_box,
             self.transfer_weight_decay_spin_box,
-            self.transfer_gradient_clip_spin_box,
             self.transfer_seed_spin_box,
         ):
             widget.setEnabled(enabled)
-        if not enabled:
-            self.transfer_compatibility_status_badge.set_status("Not Checked")
-            self.transfer_notes_label.setText("Run baseline training first, or choose an existing baseline run.")
-        self._refresh_transfer_source_controls()
-
-    def _refresh_transfer_source_controls(self) -> None:
-        using_existing = self.transfer_base_model_source_combo_box.currentIndex() == 1
-        self.transfer_base_run_path_edit.setEnabled(using_existing and self.enable_transfer_learning_checkbox.isChecked() and not self._controls_locked)
-        self.browse_transfer_base_run_button.setEnabled(using_existing and self.enable_transfer_learning_checkbox.isChecked() and not self._controls_locked)
-        if not using_existing and self.enable_transfer_learning_checkbox.isChecked():
-            if self._current_baseline_run_dir():
-                self.transfer_compatibility_status_badge.set_status("Compatible")
-                self.transfer_notes_label.setText("Self-transfer will use the baseline produced in this session.")
-            else:
-                self.transfer_compatibility_status_badge.set_status("Not Checked")
-                self.transfer_notes_label.setText("Run baseline training first, or choose an existing baseline run.")
-        elif not self.enable_transfer_learning_checkbox.isChecked():
-            self.transfer_compatibility_status_badge.set_status("Not Checked")
-            self.transfer_notes_label.setText("Run baseline training first, or choose an existing baseline run.")
-        else:
-            self.validate_transfer_compatibility()
 
     def _refresh_transfer_note_text(self) -> None:
         if self.last_scan_result is None:
@@ -2080,16 +2011,7 @@ class MlpTrainingStudio(QMainWindow):
                 f"The last {trimmed_frequency_count} frequency point(s) will be discarded during "
                 f"transfer so each band uses {points_per_band} points."
             )
-        if self.transfer_base_model_source_combo_box.currentIndex() == 0 and self.enable_transfer_learning_checkbox.isChecked():
-            prefix = (
-                "Self-transfer will use the baseline from this session."
-                if self._current_baseline_run_dir()
-                else "Run baseline training first, or choose an existing baseline run."
-            )
-        elif self.enable_transfer_learning_checkbox.isChecked():
-            prefix = self.transfer_notes_label.text().split(". ")[0] + "."
-        else:
-            prefix = "Run baseline training first, or choose an existing baseline run."
+        prefix = "Self-transfer trains per-band models from scratch on the scanned dataset."
         self.transfer_notes_label.setText(f"{prefix} {frequency_count} frequency points detected, about {points_per_band:.1f} per band. {suffix}")
 
     def _update_start_button_text(self) -> None:
@@ -2111,7 +2033,6 @@ class MlpTrainingStudio(QMainWindow):
             self.export_onnx_button,
             self.apply_initial_settings_button,
             self.restore_recommended_baseline_button,
-            self.ctle_preset_button,
             self.input_feature_path_edit,
             self.browse_input_feature_button,
             self.ground_truth_data_folder_path_edit,
@@ -2122,7 +2043,6 @@ class MlpTrainingStudio(QMainWindow):
             self.cache_path_edit,
             self.browse_cache_button,
             self.training_tabs,
-            self.browse_transfer_base_run_button,
             self.license_server_url_edit,
             self.test_license_connection_button,
             self.acquire_license_seat_button,
@@ -2157,12 +2077,14 @@ class MlpTrainingStudio(QMainWindow):
 
     def _reset_transfer_plots(self) -> None:
         self._transfer_iteration_mae_x.clear()
-        self._transfer_iteration_mae_y.clear()
-        self._transfer_frequency_history.clear()
-        self._transfer_frequency_items.clear()
-        self.transfer_frequency_mae_plot.clear()
-        sweep = getattr(self, "_sweep_label", "Frequency (GHz)")
-        configure_plot_widget(self.transfer_frequency_mae_plot, title=f"MAE over {sweep} by Transfer Iteration", x_label=sweep, y_label="MAE")
+        self._transfer_channel_mae.clear()
+        self.transfer_average_mae_plot.clear()
+        configure_plot_widget(
+            self.transfer_average_mae_plot,
+            title="MAE by Transfer Iteration (per channel)",
+            x_label="Transfer Iteration",
+            y_label="MAE",
+        )
 
     def _plot_search_tradeoff(self, trials: list[dict[str, Any]]) -> None:
         self._reset_search_plot()
@@ -2176,29 +2098,24 @@ class MlpTrainingStudio(QMainWindow):
             self.search_tradeoff_plot.addItem(label)
             self._search_text_items.append(label)
 
-    def _plot_transfer_base_metrics(self, payload: dict[str, Any]) -> None:
+    def _plot_transfer_average(self) -> None:
+        """Show each output channel's MAE per transfer iteration (e.g. gain and phase
+        as separate lines), matching the baseline's per-channel MAE calculation."""
+        self.transfer_average_mae_plot.clear()
         colors = plot_color_cycle()
-        if payload.get("frequency_ghz") and payload.get("base_frequency_mae"):
-            item = self.transfer_frequency_mae_plot.plot(
-                payload["frequency_ghz"],
-                payload["base_frequency_mae"],
-                pen=pg.mkPen(colors[4], width=2.0, style=Qt.PenStyle.DashLine),
-                name="Base",
-            )
-            self._transfer_frequency_items.append(item)
-
-    def _plot_transfer_iteration_metrics(self, payload: dict[str, Any]) -> None:
-        colors = plot_color_cycle()
-        index = max(len(self._transfer_frequency_history) - 1, 0)
-        color = colors[index % len(colors)]
-        if payload.get("frequency_ghz") and payload.get("frequency_mae"):
-            item = self.transfer_frequency_mae_plot.plot(
-                payload["frequency_ghz"],
-                payload["frequency_mae"],
+        if not self._transfer_iteration_mae_x:
+            return
+        for index, (name, values) in enumerate(self._transfer_channel_mae.items()):
+            color = colors[index % len(colors)]
+            self.transfer_average_mae_plot.plot(
+                self._transfer_iteration_mae_x,
+                values,
                 pen=pg.mkPen(color, width=2.2),
-                name=f"T={payload['transfer_iteration']}",
+                symbol="o",
+                symbolSize=8,
+                symbolBrush=color,
+                name=name,
             )
-            self._transfer_frequency_items.append(item)
 
     # ------------------------------------------------------------------
     # Misc helpers
@@ -2352,12 +2269,6 @@ class MlpTrainingStudio(QMainWindow):
             return
         self._show_warning("No recommended baseline configuration is available yet.")
 
-    def _apply_ctle_preset(self) -> None:
-        from .runner import TrainConfig
-        config = TrainConfig.preset("CTLE")
-        self._apply_baseline_form(asdict(config))
-        self.append_log("Applied CTLE preset (notebook-validated defaults).")
-
     def _validate_split_fractions(self) -> bool:
         train_frac = float(self.baseline_train_fraction_spin_box.value())
         val_frac = float(self.baseline_validation_fraction_spin_box.value())
@@ -2382,12 +2293,6 @@ class MlpTrainingStudio(QMainWindow):
             self._show_warning(
                 f"The selected number of frequency bands ({num_bands}) exceeds the detected frequency count ({frequency_count})."
             )
-            return False
-        if self.transfer_base_model_source_combo_box.currentIndex() == 0 and self._current_baseline_run_dir() is None:
-            self._show_warning("Run baseline training first, or choose an existing baseline run for self-transfer learning.")
-            return False
-        if self.transfer_base_model_source_combo_box.currentIndex() == 1 and self.transfer_compatibility_status_badge.text() != "Compatible":
-            self._show_warning("The selected existing baseline run is not compatible with the current dataset/cache.")
             return False
         return True
 
@@ -2548,13 +2453,10 @@ class MlpTrainingStudio(QMainWindow):
             self._baseline_val_losses = [float(entry["val_loss"]) for entry in history if "val_loss" in entry]
             self.baseline_train_curve.setData(self._baseline_epochs, self._baseline_train_losses)
             self.baseline_val_curve.setData(self._baseline_epochs, self._baseline_val_losses)
-        channel_labels = summary.get("channel_mae_with_units")
-        if channel_labels:
-            self.metric_cards["average_mae"].set_value(" | ".join(channel_labels))
-        else:
-            average_mae = summary.get("average_evaluation_mae", summary.get("average_test_mae"))
-            if average_mae is not None:
-                self.metric_cards["average_mae"].set_value(f"{float(average_mae):.6f}")
+        # Show a single MAE averaged over all ground-truth channels (no per-channel split).
+        average_mae = summary.get("average_evaluation_mae", summary.get("average_test_mae"))
+        if average_mae is not None:
+            self.metric_cards["average_mae"].set_value(f"{float(average_mae):.6f}")
         best_val_loss = summary.get("best_val_loss")
         if best_val_loss is not None:
             self.metric_cards["best_metric"].set_value(f"Best val {float(best_val_loss):.6f}")
@@ -2700,7 +2602,7 @@ class MlpTrainingStudio(QMainWindow):
         self.run_log_text_edit.verticalScrollBar().setValue(self.run_log_text_edit.verticalScrollBar().maximum())
 
     def _show_warning(self, text: str) -> None:
-        QMessageBox.warning(self, "Surrogate Model Traning Suite", text)
+        QMessageBox.warning(self, "Surrogate Model Training Suite", text)
 
     def _format_seconds(self, value: Any) -> str:
         if value in (None, "", "-"):
@@ -2722,7 +2624,12 @@ class MlpTrainingStudio(QMainWindow):
         if self.current_task is not None and self.current_task.thread is not None and self.current_task.thread.isRunning():
             self.current_task.stop()
             self.current_task.thread.quit()
-            self.current_task.thread.wait(3000)
+            # Workers poll should_stop between batches/samples, so give them time
+            # to unwind. Destroying a QThread that is still running aborts the
+            # whole process, so fall back to terminate() as the lesser evil.
+            if not self.current_task.thread.wait(10000):
+                self.current_task.thread.terminate()
+                self.current_task.thread.wait(2000)
         self.license_controller.shutdown()
         super().closeEvent(event)
 

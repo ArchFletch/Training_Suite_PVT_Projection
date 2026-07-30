@@ -25,7 +25,7 @@ It must prove the same happy path:
 
 ## Required Inputs
 
-- Windows GUI installer for `Surrogate Model Traning Suite`
+- Windows GUI installer for `Surrogate Model Training Suite`
 - Windows license-server service bundle
 - internal vendor-tool runtime for issuing the evaluation license
 - a clean external workspace under `MLP_modeling_v2_runtime\install-smoke\`
@@ -41,7 +41,7 @@ It must prove the same happy path:
 
 ### Expected Install Roots
 
-- GUI install root: `%LOCALAPPDATA%\Programs\Surrogate Model Traning Suite\`
+- GUI install root: `%LOCALAPPDATA%\Programs\Surrogate Model Training Suite\`
 - server install root: `C:\Program Files\MLP License Server\`
 - server runtime root: `%PROGRAMDATA%\MLP License Server\`
 
@@ -75,11 +75,11 @@ It must prove the same happy path:
 
 - run the GUI installer in a clean user context
 - repeat with silent install as part of release validation
-- confirm the installed EXE launches from `%LOCALAPPDATA%\Programs\Surrogate Model Traning Suite\`
+- confirm the installed EXE launches from `%LOCALAPPDATA%\Programs\Surrogate Model Training Suite\`
 
 ### 6. Configure The GUI
 
-- pre-seed or update `%APPDATA%\Surrogate Model Traning Suite\license_client.json` with:
+- pre-seed or update `%APPDATA%\Surrogate Model Training Suite\license_client.json` with:
 
 ```json
 {

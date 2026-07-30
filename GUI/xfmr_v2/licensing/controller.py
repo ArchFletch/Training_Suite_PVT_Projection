@@ -143,6 +143,27 @@ class LicenseLeaseController:
         except LicenseClientError as exc:
             return self._handle_heartbeat_failure(snapshot, str(exc))
 
+        if not result.ok:
+            # The server answered and rejected the lease (expired, evicted, or
+            # machine mismatch). Unlike a network failure this is authoritative —
+            # the seat is gone and may already be in use elsewhere — so fail
+            # closed immediately instead of entering the grace window.
+            reason = result.message or result.reason_code or "the lease is no longer valid"
+            state = replace(
+                snapshot,
+                phase="license_required",
+                badge_text="License Required",
+                message=(
+                    f"The license server rejected the seat lease ({reason}). "
+                    "Finish the current run, then reconnect before starting another."
+                ),
+                lease_id=None,
+                expires_at=None,
+                heartbeat_failures=snapshot.heartbeat_failures + 1,
+                last_error=reason,
+            )
+            return self._set_state_for_lease(state, snapshot)
+
         now = self._now()
         state = replace(
             snapshot,
@@ -155,8 +176,7 @@ class LicenseLeaseController:
             grace_deadline=None,
             last_error=None,
         )
-        self._set_state(state)
-        return state
+        return self._set_state_for_lease(state, snapshot)
 
     def release(self) -> LicenseLeaseState:
         """Stop heartbeats and release the current seat when possible."""
@@ -173,22 +193,29 @@ class LicenseLeaseController:
 
     def _start_heartbeat_thread(self) -> None:
         self._stop_heartbeat_thread()
-        self._heartbeat_stop = threading.Event()
-        thread = threading.Thread(target=self._heartbeat_loop, name="license-heartbeat", daemon=True)
+        stop_event = threading.Event()
+        self._heartbeat_stop = stop_event
+        # The loop holds its own stop event: reading self._heartbeat_stop from the
+        # loop would let an old thread (still in a slow HTTP call when its 1 s
+        # join times out) latch onto the replacement event and run forever
+        # alongside the new thread.
+        thread = threading.Thread(
+            target=self._heartbeat_loop, args=(stop_event,), name="license-heartbeat", daemon=True
+        )
         self._heartbeat_thread = thread
         thread.start()
 
-    def _heartbeat_loop(self) -> None:
+    def _heartbeat_loop(self, stop_event: threading.Event) -> None:
         while True:
             snapshot = self.state
             if not snapshot.lease_id:
                 return
             wait_seconds = float(snapshot.heartbeat_interval_seconds or 30.0)
-            if self._heartbeat_stop.wait(wait_seconds):
+            if stop_event.wait(wait_seconds):
                 return
             updated = self.send_heartbeat_once()
             if updated.phase == "license_required":
-                self._heartbeat_stop.set()
+                stop_event.set()
                 return
 
     def _handle_heartbeat_failure(self, snapshot: LicenseLeaseState, error_message: str) -> LicenseLeaseState:
@@ -210,8 +237,7 @@ class LicenseLeaseController:
                 grace_deadline=grace_deadline,
                 last_error=error_message,
             )
-            self._set_state(state)
-            return state
+            return self._set_state_for_lease(state, snapshot)
 
         remaining_seconds = max(int((grace_deadline - now).total_seconds()), 0)
         state = replace(
@@ -226,8 +252,7 @@ class LicenseLeaseController:
             grace_deadline=grace_deadline,
             last_error=error_message,
         )
-        self._set_state(state)
-        return state
+        return self._set_state_for_lease(state, snapshot)
 
     def _release_active_lease(self, *, update_state: bool) -> LicenseLeaseState:
         snapshot = self.state
@@ -293,6 +318,26 @@ class LicenseLeaseController:
             self._state = state
         if callback is not None:
             callback(state)
+
+    def _set_state_for_lease(self, state: LicenseLeaseState, snapshot: LicenseLeaseState) -> LicenseLeaseState:
+        """Apply a heartbeat result only if the lease it was sent for is still current.
+
+        A heartbeat is a snapshot-read, network call, write-back sequence with no
+        lock held across the call. If a release, reconnect, or clear happened while
+        the request was in flight, writing the result back would resurrect the old
+        lease state — so it is discarded instead.
+        """
+        callback = self._state_callback
+        with self._lock:
+            if (
+                self._state.lease_id != snapshot.lease_id
+                or self._state.server_url != snapshot.server_url
+            ):
+                return self._state
+            self._state = state
+        if callback is not None:
+            callback(state)
+        return state
 
 
 def _checked_out_message(

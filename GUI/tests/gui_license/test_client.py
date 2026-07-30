@@ -63,7 +63,7 @@ def test_http_client_calls_status_checkout_heartbeat_and_release(monkeypatch) ->
             "http://license-host:27850/api/v1/checkout",
             "POST",
             {
-                "product": "Surrogate Model Traning Suite",
+                "product": "Surrogate Model Training Suite",
                 "product_version": "0.1.0",
                 "machine_id": "gui_machine",
                 "hostname": "eda-win-17",

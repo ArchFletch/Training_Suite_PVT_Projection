@@ -42,7 +42,7 @@ render_args=(
   "$repo_root/packaging/render_pyside6_spec.py"
   --template "$spec_template"
   --output "$spec_path"
-  --title "Surrogate Model Traning Suite"
+  --title "Surrogate Model Training Suite"
   --project-dir "$repo_root"
   --input-file "$input_file"
   --exec-directory "$output_dir"

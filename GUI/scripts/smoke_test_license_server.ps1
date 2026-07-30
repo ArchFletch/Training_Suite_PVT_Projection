@@ -443,7 +443,7 @@ if ($Mode -eq "source") {
     } else {
         $serverRunBaseArgs = @("--host", $ServerHost, "--port", $ServerPort)
     }
-    $LicenseClientConfigPath = Resolve-DefaultPath -Value $LicenseClientConfigPath -DefaultValue (Join-Path $env:APPDATA "Surrogate Model Traning Suite\license_client.json")
+    $LicenseClientConfigPath = Resolve-DefaultPath -Value $LicenseClientConfigPath -DefaultValue (Join-Path $env:APPDATA "Surrogate Model Training Suite\license_client.json")
 }
 
 if ($StopServer) {
@@ -565,7 +565,7 @@ print(key_pem)
         }
 
         $checkoutPayload = @{
-            product = "Surrogate Model Traning Suite"
+            product = "Surrogate Model Training Suite"
             product_version = "0.1.0"
             machine_id = "smoke-client-1"
             hostname = $env:COMPUTERNAME

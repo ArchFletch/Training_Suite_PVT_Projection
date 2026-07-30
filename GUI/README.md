@@ -92,23 +92,18 @@ Tracked packaging assets live in [`packaging/`](packaging/).
 The root entrypoints keep the common training workflows easy to run from a source checkout:
 
 ```powershell
-python prepare_cache.py
+python prepare_cache.py <path-to-dataset-folder>
 python suggest_initial_settings.py
 python quick_search.py
 python train_baseline.py
 python run_self_transfer.py --base-run-dir <path-to-compatible-baseline-run>
 ```
 
-The data entrypoints also support separate input-feature-table and ground-truth paths:
-
-```powershell
-python prepare_cache.py --input-feature-path <path-to-log.txt> --ground-truth-data-dir <path-to-SPData>
-python suggest_initial_settings.py --input-feature-path <path-to-log.txt> --ground-truth-data-dir <path-to-SPData>
-python quick_search.py --input-feature-path <path-to-log.txt> --ground-truth-data-dir <path-to-SPData>
-python train_baseline.py --input-feature-path <path-to-log.txt> --ground-truth-data-dir <path-to-SPData>
-```
-
-If neither `--input-feature-path` nor `--ground-truth-data-dir` is provided, the scripts continue to support the legacy `--data-root` layout.
+`prepare_cache.py` auto-detects the dataset format (SPData/Touchstone or Cadence CSV)
+from the folder contents. The other entrypoints build the cache on demand when it is
+missing — point them at the dataset with `--data-root <path-to-dataset-folder>` (or
+the explicit `--input-feature-path` / `--ground-truth-data-dir` paths, which are used
+to locate the dataset folder).
 
 ### Desktop GUI
 

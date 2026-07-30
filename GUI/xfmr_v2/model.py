@@ -1,9 +1,9 @@
-"""Compact feed-forward models for XFMR spectral prediction.
+"""Compact feed-forward surrogate models for XFMR spectral prediction.
 
 Each model maps per-sample input features to an entire ``(channels, frequency)``
 output curve in one shot:
-- :class:`FlatMLPNet` is a single MLP from inputs to the flattened output.
-- :class:`CTLEMultiTaskMLP` shares an encoder and uses one linear head per channel.
+- :class:`SpectraNet` is a single dense network from inputs to the flattened output.
+- :class:`SpectraHydra` shares an encoder and uses one linear head per channel.
 """
 
 from __future__ import annotations
@@ -12,8 +12,8 @@ import torch
 from torch import nn
 
 
-class MLP(nn.Module):
-    """Shared MLP helper used by the models below."""
+class DenseStack(nn.Module):
+    """Shared dense feed-forward stack used by the models below."""
 
     def __init__(self, in_dim: int, hidden: int, out_dim: int, depth: int) -> None:
         super().__init__()
@@ -37,11 +37,11 @@ class MLP(nn.Module):
         return self.network(x)
 
 
-class FlatMLPNet(nn.Module):
-    """Standalone MLP that directly maps input features to the full spectral output.
+class SpectraNet(nn.Module):
+    """Standalone dense network that maps input features to the full spectral output.
 
-    It does not use frequency coordinates; it predicts the entire
-    ``(channels, num_frequencies)`` output from input features in one shot.
+    It predicts the entire ``(channels, num_frequencies)`` output from input
+    features in one shot.
 
     The ``num_frequencies`` value must be provided at construction time because
     the output layer size depends on it.
@@ -58,15 +58,14 @@ class FlatMLPNet(nn.Module):
         super().__init__()
         self.ground_truth_channels = ground_truth_channels
         self.num_frequencies = num_frequencies
-        self.network = MLP(
+        self.network = DenseStack(
             input_feature_dim,
             width,
             ground_truth_channels * num_frequencies,
             depth,
         )
 
-    def forward(self, input_features: torch.Tensor, frequency: torch.Tensor) -> torch.Tensor:
-        # ``frequency`` is accepted for interface compatibility but not used.
+    def forward(self, input_features: torch.Tensor) -> torch.Tensor:
         out = self.network(input_features)
         return out.view(input_features.shape[0], self.ground_truth_channels, self.num_frequencies)
 
@@ -101,18 +100,14 @@ def _symmetric_hidden_sizes(width: int, depth: int) -> list[int]:
     return expanding + expanding[::-1]
 
 
-class CTLEMultiTaskMLP(nn.Module):
-    """Shared-encoder MLP with per-channel output heads.
+class SpectraHydra(nn.Module):
+    """Shared-encoder network with per-channel output heads.
 
-    This architecture mirrors the CTLE training notebooks: a stack of
-    ``Linear → LayerNorm → GELU`` blocks forms a shared encoder, and each
-    ground-truth channel gets its own linear output head.  The model does
-    **not** use frequency coordinates; it predicts all frequency points in
-    one shot, similar to :class:`FlatMLPNet`.
-
-    The ``forward`` method accepts the same ``(input_features, frequency)``
-    signature as the other models for interface compatibility, but ``frequency``
-    is unused.
+    A stack of ``Linear → LayerNorm → GELU`` blocks forms a shared encoder
+    (a "trunk"), and each ground-truth channel gets its own linear output
+    head -- many heads on one body, hence the name.  The architecture mirrors
+    the original CTLE training notebooks.  It predicts all frequency points in
+    one shot, similar to :class:`SpectraNet`.
     """
 
     def __init__(
@@ -147,7 +142,7 @@ class CTLEMultiTaskMLP(nn.Module):
             nn.Linear(dim, num_frequencies) for _ in range(ground_truth_channels)
         ])
 
-    def forward(self, input_features: torch.Tensor, frequency: torch.Tensor) -> torch.Tensor:
+    def forward(self, input_features: torch.Tensor) -> torch.Tensor:
         latent = self.encoder(input_features)
         # Stack per-channel predictions into (batch, channels, frequency).
         return torch.stack([head(latent) for head in self.heads], dim=1)

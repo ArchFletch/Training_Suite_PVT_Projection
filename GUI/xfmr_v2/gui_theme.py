@@ -1,4 +1,4 @@
-"""Visual theme helpers for the Surrogate Model Traning Suite GUI.
+"""Visual theme helpers for the Surrogate Model Training Suite GUI.
 
 The GUI code imports these helpers from many places, so this module keeps the
 visual constants and styling routines in one spot. That way a rename, palette

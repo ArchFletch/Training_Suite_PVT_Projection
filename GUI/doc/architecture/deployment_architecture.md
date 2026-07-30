@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Implementation-oriented architecture for how `Surrogate Model Traning Suite`
+Implementation-oriented architecture for how `Surrogate Model Training Suite`
 moves from a source checkout into customer-facing Windows installs.
 
 ## Deployment Modes
@@ -50,14 +50,14 @@ flowchart LR
 ### Install Topology
 
 - installer: per-user EXE
-- install root: `%LOCALAPPDATA%\Programs\Surrogate Model Traning Suite\`
+- install root: `%LOCALAPPDATA%\Programs\Surrogate Model Training Suite\`
 - no administrator rights required for the design engineer install
 
 ### Writable State
 
-- license client config: `%APPDATA%\Surrogate Model Traning Suite\license_client.json`
-- session state and logs: `%LOCALAPPDATA%\Surrogate Model Traning Suite\`
-- default run outputs: `%USERPROFILE%\Documents\Surrogate Model Traning Suite\Runs\`
+- license client config: `%APPDATA%\Surrogate Model Training Suite\license_client.json`
+- session state and logs: `%LOCALAPPDATA%\Surrogate Model Training Suite\`
+- default run outputs: `%USERPROFILE%\Documents\Surrogate Model Training Suite\Runs\`
 
 ### Runtime Boundary
 

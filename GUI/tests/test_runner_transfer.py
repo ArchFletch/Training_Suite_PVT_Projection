@@ -27,7 +27,7 @@ def test_train_band_reports_elapsed_and_eta(monkeypatch) -> None:
         "width": 8,
         "depth": 2,
     }
-    init_model = runner.FlatMLPNet(num_frequencies=3, **model_kwargs)
+    init_model = runner.SpectraNet(num_frequencies=3, **model_kwargs)
     init_state = runner.clone_state(init_model.state_dict())
     loader = DataLoader(
         # A tiny deterministic tensor dataset is enough because the patched epoch
@@ -42,18 +42,16 @@ def test_train_band_reports_elapsed_and_eta(monkeypatch) -> None:
         model_kwargs=model_kwargs,
         init_state=init_state,
         loader=loader,
-        freq_slice=torch.tensor([0.0, 0.5, 1.0], dtype=torch.float32).numpy(),
         device=torch.device("cpu"),
         amp=False,
         epochs=2,
         lr=1e-3,
         weight_decay=0.0,
-        grad_clip=1.0,
         show_progress=False,
         progress_callback=events.append,
         event_context={"band_run_index": 2, "total_band_runs": 5},
         run_start_time=perf_counter() - 0.5,
-        model_type="FlatMLP",
+        model_type="SpectraNet",
         num_frequencies=3,
     )
 
@@ -64,3 +62,40 @@ def test_train_band_reports_elapsed_and_eta(monkeypatch) -> None:
     assert all("eta_seconds" in event["data"] for event in epoch_events)
     assert all(event["data"]["elapsed_seconds"] >= 0.0 for event in epoch_events)
     assert all(event["data"]["eta_seconds"] >= 0.0 for event in epoch_events)
+
+
+def test_legacy_model_type_names_still_build() -> None:
+    """Runs saved under the pre-rename names must still load after the rename.
+
+    ``canonical_model_type`` maps the legacy strings, and ``build_model`` applies
+    it, so an old checkpoint's ``model_type`` instantiates the renamed class.
+    """
+    from xfmr_v2.model import SpectraHydra, SpectraNet
+
+    assert runner.canonical_model_type("FlatMLP") == "SpectraNet"
+    assert runner.canonical_model_type("CTLE_MLP") == "SpectraHydra"
+    # Current names pass through unchanged.
+    assert runner.canonical_model_type("SpectraNet") == "SpectraNet"
+    assert runner.canonical_model_type("SpectraHydra") == "SpectraHydra"
+
+    kwargs = {"input_feature_dim": 1, "ground_truth_channels": 1, "width": 8, "depth": 2}
+    assert isinstance(runner.build_model("FlatMLP", num_frequencies=3, **kwargs), SpectraNet)
+    assert isinstance(runner.build_model("CTLE_MLP", num_frequencies=3, **kwargs), SpectraHydra)
+
+
+def test_train_baseline_stop_returns_stopped_summary() -> None:
+    """Stopping a baseline run must return a 'stopped' summary, not raise KeyError.
+
+    Regression: a cancelled run yields a partial result without 'run_dir' (and the
+    other completed-run keys); train_baseline used to index those unconditionally and
+    crash with KeyError('run_dir'). The stop check fires before any data is touched.
+    """
+    summary = runner.train_baseline(
+        runner.TrainConfig(),
+        show_progress=False,
+        should_stop=lambda: True,
+    )
+    assert summary["status"] == "stopped"
+    # The completed-run keys must be absent rather than raising.
+    assert "run_dir" not in summary
+    assert "test_loss" not in summary

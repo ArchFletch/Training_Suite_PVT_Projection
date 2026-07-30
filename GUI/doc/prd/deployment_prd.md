@@ -2,7 +2,7 @@
 
 ## Product
 
-Windows delivery workflow for `Surrogate Model Traning Suite` and its on-prem
+Windows delivery workflow for `Surrogate Model Training Suite` and its on-prem
 license server.
 
 ## Goal
@@ -42,7 +42,7 @@ Deliver an EDA-style Windows install experience where:
 ### Design Engineer Workflow
 
 1. Run the Windows GUI installer.
-2. Launch `Surrogate Model Traning Suite` from the Start menu or desktop shortcut.
+2. Launch `Surrogate Model Training Suite` from the Start menu or desktop shortcut.
 3. Use a saved or pre-seeded server URL.
 4. Start work only after seat checkout succeeds.
 
@@ -98,7 +98,7 @@ Deliver an EDA-style Windows install experience where:
 
 ## Success Criteria
 
-- A design engineer can install and launch `Surrogate Model Traning Suite` from a normal Windows installer.
+- A design engineer can install and launch `Surrogate Model Training Suite` from a normal Windows installer.
 - Customer IT can install the Windows service bundle and reach a running server at the configured LAN URL.
 - A clean-install rehearsal proves checkout, heartbeat, and release without relying on source folders.
 

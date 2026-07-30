@@ -5,7 +5,7 @@ param(
     [string]$ServiceArguments = "",
     [string]$ServiceId = "mlp-license-server",
     [string]$ServiceName = "MLP License Server",
-    [string]$ServiceDescription = "On-prem floating license server for Surrogate Model Traning Suite",
+    [string]$ServiceDescription = "On-prem floating license server for Surrogate Model Training Suite",
     [string]$ServiceRoot = "$env:ProgramFiles\MLP License Server",
     [string]$ProgramDataRoot = "$env:ProgramData\MLP License Server",
     [string]$ConfigTemplatePath = "",

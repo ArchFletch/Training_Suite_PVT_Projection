@@ -1,4 +1,4 @@
-"""GUI interaction tests for the Surrogate Model Traning Suite."""
+"""GUI interaction tests for the Surrogate Model Training Suite."""
 
 from __future__ import annotations
 
@@ -64,10 +64,9 @@ def test_window_scan_and_suggest_populate_preview_and_forms(
 
     gui_window.scan_dataset()
     assert gui_window.dataset_schema_status_badge.text() == "Valid"
-    assert gui_window.detected_dataset_readme_value.text().endswith("README.md")
     assert gui_window.data_preview_table.rowCount() >= 10
-    assert gui_window.scan_data_button.text() == "Scan Data"
-    assert "[Scan] Loaded ground-truth sample" in gui_window.run_log_text_edit.toPlainText()
+    assert gui_window.scan_dataset_button.text() == "Scan Dataset"
+    assert "[Scan] Dataset scan completed" in gui_window.run_log_text_edit.toPlainText()
     assert gui_window.metric_cards["current_phase"].value_label.text() == "Scan"
 
     gui_window.run_suggest_initial_settings()
@@ -94,11 +93,13 @@ def test_window_exposes_separate_baseline_and_transfer_actions(gui_window) -> No
     assert [gui_window.monitor_tabs.tabText(index) for index in range(gui_window.monitor_tabs.count())] == [
         "Baseline Monitor",
         "Transfer Results",
+        "Test Samples",
     ]
     transfer_tab = gui_window.monitor_tabs.widget(1)
     assert transfer_tab.layout().count() == 1
     assert not hasattr(gui_window, "transfer_training_loss_plot")
-    assert not hasattr(gui_window, "transfer_average_mae_plot")
+    # The average-MAE-per-iteration plot was reintroduced with the avg-MAE display.
+    assert hasattr(gui_window, "transfer_average_mae_plot")
     assert not hasattr(gui_window, "transfer_band_mae_plot")
 
 
@@ -144,29 +145,6 @@ def test_manual_cache_path_is_preserved_on_run_name_change(gui_window, tmp_path:
     assert gui_window.cache_path_edit.text() == manual_cache_path
 
 
-def test_window_existing_transfer_base_updates_compatibility_status(
-    gui_window,
-    synthetic_dataset: dict[str, Path],
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _configure_dataset_paths(gui_window, synthetic_dataset, tmp_path)
-    gui_window.scan_dataset()
-
-    monkeypatch.setattr(
-        gui_window_module,
-        "check_transfer_compatibility",
-        lambda **kwargs: {"status": "Compatible", "message": "Compatible synthetic baseline."},
-    )
-
-    gui_window.transfer_base_model_source_combo_box.setCurrentIndex(1)
-    gui_window.transfer_base_run_path_edit.setText(str(tmp_path / "existing_baseline"))
-    gui_window.validate_transfer_compatibility()
-
-    assert gui_window.transfer_compatibility_status_badge.text() == "Compatible"
-    assert "Compatible synthetic baseline" in gui_window.transfer_notes_label.text()
-
-
 def test_window_baseline_training_progress_updates_live_metrics_and_plots(
     gui_window,
     synthetic_dataset: dict[str, Path],
@@ -180,13 +158,11 @@ def test_window_baseline_training_progress_updates_live_metrics_and_plots(
         *,
         baseline_config,
         transfer_config,
-        transfer_base_run_dir,
         progress_callback=None,
         should_stop=None,
     ):
         assert baseline_config is not None
         assert transfer_config is None
-        assert transfer_base_run_dir is None
         emit_progress(progress_callback, event="started", phase="baseline", message="Baseline started.")
         emit_progress(
             progress_callback,
@@ -230,6 +206,10 @@ def test_window_baseline_training_progress_updates_live_metrics_and_plots(
             event="evaluation_completed",
             phase="baseline",
             average_evaluation_mae=0.05,
+            # Per-channel values are still emitted, but the card must ignore them and
+            # show only the single average over all ground-truth channels.
+            per_channel_mae=[0.06, 0.04],
+            channel_mae_with_units=["gain: 0.0600 dB", "phase: 0.0400 deg"],
             frequency_ghz=[2.0, 3.0, 4.0],
             frequency_mae=[0.05, 0.04, 0.03],
             message="Baseline evaluation complete.",
@@ -245,6 +225,7 @@ def test_window_baseline_training_progress_updates_live_metrics_and_plots(
                 ],
                 "best_val_loss": 0.12,
                 "average_evaluation_mae": 0.05,
+                "channel_mae_with_units": ["gain: 0.0600 dB", "phase: 0.0400 deg"],
                 "runtime_seconds": 2.0,
             },
             "transfer": None,
@@ -256,11 +237,15 @@ def test_window_baseline_training_progress_updates_live_metrics_and_plots(
     assert gui_window.last_workflow_summary["status"] == "ok"
     assert gui_window.run_state_badge.text() == "Completed"
     assert gui_window._baseline_epochs == [1, 2]
+    # The card shows the single MAE averaged over all channels, not the per-channel
+    # breakdown that was also emitted (in both the live event and the summary).
     assert gui_window.metric_cards["average_mae"].value_label.text() == "0.050000"
     assert gui_window.last_baseline_summary["run_dir"].endswith("baseline_run")
+    # Elapsed shows the real runtime (runtime_seconds=2.0) once baseline training completes.
+    assert gui_window.metric_cards["elapsed"].value_label.text() == "2s"
 
 
-def test_window_transfer_training_uses_latest_baseline_from_session(
+def test_window_transfer_training_standalone_reports_per_channel_mae(
     gui_window,
     synthetic_dataset: dict[str, Path],
     tmp_path: Path,
@@ -268,61 +253,18 @@ def test_window_transfer_training_uses_latest_baseline_from_session(
 ) -> None:
     _configure_dataset_paths(gui_window, synthetic_dataset, tmp_path)
     gui_window.scan_dataset()
-    gui_window.last_baseline_summary = {"run_dir": str(tmp_path / "baseline_run")}
-    gui_window.transfer_base_model_source_combo_box.setCurrentIndex(0)
     gui_window.transfer_num_bands_spin_box.setValue(3)
-    gui_window.validate_transfer_compatibility()
 
     def fake_run_training_workflow(
         *,
         baseline_config,
         transfer_config,
-        transfer_base_run_dir,
         progress_callback=None,
         should_stop=None,
     ):
+        # Standalone transfer: no baseline involved.
         assert baseline_config is None
         assert transfer_config is not None
-        assert transfer_base_run_dir == str(tmp_path / "baseline_run")
-        emit_progress(
-            progress_callback,
-            event="baseline_metrics_ready",
-            phase="transfer",
-            base_average_mae=0.05,
-            base_frequency_mae=[0.05, 0.04, 0.03],
-            base_band_mae=[0.05, 0.04, 0.03],
-            frequency_ghz=[2.0, 3.0, 4.0],
-            message="Transfer baseline metrics ready.",
-        )
-        emit_progress(
-            progress_callback,
-            event="band_started",
-            phase="transfer",
-            transfer_iteration=1,
-            direction="forward",
-            band_index=1,
-            num_bands=3,
-            band_run_index=2,
-            total_band_runs=5,
-            message="Band training started.",
-        )
-        emit_progress(
-            progress_callback,
-            event="band_epoch_end",
-            phase="transfer",
-            transfer_iteration=1,
-            direction="forward",
-            band_index=1,
-            num_bands=3,
-            band_run_index=2,
-            total_band_runs=5,
-            epoch=1,
-            total_epochs=2,
-            train_loss=0.08,
-            elapsed_seconds=5.0,
-            eta_seconds=7.0,
-            message="Band epoch 1 complete.",
-        )
         emit_progress(
             progress_callback,
             event="iteration_completed",
@@ -330,6 +272,8 @@ def test_window_transfer_training_uses_latest_baseline_from_session(
             transfer_iteration=1,
             total_iterations=1,
             average_mae=0.025,
+            per_channel_mae=[0.03, 0.02],
+            channel_names=["gain", "phase"],
             frequency_ghz=[2.0, 3.0, 4.0],
             frequency_mae=[0.03, 0.02, 0.01],
             band_mae=[0.03, 0.02, 0.01],
@@ -358,6 +302,10 @@ def test_window_transfer_training_uses_latest_baseline_from_session(
     assert gui_window.last_workflow_summary["status"] == "ok"
     assert gui_window.run_state_badge.text() == "Completed"
     assert gui_window._transfer_iteration_mae_x == [1]
+    # Gain and phase are tracked separately for the per-channel transfer plot.
+    assert gui_window._transfer_channel_mae == {"gain": [0.03], "phase": [0.02]}
+    # The card itself shows the single MAE averaged over all channels (not per-channel).
+    assert gui_window.metric_cards["average_mae"].value_label.text() == "0.025000"
     assert gui_window.metric_cards["elapsed"].value_label.text() == "9s"
     assert gui_window.metric_cards["eta"].value_label.text() == "0s"
 
@@ -372,7 +320,7 @@ def _write_minimal_baseline_checkpoint(run_dir: Path) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     n_features, channels, freqs, width, depth = 4, 2, 8, 16, 3
     model = build_model(
-        "CTLE_MLP",
+        "SpectraHydra",
         num_frequencies=freqs,
         input_feature_dim=n_features,
         ground_truth_channels=channels,
@@ -382,7 +330,7 @@ def _write_minimal_baseline_checkpoint(run_dir: Path) -> None:
     torch.save(
         {
             "model_state": model.state_dict(),
-            "config": {"model_type": "CTLE_MLP", "width": width, "depth": depth, "cache_path": ""},
+            "config": {"model_type": "SpectraHydra", "width": width, "depth": depth, "cache_path": ""},
             "active_input_feature_names": [f"f{i}" for i in range(n_features)],
             "target_channel_names": ["gain", "phase"],
             "input_feature_mean": np.zeros(n_features, dtype=np.float32),
