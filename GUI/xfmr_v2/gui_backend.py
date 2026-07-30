@@ -67,7 +67,7 @@ def scan_dataset(
 ) -> dict[str, Any]:
     """Load an existing cache and summarize the dataset for the GUI.
 
-    New caches are created via ``build_cache_from_loader``.  This function
+    New caches are created via ``build_cache_from_dataset``.  This function
     only loads caches that already exist.
     """
     if progress_callback is not None:

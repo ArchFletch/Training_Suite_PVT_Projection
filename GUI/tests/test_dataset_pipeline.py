@@ -134,7 +134,7 @@ def test_load_cache_and_split_bundle(synthetic_dataset: dict[str, Path]) -> None
 
     cache_path = synthetic_dataset["cache_path"]
 
-    # Cache was already built by the fixture via build_cache_from_loader.
+    # Cache was already built by the fixture.
     summary = data.load_existing_cache(cache_path)
     assert summary["status"] == "existing"
     assert summary["num_samples"] == 10

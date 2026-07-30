@@ -18,9 +18,8 @@ Run it from the ``GUI`` directory (where ``xfmr_v2`` is importable)::
     python -m xfmr_v2.export_onnx path/to/best_model.pt
     python -m xfmr_v2.export_onnx path/to/best_model.pt -o ctle.onnx --check
 
-The forward signature of every model is ``(input_features, frequency)`` but
-``frequency`` is unused (the models predict all frequency points at once), so the
-exported graph has a single input.
+Every model takes a single ``input_features`` argument and predicts all frequency
+points at once, so the exported graph has a single input.
 """
 
 from __future__ import annotations
@@ -89,14 +88,12 @@ class _ExportWrapper(nn.Module):
         self._has_log10 = any(log10_channel_mask)
         mask = torch.tensor([m for m in log10_channel_mask], dtype=torch.bool)
         self.register_buffer("log10_mask", mask.view(1, -1, 1))
-        # `frequency` is required by the forward signature but ignored by the models.
-        self.register_buffer("_unused_frequency", torch.zeros(1, dtype=torch.float32))
 
     def forward(self, input_features: torch.Tensor) -> torch.Tensor:
         x = input_features
         if self.bake_normalization:
             x = (x - self.input_mean) / self.input_std
-        y = self.model(x, self._unused_frequency)  # (batch, C, F), normalized space
+        y = self.model(x)  # (batch, C, F), normalized space
         if self.bake_normalization:
             y = y * self.target_std + self.target_mean
             y = _apply_log10_inverse(y, self.log10_mask, self._has_log10)
@@ -139,14 +136,13 @@ class _TransferExportWrapper(nn.Module):
         self._has_log10 = any(log10_channel_mask)
         mask = torch.tensor([m for m in log10_channel_mask], dtype=torch.bool)
         self.register_buffer("log10_mask", mask.view(1, -1, 1))
-        self.register_buffer("_unused_frequency", torch.zeros(1, dtype=torch.float32))
 
     def forward(self, input_features: torch.Tensor) -> torch.Tensor:
         x = input_features
         if self.bake_normalization:
             x = (x - self.input_mean) / self.input_std
         # Each submodel returns (batch, C, band_width); concatenate along frequency.
-        y = torch.cat([sub(x, self._unused_frequency) for sub in self.submodels], dim=2)
+        y = torch.cat([sub(x) for sub in self.submodels], dim=2)
         if self.bake_normalization:
             y = y * self.target_std + self.target_mean
             y = _apply_log10_inverse(y, self.log10_mask, self._has_log10)

@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 
@@ -97,50 +98,45 @@ def synthetic_dataset(tmp_path: Path) -> dict[str, Path]:
         _write_touchstone_sample(output_dir / f"{sample_id}.s2p", sample_index=sample_id)
     (input_dir / "log.txt").write_text("\n".join(rows) + "\n", encoding="utf-8")
 
-    # Pre-build the cache so tests can use it directly.
-    from xfmr_v2.data import build_cache_from_loader
+    # Pre-build the cache directly so tests have one to load. The production app
+    # builds caches via build_cache_from_dataset (folder auto-detection); this
+    # fixture writes the cache contents explicitly to pin a small, fixed
+    # S11+S12 channel set (auto-detection would also emit S22).
+    from xfmr_v2.data import _save_cache
     cache_path = tmp_path / "synthetic_cache.npz"
-    loader_code = '''
-import ast, re, numpy as np
-from pathlib import Path
 
-_SI = {"f":1e-15,"p":1e-12,"n":1e-9,"u":1e-6,"m":1e-3,"K":1e3,"M":1e6,"G":1e9,"T":1e12}
+    # Mirror _write_touchstone_sample exactly, dropping the first frequency point.
+    features = np.array(
+        [[float(sid), float((sid % 4) - 1.5), 7.0] for sid in range(1, 11)],
+        dtype=np.float32,
+    )
+    targets_list = []
+    for sid in range(1, 11):
+        channels = [[], [], [], []]  # S11_re, S11_im, S12_re, S12_im
+        for freq_index in range(2, 5):  # frequency index 1 is dropped
+            base = 0.05 * sid + 0.01 * freq_index
+            channels[0].append(base)
+            channels[1].append(-0.5 * base)
+            channels[2].append(base / 3.0)
+            channels[3].append(base / 4.0)
+        targets_list.append(np.array(channels, dtype=np.float32))
+    targets = np.stack(targets_list, axis=0)
+    frequency_hz = np.array([2.0e9, 3.0e9, 4.0e9], dtype=np.float32)
 
-def load_dataset(dataset_root, max_samples=None):
-    root = Path(dataset_root)
-    input_file = root / "input" / "log.txt"
-    output_dir = root / "output"
-    rows = [ast.literal_eval(line.strip()) for line in input_file.read_text().strip().splitlines()]
-    if max_samples:
-        rows = rows[:max_samples]
-    features = np.array([[r[0], r[1], r[2]] for r in rows], dtype=np.float32)
-    sample_ids = [int(r[3]) for r in rows]
-    targets_list, freq_ref = [], None
-    for sid in sample_ids:
-        path = output_dir / f"{sid}.s2p"
-        lines = [l.strip() for l in path.read_text().splitlines() if l.strip() and not l.startswith("!") and not l.startswith("#") and not l.startswith("[")]
-        data_rows = [list(map(float, l.split())) for l in lines]
-        freq = np.array([r[0] for r in data_rows]) * 1e9
-        s11_re = np.array([r[1] for r in data_rows])
-        s11_im = np.array([r[2] for r in data_rows])
-        s12_re = np.array([r[3] for r in data_rows])
-        s12_im = np.array([r[4] for r in data_rows])
-        if freq_ref is None:
-            freq_ref = freq[1:]
-        targets_list.append(np.stack([s11_re[1:], s11_im[1:], s12_re[1:], s12_im[1:]], axis=0))
-    targets = np.stack(targets_list, axis=0).astype(np.float32)
-    return {
-        "features": features,
-        "targets": targets,
-        "sweep_axis": freq_ref.astype(np.float32),
-        "feature_names": ["x", "y", "const"],
-        "channel_names": ["S11_re", "S11_im", "S12_re", "S12_im"],
-        "channel_units": ["", "", "", ""],
-        "sweep_label": "Frequency (GHz)",
-        "dataset_name": "SyntheticTouchstoneDataset",
-    }
-'''
-    build_cache_from_loader(loader_code, str(root), str(cache_path))
+    _save_cache(
+        cache_path,
+        dataset_root=root,
+        dataset_name="SyntheticTouchstoneDataset",
+        features=features,
+        targets=targets,
+        frequency_hz=frequency_hz,
+        feature_names=["x", "y", "const"],
+        channel_names=["S11_re", "S11_im", "S12_re", "S12_im"],
+        target_names=["S11_re", "S11_im", "S12_re", "S12_im"],
+        channel_units=["", "", "", ""],
+        channel_transforms=["", "", "", ""],
+        sweep_label="Frequency (GHz)",
+    )
 
     return {
         "root": root,

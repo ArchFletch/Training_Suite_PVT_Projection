@@ -97,7 +97,7 @@ def _reference(ref: dict, x: np.ndarray) -> np.ndarray:
     """Recompute the baked pipeline in numpy/torch: physical-unit, flat (B, C*F)."""
     xn = (x - ref["input_mean"]) / ref["input_std"]
     with torch.no_grad():
-        yn = ref["model"](torch.from_numpy(xn.astype(np.float32)), torch.zeros(1)).numpy()
+        yn = ref["model"](torch.from_numpy(xn.astype(np.float32))).numpy()
     y = yn * ref["target_std"] + ref["target_mean"]
     for c, t in enumerate(ref["transforms"]):
         if t == "log10":
@@ -237,7 +237,7 @@ def test_transfer_export_matches_stitched_torch(tmp_path: Path) -> None:
         m.load_state_dict(state)
         m.eval()
         with torch.no_grad():
-            o = m(xn, torch.zeros(1)).numpy()
+            o = m(xn).numpy()
         stitched[:, :, band] = o * ref["target_std"][:, band][None] + ref["target_mean"][:, band][None]
 
     onnx_out = ort.InferenceSession(str(out)).run(["prediction"], {"input_features": x})[0]

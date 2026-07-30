@@ -40,8 +40,8 @@ class DenseStack(nn.Module):
 class SpectraNet(nn.Module):
     """Standalone dense network that maps input features to the full spectral output.
 
-    It does not use frequency coordinates; it predicts the entire
-    ``(channels, num_frequencies)`` output from input features in one shot.
+    It predicts the entire ``(channels, num_frequencies)`` output from input
+    features in one shot.
 
     The ``num_frequencies`` value must be provided at construction time because
     the output layer size depends on it.
@@ -65,8 +65,7 @@ class SpectraNet(nn.Module):
             depth,
         )
 
-    def forward(self, input_features: torch.Tensor, frequency: torch.Tensor) -> torch.Tensor:
-        # ``frequency`` is accepted for interface compatibility but not used.
+    def forward(self, input_features: torch.Tensor) -> torch.Tensor:
         out = self.network(input_features)
         return out.view(input_features.shape[0], self.ground_truth_channels, self.num_frequencies)
 
@@ -107,13 +106,8 @@ class SpectraHydra(nn.Module):
     A stack of ``Linear → LayerNorm → GELU`` blocks forms a shared encoder
     (a "trunk"), and each ground-truth channel gets its own linear output
     head -- many heads on one body, hence the name.  The architecture mirrors
-    the original CTLE training notebooks.  The model does **not** use frequency
-    coordinates; it predicts all frequency points in one shot, similar to
-    :class:`SpectraNet`.
-
-    The ``forward`` method accepts the same ``(input_features, frequency)``
-    signature as the other models for interface compatibility, but ``frequency``
-    is unused.
+    the original CTLE training notebooks.  It predicts all frequency points in
+    one shot, similar to :class:`SpectraNet`.
     """
 
     def __init__(
@@ -148,7 +142,7 @@ class SpectraHydra(nn.Module):
             nn.Linear(dim, num_frequencies) for _ in range(ground_truth_channels)
         ])
 
-    def forward(self, input_features: torch.Tensor, frequency: torch.Tensor) -> torch.Tensor:
+    def forward(self, input_features: torch.Tensor) -> torch.Tensor:
         latent = self.encoder(input_features)
         # Stack per-channel predictions into (batch, channels, frequency).
         return torch.stack([head(latent) for head in self.heads], dim=1)

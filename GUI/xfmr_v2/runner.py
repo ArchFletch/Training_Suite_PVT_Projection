@@ -27,7 +27,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from .data import CACHE_PATH, DATA_ROOT, ensure_cache, load_split_bundle, normalize_frequency, split_indices
+from .data import CACHE_PATH, DATA_ROOT, ensure_cache, load_split_bundle, split_indices
 from .model import SpectraHydra, SpectraNet
 from .progress import ProgressCallback, RunCancelled, StopChecker, emit_progress, request_stop
 
@@ -302,8 +302,7 @@ def run_baseline_trial(
             ),
         )
 
-        # Stage 3: create the model and optimization objects. The frequency axis is
-        # reused every batch, so we move it to the device once outside the loop.
+        # Stage 3: create the model and optimization objects.
         model = build_model(
             config.model_type,
             num_frequencies=len(bundle.frequency_ghz),
@@ -324,12 +323,11 @@ def run_baseline_trial(
             )
         amp = config.use_amp and device.type == "cuda"
         scaler = torch.amp.GradScaler("cuda", enabled=amp)
-        freq = torch.from_numpy(bundle.frequency_norm).to(device)
         emit_progress(
             progress_callback,
             event="model_ready",
             phase="baseline",
-            message="Model, optimizer, and frequency grid are ready. Training epochs are starting.",
+            message="Model and optimizer are ready. Training epochs are starting.",
             **_progress_data(
                 event_context,
                 parameter_count=int(sum(parameter.numel() for parameter in model.parameters())),
@@ -345,7 +343,6 @@ def run_baseline_trial(
             train_loss = _run_epoch(
                 model,
                 bundle.train_loader,
-                freq,
                 optimizer,
                 scaler,
                 device,
@@ -353,7 +350,7 @@ def run_baseline_trial(
                 should_stop=should_stop,
                 loss_fn=loss_fn,
             )
-            val_loss = _eval_loss(model, bundle.val_loader, freq, device, amp, should_stop=should_stop, loss_fn=loss_fn)
+            val_loss = _eval_loss(model, bundle.val_loader, device, amp, should_stop=should_stop, loss_fn=loss_fn)
             if config.scheduler == "plateau":
                 scheduler.step(val_loss)
             else:
@@ -418,7 +415,6 @@ def run_baseline_trial(
         evaluation_loss, evaluation_mae, freq_mae, per_channel_mae = _eval_metrics(
             model,
             evaluation_loader,
-            freq,
             device,
             amp,
             should_stop=should_stop,
@@ -520,7 +516,7 @@ def run_baseline_trial(
 
         # Generate test sample prediction-vs-truth plots.
         test_sample_plot_paths, test_sample_data = _generate_test_sample_plots(
-            model, bundle, freq, device, amp, artifact_dir, num_samples=4,
+            model, bundle, device, amp, artifact_dir, num_samples=4,
         )
 
         artifact_summary = {
@@ -735,8 +731,7 @@ def run_self_transfer(
         # displayed in GHz; other sweep axes (e.g. a CTLE VDIFF sweep) are used as-is.
         is_frequency = "freq" in sweep_label.lower()
         freq_ghz = (frequency_hz / 1.0e9) if is_frequency else frequency_hz
-        freq_norm = normalize_frequency(freq_ghz)
-        original_frequency_count = int(len(freq_norm))
+        original_frequency_count = int(len(freq_ghz))
         bands = _band_indices(original_frequency_count, config.num_bands)
         effective_frequency_count = int(sum(len(band) for band in bands))
         trimmed_frequency_count = int(original_frequency_count - effective_frequency_count)
@@ -749,7 +744,6 @@ def run_self_transfer(
             target_mean = target_mean[:, :effective_frequency_count]
             target_std = target_std[:, :effective_frequency_count]
             freq_ghz = freq_ghz[:effective_frequency_count]
-            freq_norm = freq_norm[:effective_frequency_count]
             transfer_data_message = (
                 "Transfer-learning inputs are ready. "
                 f"Trimming the last {trimmed_frequency_count} frequency point(s) so "
@@ -797,7 +791,6 @@ def run_self_transfer(
             model_kwargs,
             None,
             loaders[0],
-            freq_norm[bands[0]],
             device,
             amp,
             config.transfer_epochs,
@@ -839,7 +832,6 @@ def run_self_transfer(
                     model_kwargs,
                     states[i - 1],
                     loaders[i],
-                    freq_norm[bands[i]],
                     device,
                     amp,
                     config.transfer_epochs,
@@ -870,7 +862,6 @@ def run_self_transfer(
                     model_kwargs,
                     states[i + 1],
                     loaders[i],
-                    freq_norm[bands[i]],
                     device,
                     amp,
                     config.transfer_epochs,
@@ -894,7 +885,7 @@ def run_self_transfer(
             # Reassemble the per-band models into one full-spectrum prediction and
             # record its error profile.
             average_mae, freq_mae, band_mae, per_channel_mae = _stitched_mae(
-                eval_model, states, bands, test_x, test_y, freq_norm, device, amp, config.batch_size,
+                eval_model, states, bands, test_x, test_y, device, amp, config.batch_size,
                 target_mean=target_mean, target_std=target_std, channel_transforms=channel_transforms,
             )
             result = {
@@ -1040,7 +1031,6 @@ def run_self_transfer(
 def _run_epoch(
     model: nn.Module,
     loader: DataLoader,
-    freq: torch.Tensor,
     optimizer: torch.optim.Optimizer,
     scaler: torch.amp.GradScaler,
     device: torch.device,
@@ -1056,7 +1046,7 @@ def _run_epoch(
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
-            loss = loss_fn(model(x, freq), y)
+            loss = loss_fn(model(x), y)
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
@@ -1068,7 +1058,6 @@ def _run_epoch(
 def _eval_loss(
     model: nn.Module,
     loader: DataLoader,
-    freq: torch.Tensor,
     device: torch.device,
     amp: bool,
     should_stop: StopChecker | None = None,
@@ -1082,7 +1071,7 @@ def _eval_loss(
             request_stop(should_stop)
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
-                loss = loss_fn(model(x, freq), y)
+                loss = loss_fn(model(x), y)
             total += float(loss.detach().cpu()) * x.shape[0]
             count += x.shape[0]
     return total / max(count, 1)
@@ -1091,7 +1080,6 @@ def _eval_loss(
 def _eval_metrics(
     model: nn.Module,
     loader: DataLoader,
-    freq: torch.Tensor,
     device: torch.device,
     amp: bool,
     should_stop: StopChecker | None = None,
@@ -1112,13 +1100,13 @@ def _eval_metrics(
     model.eval()
     preds: list[torch.Tensor] = []
     trues: list[torch.Tensor] = []
-    loss = _eval_loss(model, loader, freq, device, amp, should_stop=should_stop, loss_fn=loss_fn)
+    loss = _eval_loss(model, loader, device, amp, should_stop=should_stop, loss_fn=loss_fn)
     with torch.no_grad():
         for x, y in loader:
             request_stop(should_stop)
             x = x.to(device, non_blocking=True)
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
-                pred = model(x, freq)
+                pred = model(x)
             preds.append(pred.cpu())
             trues.append(y)
     if not preds:
@@ -1209,7 +1197,6 @@ def _train_band(
     model_kwargs: dict[str, Any],
     init_state: dict[str, torch.Tensor] | None,
     loader: DataLoader,
-    freq_slice: np.ndarray,
     device: torch.device,
     amp: bool,
     epochs: int,
@@ -1232,7 +1219,6 @@ def _train_band(
         model.load_state_dict(init_state)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=amp)
-    freq = torch.from_numpy(freq_slice.astype(np.float32)).to(device)
     emit_progress(
         progress_callback,
         event="band_started",
@@ -1245,7 +1231,6 @@ def _train_band(
         train_loss = _run_epoch(
             model,
             loader,
-            freq,
             optimizer,
             scaler,
             device,
@@ -1298,7 +1283,6 @@ def _stitched_mae(
     bands: list[np.ndarray],
     test_x: np.ndarray,
     test_y: np.ndarray,
-    freq_norm: np.ndarray,
     device: torch.device,
     amp: bool,
     batch_size: int,
@@ -1320,12 +1304,11 @@ def _stitched_mae(
     for state, band in zip(states, bands, strict=True):
         model.load_state_dict(state)
         model.eval()
-        freq = torch.from_numpy(freq_norm[band].astype(np.float32)).to(device)
         for start in range(0, len(test_x), batch_size):
             stop = min(start + batch_size, len(test_x))
             with torch.no_grad():
                 with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
-                    out = model(x[start:stop].to(device), freq)
+                    out = model(x[start:stop].to(device))
             out_np = out.detach().cpu().numpy().astype(np.float32)
             if target_mean is not None and target_std is not None:
                 out_np = out_np * target_std[:, band][np.newaxis, :, :] + target_mean[:, band][np.newaxis, :, :]
@@ -1558,7 +1541,6 @@ def _plot_band_curve(
 def _generate_test_sample_plots(
     model: nn.Module,
     bundle: Any,
-    freq: torch.Tensor,
     device: torch.device,
     amp: bool,
     artifact_dir: Path,
@@ -1579,7 +1561,7 @@ def _generate_test_sample_plots(
         for x, y in loader:
             x_dev = x.to(device, non_blocking=True)
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
-                pred = model(x_dev, freq)
+                pred = model(x_dev)
             preds_list.append(pred.cpu())
             trues_list.append(y)
 

@@ -1,12 +1,14 @@
-"""Build caches and training splits from README-described raw data.
+"""Build caches and training splits from raw dataset folders.
 
 This module handles the entire data journey:
 
-1. Resolve where the input-feature table and output files live on disk.
-2. Read the README schema that explains how those files should be interpreted.
-3. Convert the raw files into a compact `.npz` cache for repeated training runs.
-4. Load the cache back, create deterministic train/validation/test splits,
-   normalize the features, and build PyTorch `DataLoader` objects.
+1. Build a compact `.npz` cache (plus a `.json` metadata sidecar) from a raw
+   dataset folder by auto-detecting its layout. Supported layouts are
+   SPData/Touchstone (`log.txt` + a folder of `.sNp` files) and Cadence-export
+   `.csv` files.
+2. Load the cache back, create deterministic train/validation/test splits, drop
+   constant input features, normalize features and per-channel targets using
+   training-split statistics only, and build PyTorch `DataLoader` objects.
 
 The module is intentionally split into small helpers so each stage is easy to
 trace in isolation.
@@ -76,11 +78,9 @@ class SplitBundle:
     # Statistics computed from the training split and reused for all splits.
     input_feature_mean: np.ndarray
     input_feature_std: np.ndarray
-    # Frequency axis in three different forms: raw Hz, GHz for display, and normalized
-    # coordinates fed to the model.
+    # Frequency axis in two forms: raw Hz and GHz for display.
     frequency_hz: np.ndarray
     frequency_ghz: np.ndarray
-    frequency_norm: np.ndarray
     # Display label for the swept axis (e.g. "Frequency (GHz)", "VDIFF (mV)").
     sweep_label: str
     # Human-readable names for the predicted outputs.
@@ -97,152 +97,6 @@ class SplitBundle:
     channel_transforms: list[str]
 
 
-# ---------------------------------------------------------------------------
-# Loader-code execution (in-memory, no files saved to disk)
-# ---------------------------------------------------------------------------
-_LOADER_ALLOWED_MODULES = {
-    "csv", "re", "json", "math", "struct", "io", "os.path",
-    "numpy", "pathlib",
-}
-
-
-def run_loader_code(
-    code: str,
-    dataset_root: str | Path,
-    max_samples: int | None = None,
-) -> dict[str, Any]:
-    """Execute loader code in memory and return standardized arrays.
-
-    The code must define ``load_dataset(dataset_root, max_samples=None)``
-    returning a dict with at least ``features``, ``targets``, ``sweep_axis``.
-
-    Raises ValueError on any failure (compilation, execution, validation).
-    """
-    import importlib
-    import builtins
-
-    # Use standard builtins — the loader code is user-provided and trusted.
-    safe_globals: dict[str, Any] = {"__builtins__": builtins}
-
-    for mod_name in _LOADER_ALLOWED_MODULES:
-        try:
-            safe_globals[mod_name.split(".")[0]] = importlib.import_module(mod_name)
-        except ImportError:
-            pass
-    safe_globals["np"] = safe_globals.get("numpy")
-    safe_globals["Path"] = Path
-
-    try:
-        exec(compile(code, "<loader>", "exec"), safe_globals)
-    except Exception as exc:
-        raise ValueError(f"Loader code compilation failed: {exc}") from exc
-
-    load_fn = safe_globals.get("load_dataset")
-    if load_fn is None:
-        raise ValueError("Loader code must define a 'load_dataset' function.")
-
-    try:
-        result = load_fn(str(dataset_root), max_samples=max_samples)
-    except Exception as exc:
-        raise ValueError(f"Loader execution failed: {exc}") from exc
-
-    required = {"features", "targets", "sweep_axis"}
-    missing = required - set(result.keys())
-    if missing:
-        raise ValueError(f"Loader result missing keys: {missing}")
-
-    features = np.asarray(result["features"], dtype=np.float32)
-    targets = np.asarray(result["targets"], dtype=np.float32)
-    sweep = np.asarray(result["sweep_axis"], dtype=np.float32)
-
-    if features.ndim != 2:
-        raise ValueError(f"features must be 2D (samples, features), got shape {features.shape}")
-    if targets.ndim == 2:
-        targets = targets[:, np.newaxis, :]
-    if targets.ndim != 3:
-        raise ValueError(f"targets must be 2D or 3D, got shape {targets.shape}")
-
-    result["features"] = features
-    result["targets"] = targets
-    result["sweep_axis"] = sweep
-
-    # --- Validate the loaded data ---
-    warnings = _validate_loader_output(features, targets, sweep, result)
-    if warnings:
-        result["validation_warnings"] = warnings
-
-    return result
-
-
-def _validate_loader_output(
-    features: np.ndarray,
-    targets: np.ndarray,
-    sweep: np.ndarray,
-    result: dict[str, Any],
-) -> list[str]:
-    """Check for common data loading issues. Returns a list of warning strings."""
-    warnings: list[str] = []
-    num_samples = features.shape[0]
-    num_channels = targets.shape[1]
-    num_sweep = targets.shape[2]
-
-    # 1. Sample count sanity
-    if num_samples < 2:
-        warnings.append(
-            f"Only {num_samples} sample(s) loaded. This is likely a parsing error — "
-            f"check that sample boundaries are detected correctly."
-        )
-
-    # 2. NaN / Inf check
-    nan_features = np.isnan(features).sum()
-    nan_targets = np.isnan(targets).sum()
-    inf_targets = np.isinf(targets).sum()
-    if nan_features > 0:
-        warnings.append(f"Features contain {nan_features} NaN values.")
-    if nan_targets > 0:
-        warnings.append(f"Targets contain {nan_targets} NaN values.")
-    if inf_targets > 0:
-        warnings.append(f"Targets contain {inf_targets} Inf values.")
-
-    # 3. Extreme target values (likely parser bug or simulator error)
-    target_absmax = float(np.abs(targets).max())
-    target_p99 = float(np.percentile(np.abs(targets), 99))
-    if target_absmax > 10 * target_p99 and target_p99 > 0:
-        warnings.append(
-            f"Target max |{target_absmax:.2f}| is >10x the 99th percentile |{target_p99:.2f}|. "
-            f"This suggests extreme outliers or parser errors."
-        )
-
-    # 4. Constant targets (all same value for a channel)
-    for ch in range(num_channels):
-        ch_std = float(targets[:, ch, :].std())
-        ch_name = result.get("channel_names", [f"ch{ch}"])[ch] if ch < len(result.get("channel_names", [])) else f"ch{ch}"
-        if ch_std < 1e-10:
-            warnings.append(f"Channel '{ch_name}' has zero variance — all values are identical.")
-
-    # 5. Sweep axis issues
-    if len(sweep) < 2:
-        warnings.append(f"Sweep axis has only {len(sweep)} point(s).")
-    elif not np.all(np.diff(sweep) > 0) and not np.all(np.diff(sweep) < 0):
-        warnings.append("Sweep axis is not monotonically increasing or decreasing.")
-
-    # 6. Suspiciously many sweep points per sample (likely merged samples)
-    if num_sweep > 10000:
-        warnings.append(
-            f"Each sample has {num_sweep} sweep points — this is unusually high. "
-            f"Check that sample boundaries are being detected correctly."
-        )
-
-    # 7. Feature variance check
-    for i in range(features.shape[1]):
-        col = features[:, i]
-        if col.max() == col.min() and num_samples > 1:
-            fname = result.get("feature_names", [f"x{i}"])[i] if i < len(result.get("feature_names", [])) else f"x{i}"
-            warnings.append(f"Feature '{fname}' is constant (value={col[0]:.6g}) — will be dropped during training.")
-
-    return warnings
-
-
 # Public cache and split API.
 def load_existing_cache(
     cache_path: str | Path,
@@ -250,8 +104,8 @@ def load_existing_cache(
 ) -> dict[str, Any]:
     """Load an existing .npz cache and return its summary metadata.
 
-    This does NOT build a cache from raw data.  Use ``build_cache_from_loader``
-    to create a new cache from a ``loader.py``.
+    This does NOT build a cache from raw data.  Use ``build_cache_from_dataset``
+    to create a new cache from a dataset folder.
     """
     def emit(event: str, message: str, **payload: Any) -> None:
         if progress_callback is not None:
@@ -296,73 +150,6 @@ def load_existing_cache(
          cache_path=summary["cache_path"],
          total_samples=summary["num_samples"],
          frequency_count=summary["num_frequencies"])
-    return summary
-
-
-def build_cache_from_loader(
-    loader_code: str,
-    dataset_root: str | Path,
-    cache_path: str | Path,
-    max_samples: int | None = None,
-    progress_callback=None,
-) -> dict[str, Any]:
-    """Execute loader code in memory and save the result as a cache.
-
-    This is the primary entry point for the loader-based loading flow. The code
-    runs once in memory, produces standardized arrays, and saves them to the
-    cache. No files are written to the dataset directory.
-    """
-    def emit(event: str, message: str, **payload: Any) -> None:
-        if progress_callback is not None:
-            progress_callback({"phase": "scan", "event": event, "message": message, **payload})
-
-    emit("loader_running", "Executing AI-generated loader code...")
-    result = run_loader_code(loader_code, dataset_root, max_samples)
-
-    features = result["features"]
-    targets = result["targets"]
-    frequency_hz = result["sweep_axis"]
-    feature_names = result.get("feature_names", [f"x{i}" for i in range(features.shape[1])])
-    channel_names_list = result.get("channel_names", [f"ch{i}" for i in range(targets.shape[1])])
-    target_names = result.get("target_names", channel_names_list)
-    channel_unit_list = result.get("channel_units", [""] * len(channel_names_list))
-    channel_transform_list = result.get("channel_transforms", [""] * len(channel_names_list))
-    sweep_label = result.get("sweep_label", "Frequency (GHz)")
-    dataset_name = result.get("dataset_name", Path(dataset_root).name)
-
-    # Check for data issues before caching.
-    validation_warnings = result.get("validation_warnings", [])
-    if validation_warnings:
-        warning_text = "\n".join(f"  - {w}" for w in validation_warnings)
-        emit("loader_warning",
-             f"Data validation warnings:\n{warning_text}")
-        # Block caching if there are critical issues (e.g. only 1 sample).
-        if features.shape[0] < 2:
-            raise ValueError(
-                f"Loader produced only {features.shape[0]} sample(s). "
-                f"This is almost certainly a parsing bug.\n"
-                f"Validation warnings:\n{warning_text}"
-            )
-
-    emit("loader_done",
-         f"Loaded {features.shape[0]} samples, {targets.shape[1]} channels, "
-         f"{targets.shape[2]} sweep points.")
-
-    summary = _save_cache(
-        cache_path,
-        dataset_root=dataset_root,
-        dataset_name=dataset_name,
-        features=features,
-        targets=targets,
-        frequency_hz=frequency_hz,
-        feature_names=feature_names,
-        channel_names=channel_names_list,
-        target_names=target_names,
-        channel_units=channel_unit_list,
-        channel_transforms=channel_transform_list,
-        sweep_label=sweep_label,
-    )
-    emit("cache_saved", f"Cache saved: {features.shape[0]} samples.", cache_path=summary["cache_path"])
     return summary
 
 
@@ -707,8 +494,7 @@ def ensure_cache(
 
     When the cache file does not exist, the dataset folder (``data_root``, or one
     derived from the explicit paths) is built via ``build_cache_from_dataset``
-    format auto-detection. Caches from AI-generated loaders are still created
-    through ``build_cache_from_loader``.
+    format auto-detection.
     """
     p = Path(cache_path)
     if p.exists():
@@ -862,7 +648,6 @@ def load_split_bundle(
         input_feature_std=std,
         frequency_hz=frequency_hz,
         frequency_ghz=frequency_ghz,
-        frequency_norm=normalize_frequency(frequency_ghz),
         target_names=target_names,
         channel_names=channel_names,
         cache_path=Path(cache_path),
@@ -908,14 +693,6 @@ def split_indices(num_samples: int, train_frac: float, val_frac: float, seed: in
     train_end = min(max(int(num_samples * train_frac), 1), num_samples - 2)
     val_end = min(max(train_end + int(num_samples * val_frac), train_end + 1), num_samples - 1)
     return {"train": order[:train_end], "val": order[train_end:val_end], "test": order[val_end:]}
-
-
-def normalize_frequency(frequency_ghz: np.ndarray) -> np.ndarray:
-    """Map frequency to [-1, 1] for the model's frequency input."""
-    lo, hi = float(frequency_ghz.min()), float(frequency_ghz.max())
-    if np.isclose(lo, hi):
-        return np.zeros_like(frequency_ghz, dtype=np.float32)
-    return (2.0 * (frequency_ghz - lo) / (hi - lo) - 1.0).astype(np.float32)
 
 
 

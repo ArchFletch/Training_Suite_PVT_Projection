@@ -42,7 +42,6 @@ def test_train_band_reports_elapsed_and_eta(monkeypatch) -> None:
         model_kwargs=model_kwargs,
         init_state=init_state,
         loader=loader,
-        freq_slice=torch.tensor([0.0, 0.5, 1.0], dtype=torch.float32).numpy(),
         device=torch.device("cpu"),
         amp=False,
         epochs=2,
