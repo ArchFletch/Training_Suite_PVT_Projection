@@ -4,11 +4,14 @@ This module handles the entire data journey:
 
 1. Build a compact `.npz` cache (plus a `.json` metadata sidecar) from a raw
    dataset folder by auto-detecting its layout. Supported layouts are
-   SPData/Touchstone (`log.txt` + a folder of `.sNp` files) and Cadence-export
-   `.csv` files.
+   SPData/Touchstone (`log.txt` + a folder of `.sNp` files), Cadence-export
+   `.csv` files, and a prebuilt `.npz` already holding
+   features/targets/frequency_hz arrays.
 2. Load the cache back, create deterministic train/validation/test splits, drop
    constant input features, normalize features and per-channel targets using
    training-split statistics only, and build PyTorch `DataLoader` objects.
+   Splits are row-level by default; naming the PVT corner columns switches to a
+   design-level split that keeps every corner row of a design in one fold.
 
 The module is intentionally split into small helpers so each stage is easy to
 trace in isolation.
@@ -20,6 +23,8 @@ import ast
 import json
 import os
 import re
+import warnings
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -95,6 +100,8 @@ class SplitBundle:
     channel_units: list[str]
     # Per-channel transforms applied before normalization (e.g. ["", "log10"]).
     channel_transforms: list[str]
+    # Unique designs per split when the design-level split is active, else None.
+    design_counts: dict[str, int] | None = None
 
 
 # Public cache and split API.
@@ -236,6 +243,9 @@ def build_cache_from_dataset(
 
     - SPData/Touchstone: ``log.txt`` + a folder of ``.sNp`` files.
     - Cadence CSV: one or more Cadence-export ``.csv`` files (one per channel).
+    - Prebuilt arrays: an ``.npz`` holding ``features`` / ``targets`` /
+      ``frequency_hz`` (this engine's cache layout, or a barer bundle written by an
+      offline preparation script). Detected only when no raw source is present.
 
     See ``_build_auto`` for the detection rules and defaults.
     """
@@ -289,14 +299,233 @@ def _build_auto(
 
     # 2. Cadence CSV: one or more Cadence-export .csv files.
     csv_files = [p for p in sorted(root.glob("*.csv")) if not p.name.startswith(".~")]
+    array_npz_files = _array_npz_candidates(root)
     if csv_files:
-        result = _build_cadence_auto(root, csv_files, max_samples, emit, should_stop)
+        try:
+            result = _build_cadence_auto(root, csv_files, max_samples, emit, should_stop)
+        except ValueError:
+            # The .csv files are not Cadence exports at all (e.g. a metrics or manifest
+            # file left beside a prepared bundle). Only abort when there is no prebuilt
+            # array to fall back on, so a stray CSV cannot shadow a usable dataset.
+            # RunCancelled is a RuntimeError and deliberately not caught here.
+            if not array_npz_files:
+                raise
+            emit(
+                "auto_skip",
+                f"Ignoring {len(csv_files)} .csv file(s): not Cadence exports.",
+                dataset_root=str(root),
+            )
+        else:
+            return _save_cache(cache_path, dataset_root=root, readme_path="", **result)
+
+    # 3. Prebuilt arrays: an .npz that already holds features/targets/frequency_hz,
+    #    i.e. this engine's own cache layout or an array bundle written by an offline
+    #    preparation script. Checked last so raw sources always win when both exist.
+    if array_npz_files:
+        # Never write the cache over a source file in the dataset folder. Compare against
+        # every candidate (not just the chosen one) and against the path numpy will
+        # actually write, so neither a sibling bundle nor an extension-less cache path
+        # can silently destroy prepared data.
+        write_target = _npz_write_target(cache_path)
+        clobbered = next((p for p in array_npz_files if _is_same_file(write_target, p)), None)
+        if clobbered is not None:
+            raise ValueError(
+                f"The selected cache path would overwrite the source dataset file {clobbered}. "
+                "Choose a cache file path outside the dataset folder."
+            )
+        if len(array_npz_files) > 1:
+            others = ", ".join(p.name for p in array_npz_files[1:])
+            warnings.warn(
+                f"{root} holds several prebuilt array files; using {array_npz_files[0].name} "
+                f"and ignoring {others}.",
+                stacklevel=2,
+            )
+        result = _build_array_npz_auto(root, array_npz_files[0], max_samples, emit, should_stop)
         return _save_cache(cache_path, dataset_root=root, readme_path="", **result)
 
+    unreadable = _unreadable_npz_files(root)
+    if unreadable:
+        raise FileNotFoundError(
+            f"Could not auto-detect a supported dataset format in {root}. The .npz file(s) "
+            f"{', '.join(p.name for p in unreadable)} could not be read as prebuilt arrays; "
+            "they may be incomplete (an interrupted copy) or saved with pickled objects."
+        )
     raise FileNotFoundError(
         f"Could not auto-detect a supported dataset format in {root}. Expected SPData/Touchstone "
-        "(log.txt + a folder of .sNp files) or Cadence CSV (*.csv), or a README with a json schema block."
+        "(log.txt + a folder of .sNp files), Cadence CSV (*.csv), a prebuilt .npz holding "
+        "features/targets/frequency_hz, or a README with a json schema block."
     )
+
+
+# Keys an .npz must contain to be usable as a prebuilt array dataset.
+_ARRAY_NPZ_KEYS = ("features", "targets", "frequency_hz")
+
+
+def _is_array_npz(path: Path) -> bool:
+    """Return True when ``path`` is an .npz holding the prebuilt array keys."""
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            return all(key in data for key in _ARRAY_NPZ_KEYS)
+    except Exception:
+        # Unreadable, pickled, or not an npz at all: not a usable dataset.
+        return False
+
+
+def _is_same_file(left: str | Path, right: str | Path) -> bool:
+    """Return True when both paths resolve to the same existing file.
+
+    Uses ``os.path.samefile`` so symlinks, relative paths, and hard links are all
+    treated as the same file rather than compared as strings.
+    """
+    left, right = Path(left), Path(right)
+    if not left.exists() or not right.exists():
+        return False
+    try:
+        return os.path.samefile(left, right)
+    except OSError:
+        return False
+
+
+def _npz_write_target(cache_path: str | Path) -> Path:
+    """The file ``np.savez_compressed`` will actually create for ``cache_path``.
+
+    numpy appends ``.npz`` when the path lacks that suffix, so an aliasing check has
+    to compare against the real destination rather than the requested path.
+    """
+    path = Path(cache_path)
+    return path if path.suffix == ".npz" else path.with_suffix(path.suffix + ".npz")
+
+
+def _array_npz_candidates(root: Path) -> list[Path]:
+    """Every prebuilt-array ``.npz`` in ``root``, most-preferred first.
+
+    The conventional names come first (a complete engine cache beats a barer bundle),
+    then any remaining ``.npz`` in sorted order so detection is deterministic.
+    """
+    if not root.is_dir():
+        return []
+    preferred = [root / name for name in ("cache.npz", "bundle.npz")]
+    ordered = [p for p in preferred if p.is_file()] + sorted(
+        p for p in root.glob("*.npz") if p not in preferred
+    )
+    return [p for p in ordered if _is_array_npz(p)]
+
+
+def _unreadable_npz_files(root: Path) -> list[Path]:
+    """``.npz`` files present in ``root`` that could not be read as prebuilt arrays."""
+    if not root.is_dir():
+        return []
+    return [p for p in sorted(root.glob("*.npz")) if not _is_array_npz(p)]
+
+
+def _npz_string_list(data, key: str) -> list[str]:
+    """Read a string array from an npz as a list, tolerating 0-d and 1-element arrays.
+
+    ``np.asarray("dB").astype(str).tolist()`` returns a bare ``str``, so a naive
+    ``len()`` would count characters instead of entries.
+    """
+    if key not in data:
+        return []
+    return [str(value) for value in np.atleast_1d(data[key])]
+
+
+def _npz_scalar_string(data, key: str, default: str) -> str:
+    """Read a single string from an npz, tolerating 0-d and 1-element arrays."""
+    if key not in data:
+        return default
+    values = np.atleast_1d(data[key])
+    return str(values[0]) if values.size else default
+
+
+def _build_array_npz_auto(
+    root: Path, npz_path: Path, max_samples: int | None, emit, should_stop=None
+) -> dict[str, Any]:
+    """Adopt a prebuilt array ``.npz`` as the training dataset.
+
+    Accepts both this engine's cache layout (``input_feature_names``) and the plainer
+    array-bundle layout that offline preparation scripts write (``feature_names``, no
+    ``target_names``). Missing optional metadata is filled with neutral defaults so a
+    minimal features/targets/frequency_hz bundle is enough to train from.
+    """
+    request_stop(should_stop)
+    emit("dataset_detected", f"Detected a prebuilt array dataset: {npz_path.name}.", dataset_root=str(root))
+    with np.load(npz_path, allow_pickle=False) as data:
+        features = np.asarray(data["features"], dtype=np.float32)
+        targets = np.asarray(data["targets"], dtype=np.float32)
+        frequency_hz = np.asarray(data["frequency_hz"], dtype=np.float32).reshape(-1)
+        feature_names = _npz_string_list(data, "input_feature_names") or _npz_string_list(
+            data, "feature_names"
+        )
+        channel_names = _npz_string_list(data, "channel_names")
+        target_names = _npz_string_list(data, "target_names")
+        channel_units = _npz_string_list(data, "channel_units")
+        channel_transforms = _npz_string_list(data, "channel_transforms")
+        sweep_label = _npz_scalar_string(data, "sweep_label", "Frequency (GHz)")
+
+    if features.ndim != 2:
+        raise ValueError(
+            f"{npz_path.name}: 'features' must be 2-D (samples, columns); got shape {features.shape}."
+        )
+    if targets.ndim != 3:
+        raise ValueError(
+            f"{npz_path.name}: 'targets' must be 3-D (samples, channels, sweep points); "
+            f"got shape {targets.shape}."
+        )
+    if features.shape[0] != targets.shape[0]:
+        raise ValueError(
+            f"{npz_path.name}: 'features' has {features.shape[0]} samples but 'targets' has "
+            f"{targets.shape[0]}."
+        )
+    if targets.shape[2] != frequency_hz.shape[0]:
+        raise ValueError(
+            f"{npz_path.name}: 'targets' has {targets.shape[2]} sweep points but 'frequency_hz' has "
+            f"{frequency_hz.shape[0]}."
+        )
+
+    num_channels = int(targets.shape[1])
+    # Fill in whatever labels the source omitted, and reject mislabeled sources.
+    feature_names = feature_names or [f"x{i}" for i in range(features.shape[1])]
+    channel_names = channel_names or [f"ch{i}" for i in range(num_channels)]
+    target_names = target_names or list(channel_names)
+    channel_units = channel_units or [""] * num_channels
+    channel_transforms = channel_transforms or [""] * num_channels
+    if len(feature_names) != features.shape[1]:
+        raise ValueError(
+            f"{npz_path.name}: {len(feature_names)} feature name(s) for {features.shape[1]} "
+            "feature column(s)."
+        )
+    for label, values in (
+        ("channel_names", channel_names),
+        ("channel_units", channel_units),
+        ("channel_transforms", channel_transforms),
+    ):
+        if len(values) != num_channels:
+            raise ValueError(
+                f"{npz_path.name}: {len(values)} {label} entr(ies) for {num_channels} target channel(s)."
+            )
+
+    if max_samples is not None:
+        features, targets = features[:max_samples], targets[:max_samples]
+
+    emit(
+        "arrays_ready",
+        f"Loaded {features.shape[0]} sample(s) from {npz_path.name}.",
+        total_samples=int(features.shape[0]),
+        frequency_count=int(frequency_hz.shape[0]),
+    )
+    return {
+        "dataset_name": root.name or npz_path.stem,
+        "features": features,
+        "targets": targets,
+        "frequency_hz": frequency_hz,
+        "feature_names": feature_names,
+        "channel_names": channel_names,
+        "target_names": target_names,
+        "channel_units": channel_units,
+        "channel_transforms": channel_transforms,
+        "sweep_label": sweep_label,
+        "input_feature_path": str(npz_path),
+    }
 
 
 def _read_logtxt_columns(log_txt: Path) -> list[str]:
@@ -573,8 +802,19 @@ def load_split_bundle(
     val_frac: float = 0.1,
     max_samples: int | None = None,
     pin_memory: bool = False,
+    split_corner_columns: Sequence[str] | None = None,
+    split_design_columns: Sequence[str] | None = None,
 ) -> SplitBundle:
-    """Load cached arrays, drop constant inputs, normalize, and build loaders."""
+    """Load cached arrays, drop constant inputs, normalize, and build loaders.
+
+    Setting either split column list switches from the default row-level split to
+    a design-level one, where every corner row of a design lands in the same fold
+    (see :func:`design_split_indices`). ``split_corner_columns`` names the columns
+    that VARY across a design's corners (Temp_C, VDD, process one-hots, and every
+    derived column that moves with them); ``split_design_columns`` instead names
+    the columns that IDENTIFY a design, which is the safer way round because an
+    omission there merges designs rather than silently splintering them.
+    """
     with np.load(cache_path, allow_pickle=False) as data:
         # `build_cache` already enforced the schema, so this stage only reshapes and normalizes.
         features = data["features"].astype(np.float32)
@@ -593,7 +833,19 @@ def load_split_bundle(
 
     # Compute the split first, then derive the active features and normalization
     # statistics from the training split only.
-    split = split_indices(len(features), train_frac, val_frac, seed)
+    if split_corner_columns or split_design_columns:
+        split, design_counts = _design_split(
+            features,
+            input_feature_names,
+            split_corner_columns,
+            train_frac,
+            val_frac,
+            seed,
+            split_design_columns,
+        )
+    else:
+        split = split_indices(len(features), train_frac, val_frac, seed)
+        design_counts = None
     train_x = features[split["train"]]
     # A feature is constant only if every value in the training set is identical.
     # Using absolute std threshold (e.g. 1e-8) would incorrectly drop features
@@ -629,9 +881,14 @@ def load_split_bundle(
     target_std = target_std.astype(np.float32)
     y = (targets - target_mean) / target_std
 
+    # Evaluation is a forward pass with no gradients, so it can use a much larger batch
+    # than training. The reported metrics are sample-count weighted and therefore
+    # unchanged; this only removes per-batch fixed cost (collation, transfer, kernel
+    # launches), which otherwise makes validation ~11% of all iterations in a run.
+    eval_batch_size = max(batch_size, 1024)
     train_loader = _make_loader(x, y, split["train"], batch_size=batch_size, shuffle=True, pin_memory=pin_memory)
-    val_loader = _make_loader(x, y, split["val"], batch_size=batch_size, shuffle=False, pin_memory=pin_memory)
-    test_loader = _make_loader(x, y, split["test"], batch_size=batch_size, shuffle=False, pin_memory=pin_memory)
+    val_loader = _make_loader(x, y, split["val"], batch_size=eval_batch_size, shuffle=False, pin_memory=pin_memory)
+    test_loader = _make_loader(x, y, split["test"], batch_size=eval_batch_size, shuffle=False, pin_memory=pin_memory)
 
     # For frequency-swept data, convert Hz→GHz. For other sweeps, use raw values.
     is_frequency = "freq" in sweep_label.lower() or sweep_label == "Frequency (GHz)"
@@ -656,6 +913,7 @@ def load_split_bundle(
         channel_units=channel_units,
         channel_transforms=channel_transforms,
         sweep_label=sweep_label,
+        design_counts=design_counts,
     )
 
 
@@ -697,6 +955,260 @@ def split_indices(num_samples: int, train_frac: float, val_frac: float, seed: in
 
 
 
+def design_group_ids(
+    features: np.ndarray,
+    input_feature_names: list[str],
+    corner_columns: Sequence[str] | None = None,
+    design_columns: Sequence[str] | None = None,
+) -> np.ndarray:
+    """Assign each row a design id for the design-level split.
+
+    Rows that are identical in every input column EXCEPT the corner columns
+    (e.g. Temp_C, VDD, process one-hots) are the same design measured at
+    different PVT corners and share one id. Unknown corner names and a corner
+    list that covers every input column raise, because both would silently
+    degrade the split (the former points at nothing, the latter would leave no
+    columns to identify a design).
+
+    ``design_columns`` is the safer alternative: name the columns that IDENTIFY
+    a design (the geometry parameters) and every other column is treated as
+    corner-varying. Missing a name then merges designs (a coarser, still
+    leak-free split) instead of splintering them (silent leakage), so prefer it
+    on datasets carrying corner-derived columns such as physics anchors or a
+    frozen corner embedding. Exactly one of the two lists must be given.
+    """
+    group_ids, _, _ = _resolve_design_grouping(
+        features, input_feature_names, corner_columns, design_columns
+    )
+    return group_ids
+
+
+
+
+def _resolve_design_grouping(
+    features: np.ndarray,
+    input_feature_names: list[str],
+    corner_columns: Sequence[str] | None,
+    design_columns: Sequence[str] | None,
+) -> tuple[np.ndarray, list[int], list[int]]:
+    """Return (design id per row, design column indices, corner column indices)."""
+    if bool(corner_columns) == bool(design_columns):
+        raise ValueError(
+            "The design-level split needs exactly one of corner_columns (columns that "
+            "VARY across a design's corners) or design_columns (columns that IDENTIFY "
+            "a design), not both and not neither."
+        )
+
+    def resolve(requested: Sequence[str], label: str) -> list[str]:
+        names = list(dict.fromkeys(str(name) for name in requested if str(name).strip()))
+        if not names:
+            raise ValueError(f"The design-level split needs at least one {label} name.")
+        unknown = [name for name in names if name not in input_feature_names]
+        if unknown:
+            raise ValueError(
+                f"{label.capitalize()}(s) {unknown} are not input features of this "
+                f"dataset. Available columns: {sorted(input_feature_names)}."
+            )
+        return names
+
+    if design_columns:
+        chosen = set(resolve(design_columns, "design column"))
+        design_idx = [index for index, name in enumerate(input_feature_names) if name in chosen]
+        corner_idx = [index for index, name in enumerate(input_feature_names) if name not in chosen]
+    else:
+        chosen = set(resolve(corner_columns or (), "corner column"))
+        corner_idx = [index for index, name in enumerate(input_feature_names) if name in chosen]
+        design_idx = [index for index, name in enumerate(input_feature_names) if name not in chosen]
+        if not design_idx:
+            raise ValueError(
+                "Every input column is configured as a corner column, so no columns are "
+                "left to identify a design. Leave the geometry/design columns out of the "
+                "corner list."
+            )
+        # A column that is fully determined by the corner values (a frozen corner
+        # embedding, a corner-only derived quantity) carries no design information,
+        # but leaving it in the design key splinters every design into one group
+        # per corner — which silently turns this into a row-level split. Such a
+        # column is provably safe to treat as a corner column, so do that and say so.
+        derived = _corner_derived_columns(features, corner_idx, design_idx)
+        if derived:
+            derived_names = [input_feature_names[index] for index in derived]
+            warnings.warn(
+                "Design-level split: column(s) "
+                f"{derived_names} are fully determined by the configured corner columns, "
+                "so they were treated as corner columns too. Leaving them in the design "
+                "key would give every corner row its own 'design' and silently degrade "
+                "this to a row-level split.",
+                UserWarning,
+                stacklevel=3,
+            )
+            derived_set = set(derived)
+            design_idx = [index for index in design_idx if index not in derived_set]
+            corner_idx = sorted(corner_idx + derived)
+            if not design_idx:
+                raise ValueError(
+                    "After excluding corner-determined columns, no columns are left to "
+                    "identify a design. Name the design-identifying columns explicitly "
+                    "with design_columns instead."
+                )
+
+    _, group_ids = np.unique(features[:, design_idx], axis=0, return_inverse=True)
+    return group_ids, design_idx, corner_idx
+
+
+
+
+def _corner_derived_columns(
+    features: np.ndarray, corner_idx: list[int], design_idx: list[int]
+) -> list[int]:
+    """Design-key columns that are constant within every corner-value combination.
+
+    Such a column is a function of the corner alone, so it cannot distinguish two
+    designs — it can only splinter one design into per-corner groups.
+    """
+    if not corner_idx or not design_idx:
+        return []
+    _, corner_group = np.unique(features[:, corner_idx], axis=0, return_inverse=True)
+    num_groups = int(corner_group.max()) + 1
+    if num_groups >= len(features):
+        # Every row is its own corner combination, so "constant within a corner"
+        # is vacuously true for every column and would flag all of them.
+        return []
+    candidates = features[:, design_idx]
+    highs = np.full((num_groups, candidates.shape[1]), -np.inf, dtype=np.float64)
+    lows = np.full((num_groups, candidates.shape[1]), np.inf, dtype=np.float64)
+    np.maximum.at(highs, corner_group, candidates)
+    np.minimum.at(lows, corner_group, candidates)
+    constant = np.all(highs == lows, axis=0)
+    return [design_idx[position] for position in np.flatnonzero(constant)]
+
+
+
+
+def design_split_indices(
+    features: np.ndarray,
+    input_feature_names: list[str],
+    corner_columns: Sequence[str] | None,
+    train_frac: float,
+    val_frac: float,
+    seed: int,
+    design_columns: Sequence[str] | None = None,
+) -> dict[str, np.ndarray]:
+    """Design-level split: all corner rows of one design stay in the same fold.
+
+    A row-level split can place a design at one PVT corner in train and the very
+    same design at another corner in test; the shared design parameters make that
+    near-leakage, so test error reads far too optimistic. Here the unique designs
+    (rows deduplicated over the non-corner columns) are shuffled and split with
+    the same fraction/clamp rules as :func:`split_indices`, and every row follows
+    its design into that fold.
+    """
+    split, _ = _design_split(
+        features, input_feature_names, corner_columns, train_frac, val_frac, seed, design_columns
+    )
+    return split
+
+
+
+
+def _design_split(
+    features: np.ndarray,
+    input_feature_names: list[str],
+    corner_columns: Sequence[str] | None,
+    train_frac: float,
+    val_frac: float,
+    seed: int,
+    design_columns: Sequence[str] | None = None,
+) -> tuple[dict[str, np.ndarray], dict[str, int]]:
+    """Shared core of the design-level split: (row indices per fold, designs per fold).
+
+    Fewer than 3 designs is rejected up front: ``split_indices`` would return an
+    empty validation or test fold, and an empty fold does not fail loudly — it
+    reports a 0.0 validation loss every epoch (freezing the best checkpoint at
+    epoch 1) and only crashes at final evaluation, after the whole epoch budget
+    is spent. Note that ``max_samples`` truncates rows BEFORE designs are
+    grouped, so a small smoke-run cap on a design-major cache can hit this.
+
+    A grouping that gives every row its own design is rejected too: that split is
+    row-for-row identical to the row-level split it exists to replace, so it
+    would report leak-free fold counts while providing no protection at all.
+    """
+    group_ids, design_idx, corner_idx = _resolve_design_grouping(
+        features, input_feature_names, corner_columns, design_columns
+    )
+    num_designs = int(group_ids.max()) + 1
+    if num_designs == len(group_ids) and len(group_ids) > 2:
+        design_names = [input_feature_names[index] for index in design_idx]
+        raise ValueError(
+            f"The design-level split found {num_designs} designs across "
+            f"{len(group_ids)} rows — one design per row, which is exactly a "
+            "row-level split and blocks no leakage at all. No two rows share the "
+            f"same values across the design columns {design_names}. Every column "
+            "that changes between a design's corner rows (including derived ones "
+            "such as physics anchors or a frozen corner embedding) must be listed "
+            "as a corner column; simpler still, name the design-identifying "
+            "columns with design_columns and let everything else be corner-varying."
+        )
+    if corner_columns:
+        # Only meaningful in corner-columns mode, where corner_idx is the user's
+        # list of genuine corner descriptors and therefore a clean grid. In
+        # design-columns mode the complement can hold design-dependent derived
+        # columns (physics anchors), which would make every row its own "corner"
+        # and the check a false alarm.
+        _warn_on_partial_design_crossing(features, group_ids, num_designs, corner_idx)
+    if num_designs < 3:
+        raise ValueError(
+            f"The design-level split found only {num_designs} unique design(s) across "
+            f"{len(group_ids)} rows (rows identical in every non-corner column are one "
+            "design), but at least 3 designs are needed for non-empty train/validation/"
+            "test folds. Check the corner-column selection, and note that max_samples "
+            "truncates rows before designs are grouped."
+        )
+    groups = split_indices(num_designs, train_frac, val_frac, seed)
+    split = {name: np.flatnonzero(np.isin(group_ids, ids)) for name, ids in groups.items()}
+    design_counts = {name: int(len(ids)) for name, ids in groups.items()}
+    return split, design_counts
+
+
+
+
+def _warn_on_partial_design_crossing(
+    features: np.ndarray, group_ids: np.ndarray, num_designs: int, corner_idx: list[int]
+) -> None:
+    """Warn when no design reaches every corner combination present in the data.
+
+    Partial splintering is the quiet failure: leave one corner-varying column out
+    of the corner list and each design fractures into several per-corner designs.
+    Fold counts still look leak-free, but the same physical design appears in
+    train and test. On a crossed PVT grid at least one design should be measured
+    at every corner, so falling short of that is worth flagging. Genuinely ragged
+    datasets can trip this, which is why it warns rather than raises.
+    """
+    if not corner_idx or num_designs < 2:
+        return
+    _, corner_group = np.unique(features[:, corner_idx], axis=0, return_inverse=True)
+    total_corners = int(corner_group.max()) + 1
+    if total_corners < 2:
+        return
+    pairs = np.unique(np.stack([group_ids, corner_group], axis=1), axis=0)
+    best = int(np.bincount(pairs[:, 0], minlength=num_designs).max())
+    if best < total_corners:
+        warnings.warn(
+            f"Design-level split: the data holds {total_corners} distinct corner "
+            f"combinations, but no design appears at more than {best} of them "
+            f"({num_designs} designs over {len(group_ids)} rows). On a crossed PVT "
+            "grid this means some corner-varying column is still part of the design "
+            "key and is splintering designs across folds — check for derived "
+            "columns (physics anchors, corner embeddings), or name the "
+            "design-identifying columns with design_columns instead. Ignore this if "
+            "the dataset is genuinely ragged.",
+            UserWarning,
+            stacklevel=3,
+        )
+
+
+
+
 def _make_loader(
     features: np.ndarray,
     targets: np.ndarray,
@@ -707,12 +1219,18 @@ def _make_loader(
 ) -> DataLoader:
     # Build one split loader without repeating the same TensorDataset/DataLoader
     # boilerplate three times in `load_split_bundle`.
+    #
+    # `pin_memory` is deliberately not forwarded: with num_workers=0 there is no
+    # background thread to overlap the pinned staging copy, so torch performs it
+    # inline on the very thread that has to issue the next step's kernels. It is
+    # pure added latency here, and the non_blocking=True transfers it would enable
+    # are awaited within the same iteration anyway.
     return DataLoader(
         TensorDataset(torch.from_numpy(features[indices]), torch.from_numpy(targets[indices])),
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=0,
-        pin_memory=pin_memory,
+        pin_memory=False,
     )
 
 

@@ -23,8 +23,33 @@ def main() -> None:
     parser.add_argument("--model-type", default=defaults["model_type"].default)
     parser.add_argument("--width", type=int, default=defaults["width"].default)
     parser.add_argument("--depth", type=int, default=defaults["depth"].default)
+    parser.add_argument(
+        "--projection-columns",
+        default=None,
+        help="Comma-separated input-feature names of the PVT corner columns fed to the "
+        "learned projection (SpectraHydraProj only), e.g. 'Temp_C,VDD,proc_tt,proc_ff'.",
+    )
+    parser.add_argument(
+        "--projection-dim",
+        type=int,
+        default=defaults["projection_dim"].default,
+        help="Corner-embedding width (SpectraHydraProj only).",
+    )
     parser.add_argument("--train-frac", type=float, default=defaults["train_frac"].default)
     parser.add_argument("--val-frac", type=float, default=defaults["val_frac"].default)
+    parser.add_argument(
+        "--split-design-columns",
+        default=None,
+        help="Comma-separated names of the columns that IDENTIFY a design (the geometry parameters). Every other column is treated as corner-varying, so the design-level split cannot be silently defeated by a derived corner column the way --split-corner-columns can. Prefer this flag.",
+    )
+    parser.add_argument(
+        "--split-corner-columns",
+        default=None,
+        help="Comma-separated PVT corner column names enabling the design-level split: "
+        "rows identical in every other input column are one design and all of its "
+        "corner rows stay in the same train/val/test fold (prevents corner-row "
+        "leakage between splits). Works with every model type.",
+    )
     parser.add_argument("--iterations", type=int, default=defaults["iterations"].default)
     parser.add_argument("--num-bands", type=int, default=defaults["num_bands"].default)
     parser.add_argument("--transfer-epochs", type=int, default=defaults["transfer_epochs"].default)
@@ -43,8 +68,24 @@ def main() -> None:
             model_type=args.model_type,
             width=args.width,
             depth=args.depth,
+            projection_columns=(
+                [name.strip() for name in args.projection_columns.split(",") if name.strip()]
+                if args.projection_columns is not None
+                else None
+            ),
+            projection_dim=args.projection_dim,
             train_frac=args.train_frac,
             val_frac=args.val_frac,
+            split_corner_columns=(
+                [name.strip() for name in args.split_corner_columns.split(",") if name.strip()]
+                if args.split_corner_columns is not None
+                else None
+            ),
+            split_design_columns=(
+                [name.strip() for name in args.split_design_columns.split(",") if name.strip()]
+                if args.split_design_columns is not None
+                else None
+            ),
             iterations=args.iterations,
             num_bands=args.num_bands,
             transfer_epochs=args.transfer_epochs,

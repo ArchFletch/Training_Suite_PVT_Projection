@@ -16,6 +16,7 @@ import math
 import random
 import shutil
 import subprocess
+import warnings
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -27,8 +28,8 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from .data import CACHE_PATH, DATA_ROOT, ensure_cache, load_split_bundle, split_indices
-from .model import SpectraHydra, SpectraNet
+from .data import CACHE_PATH, DATA_ROOT, design_split_indices, ensure_cache, load_split_bundle, split_indices
+from .model import SpectraHydra, SpectraHydraProj, SpectraNet
 from .progress import ProgressCallback, RunCancelled, StopChecker, emit_progress, request_stop
 
 
@@ -56,11 +57,33 @@ class TrainConfig:
     # Dataset split settings.
     train_frac: float = 0.8
     val_frac: float = 0.1
+    # Optional design-level split: names of the input columns that vary across the
+    # PVT corners of one design (e.g. Temp_C, VDD, proc_* one-hots). When set, rows
+    # identical in every OTHER column are one design and all of its corner rows land
+    # in the same train/val/test fold, so no design leaks between splits. ``None``
+    # keeps the default row-level split. Works with every model type.
+    #
+    # This list must cover EVERY column that moves with the corner, derived ones
+    # included (physics anchors, a frozen corner embedding); miss one and each
+    # design splinters into per-corner designs, which is a row-level split wearing
+    # a design-level label. Prefer split_design_columns below, where the same
+    # mistake merges designs instead — coarser, never leakier. Set at most one.
+    split_corner_columns: list[str] | None = None
+    # Names of the columns that IDENTIFY a design (the geometry parameters);
+    # everything else is treated as corner-varying.
+    split_design_columns: list[str] | None = None
 
     # Model architecture settings.
-    model_type: str = "SpectraNet"  # "SpectraNet" or "SpectraHydra"
+    model_type: str = "SpectraNet"  # "SpectraNet", "SpectraHydra", or "SpectraHydraProj"
     width: int = 512
     depth: int = 5
+    # SpectraHydraProj only: names of the PVT corner/condition feature columns
+    # (e.g. Temp_C, VDD, process one-hots) fed to the learned corner projection,
+    # and the width of the projected embedding. Stored as names — not indices —
+    # because constant columns are dropped per training split, which would shift
+    # raw indices. Ignored by the other model types.
+    projection_columns: list[str] | None = None
+    projection_dim: int = 16
 
     # Loss and scheduler settings.
     loss_function: str = "rmse"  # "rmse" or "mse"
@@ -72,6 +95,17 @@ class TrainConfig:
     # Compute device to train on, e.g. "cuda:0", "cuda:1", or "cpu".
     # ``None`` means auto-select (first CUDA device when available, else CPU).
     device: str | None = None
+
+    # Optional external evaluation set: an .npz file holding ``features``,
+    # ``targets``, and ``feature_names`` arrays (a dataset bundle.npz qualifies).
+    # After training, the best checkpoint is also scored on this file and the
+    # per-channel MAE is reported next to the internal test metrics. Point it at
+    # data the training dataset never contains (e.g. extra held-out designs) to
+    # get an honest external benchmark — the internal test fold changes with the
+    # seed, this number does not. Feature columns are matched by name; targets
+    # must share the training dataset's channel order, frequency grid, and value
+    # space. The file is validated before training starts.
+    eval_dataset_path: str | None = None
 
 
 @dataclass
@@ -89,9 +123,16 @@ class TransferConfig:
     model_type: str = "SpectraNet"
     width: int = 512
     depth: int = 5
+    # SpectraHydraProj only — same semantics as the TrainConfig fields.
+    projection_columns: list[str] | None = None
+    projection_dim: int = 16
     seed: int = 42
     train_frac: float = 0.8
     val_frac: float = 0.1
+    # Same semantics as the ``TrainConfig`` fields: either one switches the split to
+    # design-level so no design's corner rows leak between train and test.
+    split_corner_columns: list[str] | None = None
+    split_design_columns: list[str] | None = None
     num_bands: int = 10
     iterations: int = 10
     transfer_epochs: int = 100
@@ -104,7 +145,7 @@ class TransferConfig:
     device: str | None = None
 
 
-MODEL_TYPES = ("SpectraNet", "SpectraHydra")
+MODEL_TYPES = ("SpectraNet", "SpectraHydra", "SpectraHydraProj")
 
 # Back-compat: runs saved under the old model-type names still load. Map the legacy
 # string to its current equivalent so old checkpoints, configs, and saved GUI forms
@@ -151,6 +192,27 @@ def resolve_device(spec: str | None) -> torch.device:
     return device
 
 
+# Torch's CPU thread pool spin-waits, so on a many-core host it burns enormous CPU on
+# the trivial host-side work GPU training does (batch collation, per-step loss readback).
+_GPU_TRAINING_CPU_THREADS = 4
+
+
+def limit_cpu_threads_for_gpu(device: torch.device) -> None:
+    """Shrink torch's CPU thread pool when the real work happens on a GPU.
+
+    Measured on a 128-thread host (L40, 9.2k samples, batch 64): one epoch used
+    ~102 s of CPU time across ~127 spinning threads to produce 0.8 s of wall-clock
+    progress. Capping the pool cuts that to ~0.7 s of CPU time and is marginally
+    *faster*, because these tensors are far too small to profit from a wide pool.
+
+    CPU training is left untouched, where a wide pool genuinely does help.
+    """
+    if device.type != "cuda":
+        return
+    if torch.get_num_threads() > _GPU_TRAINING_CPU_THREADS:
+        torch.set_num_threads(_GPU_TRAINING_CPU_THREADS)
+
+
 def build_model(model_type: str, *, num_frequencies: int, **kwargs: Any) -> nn.Module:
     """Instantiate a model by name, forwarding architecture kwargs.
 
@@ -162,7 +224,68 @@ def build_model(model_type: str, *, num_frequencies: int, **kwargs: Any) -> nn.M
         return SpectraNet(num_frequencies=num_frequencies, **kwargs)
     if model_type == "SpectraHydra":
         return SpectraHydra(num_frequencies=num_frequencies, **kwargs)
+    if model_type == "SpectraHydraProj":
+        return SpectraHydraProj(num_frequencies=num_frequencies, **kwargs)
     raise ValueError(f"Unknown model_type {model_type!r}. Choose from {MODEL_TYPES}.")
+
+
+def resolve_projection_kwargs(
+    model_type: str,
+    projection_columns: list[str] | None,
+    projection_dim: int,
+    active_names: list[str],
+    dropped_names: list[str] | tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Build the extra :func:`build_model` kwargs for ``SpectraHydraProj``.
+
+    Returns an empty dict for every other model type, so callers can splat the
+    result unconditionally. Corner columns are configured by NAME and resolved
+    here — at model-build time — to indices in the model's input order
+    (``active_names``), because constant columns are dropped per training split
+    and raw cache indices would silently shift.
+
+    A configured column that was dropped as constant is skipped: a constant
+    column carries no corner information in this dataset. Unknown names, an
+    empty configuration, and a configuration where every column was dropped all
+    raise so the run fails loudly instead of training a degenerate projection.
+    """
+    if canonical_model_type(model_type) != "SpectraHydraProj":
+        return {}
+    # Dedupe while preserving order (e.g. a repeated name in a CLI flag) so the
+    # projection never embeds the same column twice.
+    requested = list(dict.fromkeys(str(name) for name in (projection_columns or []) if str(name).strip()))
+    if not requested:
+        raise ValueError(
+            "SpectraHydraProj needs at least one PVT corner column. Set "
+            "projection_columns to names from the dataset's input features "
+            "(e.g. temperature, supply, or process-corner columns)."
+        )
+    known = set(active_names) | set(dropped_names)
+    unknown = [name for name in requested if name not in known]
+    if unknown:
+        raise ValueError(
+            f"Projection corner column(s) {unknown} are not input features of this "
+            f"dataset. Available columns: {sorted(known)}."
+        )
+    indices = [active_names.index(name) for name in requested if name in active_names]
+    if not indices:
+        raise ValueError(
+            f"All configured projection corner columns {requested} are constant in "
+            "the training split, so there is no corner information to project. "
+            "Pick columns that vary across samples (e.g. Temp_C, VDD, proc_*)."
+        )
+    skipped = [name for name in requested if name not in active_names]
+    if skipped:
+        # Constancy is a property of the current training split (seed / fractions /
+        # max_samples), not the dataset, so a silently smaller embedding could
+        # otherwise diverge between runs that share a config. Warn loudly.
+        warnings.warn(
+            f"Projection corner column(s) {skipped} are constant in this training "
+            f"split and were skipped; the corner projection embeds only "
+            f"{[active_names[i] for i in indices]}.",
+            stacklevel=2,
+        )
+    return {"corner_indices": indices, "projection_dim": int(projection_dim)}
 
 
 def frequency_rmse(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -179,13 +302,11 @@ def frequency_mse(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     channels there are.
     """
     # pred/target shape: (batch, channels, frequency)
-    num_channels = pred.shape[1]
-    if num_channels == 1:
-        return torch.mean((pred - target) ** 2)
-    return sum(
-        torch.mean((pred[:, c, :] - target[:, c, :]) ** 2)
-        for c in range(num_channels)
-    )
+    # Per-channel mean over (batch, frequency), then summed over channels. Written as
+    # one vectorized reduction rather than a Python loop over channels: identical value,
+    # 3 kernels instead of ~4 per channel plus one backward node instead of many.
+    # For a single channel this reduces to plain MSE, as before.
+    return ((pred - target) ** 2).mean(dim=(0, 2)).sum()
 
 
 LOSS_FUNCTIONS = ("rmse", "mse")
@@ -234,6 +355,7 @@ def run_baseline_trial(
     seed_all(config.seed)
     enable_fast_cuda()
     device = resolve_device(config.device)
+    limit_cpu_threads_for_gpu(device)
     bundle: Any | None = None
     history: list[dict[str, float]] = []
     best_val = float("inf")
@@ -283,17 +405,29 @@ def run_baseline_trial(
             val_frac=config.val_frac,
             max_samples=config.max_samples,
             pin_memory=device.type == "cuda",
+            split_corner_columns=config.split_corner_columns,
+            split_design_columns=config.split_design_columns,
         )
+        if bundle.design_counts is not None:
+            data_ready_message = (
+                "Training data split and normalization are ready. Design-level split: "
+                f"{bundle.design_counts['train']} train / {bundle.design_counts['val']} val / "
+                f"{bundle.design_counts['test']} test designs (all corner rows of a design "
+                "stay in one fold)."
+            )
+        else:
+            data_ready_message = "Training data split and normalization are ready."
         emit_progress(
             progress_callback,
             event="data_ready",
             phase="baseline",
-            message="Training data split and normalization are ready.",
+            message=data_ready_message,
             **_progress_data(
                 event_context,
                 train_samples=int(len(bundle.split_indices["train"])),
                 val_samples=int(len(bundle.split_indices["val"])),
                 test_samples=int(len(bundle.split_indices["test"])),
+                design_counts=bundle.design_counts,
                 active_input_feature_names=bundle.active_names,
                 dropped_input_feature_names=bundle.dropped_names,
                 frequency_count=int(len(bundle.frequency_ghz)),
@@ -301,6 +435,31 @@ def run_baseline_trial(
                 frequency_max_ghz=float(bundle.frequency_ghz.max()),
             ),
         )
+
+        # Load (and thereby validate) the external evaluation set before any
+        # training time is spent: a bad path or a mismatched file must fail now,
+        # not after the full epoch budget.
+        external_eval: tuple[np.ndarray, np.ndarray, list[str]] | None = None
+        if config.eval_dataset_path:
+            external_eval = _load_external_eval(config.eval_dataset_path, bundle)
+            ready_message = (
+                f"External evaluation set is ready: {len(external_eval[0])} rows "
+                f"from {Path(config.eval_dataset_path).name}."
+            )
+            for note in external_eval[2]:
+                ready_message += f" Note: {note}"
+            emit_progress(
+                progress_callback,
+                event="external_eval_ready",
+                phase="baseline",
+                message=ready_message,
+                **_progress_data(
+                    event_context,
+                    eval_dataset_path=str(config.eval_dataset_path),
+                    external_eval_rows=int(len(external_eval[0])),
+                    external_eval_notes=list(external_eval[2]),
+                ),
+            )
 
         # Stage 3: create the model and optimization objects.
         model = build_model(
@@ -310,6 +469,13 @@ def run_baseline_trial(
             ground_truth_channels=len(bundle.channel_names),
             width=config.width,
             depth=config.depth,
+            **resolve_projection_kwargs(
+                config.model_type,
+                config.projection_columns,
+                config.projection_dim,
+                bundle.active_names,
+                bundle.dropped_names,
+            ),
         ).to(device)
         loss_fn = _build_loss_fn(config.loss_function)
         optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
@@ -427,15 +593,9 @@ def run_baseline_trial(
         # Only show per-channel breakdown when channel_units are defined (e.g. CTLE
         # with "dB", "deg").  For touchstone data without units, show one combined
         # average MAE to keep the display clean.
-        has_units = any(u for u in bundle.channel_units)
-        channel_mae_with_units = []
-        if has_units:
-            for ch_idx, ch_name in enumerate(bundle.channel_names):
-                unit = bundle.channel_units[ch_idx] if ch_idx < len(bundle.channel_units) else ""
-                mae_val = per_channel_mae[ch_idx] if ch_idx < len(per_channel_mae) else 0.0
-                mae_str = f"{mae_val:.4e}" if mae_val != 0 and abs(mae_val) < 1e-3 else f"{mae_val:.4f}"
-                label = f"{ch_name}: {mae_str} {unit}".strip()
-                channel_mae_with_units.append(label)
+        channel_mae_with_units = _channel_mae_labels(
+            bundle.channel_names, bundle.channel_units, per_channel_mae
+        )
         emit_progress(
             progress_callback,
             event="evaluation_completed",
@@ -452,6 +612,64 @@ def run_baseline_trial(
                 channel_mae_with_units=channel_mae_with_units,
             ),
         )
+
+        # Score the same best checkpoint on the external evaluation set, through
+        # the exact metric path the internal test evaluation uses. A Stop click
+        # during this optional add-on must not discard the fully-trained run, so
+        # a cancellation here only skips the external numbers and lets the run
+        # save its artifacts normally.
+        external_result: dict[str, Any] = {}
+        if external_eval is not None:
+            try:
+                external_loader = DataLoader(
+                    TensorDataset(
+                        torch.from_numpy(external_eval[0]), torch.from_numpy(external_eval[1])
+                    ),
+                    batch_size=512,
+                )
+                external_loss, external_mae, _external_freq_mae, external_per_channel = _eval_metrics(
+                    model,
+                    external_loader,
+                    device,
+                    amp,
+                    should_stop=should_stop,
+                    target_mean=bundle.target_mean,
+                    target_std=bundle.target_std,
+                    channel_transforms=bundle.channel_transforms,
+                    loss_fn=loss_fn,
+                )
+                # The external set was requested explicitly, so always break the
+                # MAE down per channel — even for datasets that declare no units.
+                external_labels = _channel_mae_labels(
+                    bundle.channel_names, bundle.channel_units, external_per_channel, require_units=False
+                )
+                external_result = {
+                    "eval_dataset_path": str(config.eval_dataset_path),
+                    "external_eval_rows": int(len(external_eval[0])),
+                    "external_eval_loss": float(external_loss),
+                    "average_external_mae": float(external_mae),
+                    "external_per_channel_mae": external_per_channel,
+                    "external_channel_mae_with_units": external_labels,
+                }
+                emit_progress(
+                    progress_callback,
+                    event="external_evaluation_completed",
+                    phase="baseline",
+                    message=(
+                        f"External evaluation ({Path(config.eval_dataset_path).name}, "
+                        f"{external_result['external_eval_rows']} rows): "
+                        + " | ".join(external_labels)
+                    ),
+                    **_progress_data(event_context, **external_result),
+                )
+            except RunCancelled:
+                emit_progress(
+                    progress_callback,
+                    event="external_evaluation_skipped",
+                    phase="baseline",
+                    message="Stop requested during the external evaluation; skipping it and saving the trained run.",
+                    **_progress_data(event_context, eval_dataset_path=str(config.eval_dataset_path)),
+                )
 
         result = {
             "status": "ok",
@@ -471,6 +689,7 @@ def run_baseline_trial(
             "active_input_feature_names": bundle.active_names,
             "dropped_input_feature_names": bundle.dropped_names,
         }
+        result.update(external_result)
         if not save_artifacts:
             # Search trials use this fast path because they only need the metrics, not
             # a full artifact directory.
@@ -641,6 +860,17 @@ def train_baseline(
         summary["test_sample_data"] = result["test_sample_data"]
     if "test_sample_plot_paths" in result:
         summary["test_sample_plot_paths"] = result["test_sample_plot_paths"]
+    # External evaluation-set metrics, present only when the run configured one.
+    for key in (
+        "eval_dataset_path",
+        "external_eval_rows",
+        "external_eval_loss",
+        "average_external_mae",
+        "external_per_channel_mae",
+        "external_channel_mae_with_units",
+    ):
+        if key in result:
+            summary[key] = result[key]
     # Pass through history and runtime for GUI display.
     summary["history"] = result.get("history", [])
     summary["runtime_seconds"] = result.get("runtime_seconds")
@@ -668,6 +898,7 @@ def run_self_transfer(
     seed_all(config.seed)
     enable_fast_cuda()
     device = resolve_device(config.device)
+    limit_cpu_threads_for_gpu(device)
     amp = config.use_amp and device.type == "cuda"
     run_dir = make_run_dir(config.output_dir)
     results: list[dict[str, Any]] = []
@@ -704,13 +935,27 @@ def run_self_transfer(
             )
             sweep_label = str(data["sweep_label"]) if "sweep_label" in data else "Frequency (GHz)"
 
-        split = split_indices(len(features), config.train_frac, config.val_frac, config.seed)
+        if config.split_corner_columns or config.split_design_columns:
+            # Design-level split (matches baseline): every corner row of a design
+            # stays in the same fold so no design leaks between train and test.
+            split = design_split_indices(
+                features,
+                input_feature_names,
+                config.split_corner_columns,
+                config.train_frac,
+                config.val_frac,
+                config.seed,
+                config.split_design_columns,
+            )
+        else:
+            split = split_indices(len(features), config.train_frac, config.val_frac, config.seed)
         # Drop constant input features using the training split only (matches baseline).
         train_feats = features[split["train"]]
         active_mask = train_feats.max(axis=0) != train_feats.min(axis=0)
         if not active_mask.any():
             active_mask[:] = True
         active_names = [n for n, keep in zip(input_feature_names, active_mask, strict=True) if keep]
+        dropped_names = [n for n, keep in zip(input_feature_names, active_mask, strict=True) if not keep]
         active_idx = [i for i, keep in enumerate(active_mask) if keep]
         # Input normalization from the training split.
         input_feature_mean = train_feats[:, active_idx].mean(axis=0).astype(np.float32)
@@ -773,6 +1018,19 @@ def run_self_transfer(
             "width": int(config.width),
             "depth": int(config.depth),
         }
+        # SpectraHydraProj: resolve the corner columns once, here, so every band
+        # submodel, the stitch evaluator, and the saved final_submodels.pt share
+        # byte-identical projection kwargs (band-to-band warm starts load state
+        # dicts strictly, so all band architectures must match exactly).
+        model_kwargs.update(
+            resolve_projection_kwargs(
+                saved_model_type,
+                config.projection_columns,
+                config.projection_dim,
+                active_names,
+                dropped_names,
+            )
+        )
         weight_decay = 1e-4 if config.weight_decay is None else float(config.weight_decay)
         # Each band predicts only its own frequencies, so band models are built at the
         # band width (the per-frequency output layer is what differs between bands).
@@ -1039,7 +1297,12 @@ def _run_epoch(
     loss_fn=frequency_rmse,
 ) -> float:
     model.train()
-    total = 0.0
+    # Accumulate on-device and read back once after the loop. A per-batch
+    # float(loss.cpu()) blocks the host until every kernel queued for that step has
+    # finished, so the CPU can never run ahead to enqueue the next step's kernels --
+    # the loop degenerates from pipelined to strictly alternating and the GPU idles
+    # through all the Python. The returned value is unchanged.
+    total = torch.zeros((), dtype=torch.float32, device=device)
     count = 0
     for x, y in loader:
         request_stop(should_stop)
@@ -1050,9 +1313,9 @@ def _run_epoch(
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
-        total += float(loss.detach().cpu()) * x.shape[0]
+        total += loss.detach().float() * x.shape[0]
         count += x.shape[0]
-    return total / max(count, 1)
+    return float(total) / max(count, 1)
 
 
 def _eval_loss(
@@ -1064,7 +1327,8 @@ def _eval_loss(
     loss_fn=frequency_rmse,
 ) -> float:
     model.eval()
-    total = 0.0
+    # Same deferred read-back as _run_epoch: one host sync per call, not per batch.
+    total = torch.zeros((), dtype=torch.float32, device=device)
     count = 0
     with torch.no_grad():
         for x, y in loader:
@@ -1072,9 +1336,180 @@ def _eval_loss(
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
                 loss = loss_fn(model(x), y)
-            total += float(loss.detach().cpu()) * x.shape[0]
+            total += loss.detach().float() * x.shape[0]
             count += x.shape[0]
-    return total / max(count, 1)
+    return float(total) / max(count, 1)
+
+
+def _channel_mae_labels(
+    channel_names: list[str],
+    channel_units: list[str],
+    per_channel_mae: list[float],
+    require_units: bool = True,
+) -> list[str]:
+    """Format per-channel MAE values as display strings like ``"gain: 0.1291 dB"``.
+
+    With ``require_units`` (the default), datasets that declare no channel units
+    get an empty list so the GUI keeps its single averaged card; pass ``False``
+    to always produce the breakdown.
+    """
+    if require_units and not any(unit for unit in channel_units):
+        return []
+    labels = []
+    for ch_idx, ch_name in enumerate(channel_names):
+        unit = channel_units[ch_idx] if ch_idx < len(channel_units) else ""
+        mae_val = per_channel_mae[ch_idx] if ch_idx < len(per_channel_mae) else 0.0
+        mae_str = f"{mae_val:.4e}" if mae_val != 0 and abs(mae_val) < 1e-3 else f"{mae_val:.4f}"
+        labels.append(f"{ch_name}: {mae_str} {unit}".strip())
+    return labels
+
+
+def _load_external_eval(path_str: str, bundle: Any) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    """Load an external evaluation .npz and align it to a training bundle.
+
+    The file must hold ``features`` (rows x columns), ``targets`` (rows x
+    channels x frequencies), and ``feature_names`` (or the engine cache's
+    ``input_feature_names``) — a dataset bundle.npz or cache.npz qualifies.
+    Feature columns are matched to the model's active inputs by name and
+    normalized with the training statistics; targets are normalized with the
+    training target statistics so ``_eval_metrics`` reports MAE in the original
+    units, exactly like the internal test evaluation. Targets must therefore be
+    in the same value space as the training dataset's stored targets; when the
+    file carries its own channel/frequency metadata it is cross-checked against
+    the training bundle so a mismatch cannot score silently. Every problem
+    raises ``ValueError`` so callers can fail before training starts. Returns
+    ``(x, y, notes)`` where ``notes`` are non-fatal warnings for the run log.
+    """
+    path = Path(path_str)
+    if not path.is_file():
+        raise ValueError(f"External evaluation set not found: {path}")
+    try:
+        archive = np.load(path, allow_pickle=False)
+    except Exception as error:
+        raise ValueError(f"Could not read external evaluation set {path}: {error}") from error
+    with archive as data:
+        names_key = "feature_names" if "feature_names" in data else "input_feature_names"
+        missing_keys = [key for key in ("features", "targets", names_key) if key not in data]
+        if missing_keys:
+            raise ValueError(
+                f"External evaluation set {path.name} is missing arrays: {', '.join(missing_keys)} "
+                "(expected an .npz holding features, targets, and feature_names "
+                "or input_feature_names)."
+            )
+        features = np.asarray(data["features"], dtype=np.float32)
+        targets = np.asarray(data["targets"], dtype=np.float32)
+        names = [str(name) for name in data[names_key]]
+        # Optional metadata a dataset bundle/cache carries about its own targets.
+        file_channel_names = (
+            [str(name) for name in data["channel_names"]] if "channel_names" in data else None
+        )
+        file_channel_transforms = (
+            [str(item) for item in data["channel_transforms"]]
+            if "channel_transforms" in data
+            else None
+        )
+        file_channel_units = (
+            [str(unit) for unit in data["channel_units"]] if "channel_units" in data else None
+        )
+        file_frequency_hz = (
+            np.asarray(data["frequency_hz"], dtype=np.float64) if "frequency_hz" in data else None
+        )
+    if features.ndim != 2 or targets.ndim != 3:
+        raise ValueError(
+            f"External evaluation set {path.name} has features of shape {features.shape} and "
+            f"targets of shape {targets.shape}; expected (rows, columns) and "
+            "(rows, channels, frequencies)."
+        )
+    if len(features) == 0 or len(features) != len(targets):
+        raise ValueError(
+            f"External evaluation set {path.name} has {len(features)} feature rows and "
+            f"{len(targets)} target rows; both must match and be non-empty."
+        )
+    if len(names) != features.shape[1]:
+        raise ValueError(
+            f"External evaluation set {path.name} names {len(names)} feature columns but its "
+            f"features array has {features.shape[1]}; the file is malformed."
+        )
+    missing_features = [name for name in bundle.active_names if name not in names]
+    if missing_features:
+        raise ValueError(
+            f"External evaluation set {path.name} lacks input columns the model needs: "
+            f"{', '.join(missing_features)}."
+        )
+    duplicated = [name for name in bundle.active_names if names.count(name) > 1]
+    if duplicated:
+        raise ValueError(
+            f"External evaluation set {path.name} lists input columns more than once: "
+            f"{', '.join(duplicated)}; column matching by name would be ambiguous."
+        )
+    if targets.shape[1] != len(bundle.channel_names):
+        raise ValueError(
+            f"External evaluation set {path.name} has {targets.shape[1]} target channels; "
+            f"the training dataset has {len(bundle.channel_names)} ({', '.join(bundle.channel_names)})."
+        )
+    if targets.shape[2] != len(bundle.frequency_hz):
+        raise ValueError(
+            f"External evaluation set {path.name} has {targets.shape[2]} frequency points; "
+            f"the training dataset has {len(bundle.frequency_hz)}."
+        )
+    # Cross-check the file's own target metadata against the training dataset.
+    # These mismatches pass every shape check yet make the score meaningless: a
+    # value-space mismatch (log10 vs raw) exponentiates raw values into garbage,
+    # swapped channels score each channel against the other's statistics, and a
+    # different grid at the same point count compares the wrong frequencies.
+    if file_channel_names is not None and file_channel_names != list(bundle.channel_names):
+        raise ValueError(
+            f"External evaluation set {path.name} declares channels "
+            f"[{', '.join(file_channel_names)}] but the training dataset has "
+            f"[{', '.join(bundle.channel_names)}]; the order and names must match."
+        )
+    if file_channel_transforms is not None and file_channel_transforms != list(bundle.channel_transforms):
+        raise ValueError(
+            f"External evaluation set {path.name} stores targets with channel transforms "
+            f"{file_channel_transforms} but the training dataset uses "
+            f"{list(bundle.channel_transforms)}; the target value spaces differ, so the "
+            "score would be meaningless. Re-export the evaluation set in the training "
+            "dataset's target space."
+        )
+    if file_frequency_hz is not None and (
+        file_frequency_hz.shape != np.asarray(bundle.frequency_hz).shape
+        or not np.allclose(file_frequency_hz, np.asarray(bundle.frequency_hz, dtype=np.float64), rtol=1e-5)
+    ):
+        raise ValueError(
+            f"External evaluation set {path.name} was sampled on a different frequency grid "
+            "than the training dataset; equal point counts are not enough — the grids "
+            "must match point-for-point."
+        )
+    notes: list[str] = []
+    if file_channel_units is not None and file_channel_units != list(bundle.channel_units):
+        notes.append(
+            f"channel units differ from the training dataset ({file_channel_units} vs "
+            f"{list(bundle.channel_units)}); results are labeled with the training units."
+        )
+    # A column that was constant in training was dropped from the model. If it
+    # varies in the external set, the model cannot respond to it — the score is
+    # still a true measure of this checkpoint, but the reader should know.
+    for name in bundle.dropped_names:
+        if name in names:
+            column = features[:, names.index(name)]
+            if np.ptp(column) > 0:
+                notes.append(
+                    f"column '{name}' was constant in training (dropped from the model) "
+                    "but varies in the external set; the model cannot respond to it."
+                )
+    column_index = [names.index(name) for name in bundle.active_names]
+    selected = features[:, column_index]
+    if not np.isfinite(selected).all() or not np.isfinite(targets).all():
+        bad_rows = int(
+            (~np.isfinite(selected).all(axis=1) | ~np.isfinite(targets).all(axis=(1, 2))).sum()
+        )
+        raise ValueError(
+            f"External evaluation set {path.name} contains NaN or infinite values in "
+            f"{bad_rows} row(s); clean or drop those rows before using it."
+        )
+    x = (selected - bundle.input_feature_mean) / bundle.input_feature_std
+    y = (targets - bundle.target_mean) / bundle.target_std
+    return x.astype(np.float32), y.astype(np.float32), notes
 
 
 def _eval_metrics(
@@ -1100,15 +1535,24 @@ def _eval_metrics(
     model.eval()
     preds: list[torch.Tensor] = []
     trues: list[torch.Tensor] = []
-    loss = _eval_loss(model, loader, device, amp, should_stop=should_stop, loss_fn=loss_fn)
+    # The loss is accumulated inside the prediction pass; this used to call
+    # _eval_loss first, walking the whole split a second time for a value the
+    # prediction loop can produce for free.
+    total_loss = torch.zeros((), dtype=torch.float32, device=device)
+    count = 0
     with torch.no_grad():
         for x, y in loader:
             request_stop(should_stop)
             x = x.to(device, non_blocking=True)
+            y_device = y.to(device, non_blocking=True)
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
                 pred = model(x)
+                batch_loss = loss_fn(pred, y_device)
+            total_loss += batch_loss.detach().float() * x.shape[0]
+            count += x.shape[0]
             preds.append(pred.cpu())
             trues.append(y)
+    loss = float(total_loss) / max(count, 1)
     if not preds:
         raise ValueError("Evaluation split is empty; cannot compute metrics.")
     pred_all = torch.cat(preds, dim=0).numpy()

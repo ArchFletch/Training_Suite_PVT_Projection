@@ -73,10 +73,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model-type",
         default=None,
-        help="SpectraNet or SpectraHydra (legacy FlatMLP / CTLE_MLP also accepted).",
+        help="SpectraNet, SpectraHydra, or SpectraHydraProj (legacy FlatMLP / CTLE_MLP also accepted).",
     )
     parser.add_argument("--width", type=int, default=None)
     parser.add_argument("--depth", type=int, default=None)
+    # SpectraHydraProj only.
+    parser.add_argument(
+        "--projection-columns",
+        default=None,
+        help="Comma-separated input-feature names of the PVT corner columns fed to the "
+        "learned projection (SpectraHydraProj only), e.g. 'Temp_C,VDD,proc_tt,proc_ff'.",
+    )
+    parser.add_argument("--projection-dim", type=int, default=None, help="Corner-embedding width (SpectraHydraProj only).")
     # Optimization / schedule.
     parser.add_argument("--learning-rate", type=float, default=None)
     parser.add_argument("--weight-decay", type=float, default=None)
@@ -89,6 +97,28 @@ def build_parser() -> argparse.ArgumentParser:
     # Split.
     parser.add_argument("--train-frac", type=float, default=None)
     parser.add_argument("--val-frac", type=float, default=None)
+    parser.add_argument(
+        "--split-design-columns",
+        default=None,
+        help="Comma-separated names of the columns that IDENTIFY a design (the geometry parameters). Every other column is treated as corner-varying, so the design-level split cannot be silently defeated by a derived corner column the way --split-corner-columns can. Prefer this flag.",
+    )
+    parser.add_argument(
+        "--split-corner-columns",
+        default=None,
+        help="Comma-separated PVT corner column names enabling the design-level split: "
+        "rows identical in every other input column are one design and all of its "
+        "corner rows stay in the same train/val/test fold (prevents corner-row "
+        "leakage between splits). Works with every model type. Pass '' to disable "
+        "a value coming from --config-json.",
+    )
+    parser.add_argument(
+        "--eval-dataset-path",
+        default=None,
+        help="Optional .npz file (features, targets, feature_names — a dataset "
+        "bundle.npz qualifies) the best checkpoint is scored on after training, "
+        "e.g. extra held-out designs. Reported as external_* summary fields. "
+        "Pass '' to disable a value coming from --config-json.",
+    )
     # Runtime.
     parser.add_argument("--device", default=None, help="e.g. cuda:0, cuda:1, cpu. None auto-selects.")
     parser.add_argument("--disable-amp", action="store_true")
@@ -120,6 +150,12 @@ def resolve_train_config(args: argparse.Namespace) -> TrainConfig:
         "model_type": args.model_type,
         "width": args.width,
         "depth": args.depth,
+        "projection_columns": (
+            [name.strip() for name in args.projection_columns.split(",") if name.strip()]
+            if args.projection_columns is not None
+            else None
+        ),
+        "projection_dim": args.projection_dim,
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
         "scheduler": args.scheduler,
@@ -130,6 +166,17 @@ def resolve_train_config(args: argparse.Namespace) -> TrainConfig:
         "max_samples": args.max_samples,
         "train_frac": args.train_frac,
         "val_frac": args.val_frac,
+        "split_corner_columns": (
+            [name.strip() for name in args.split_corner_columns.split(",") if name.strip()]
+            if args.split_corner_columns is not None
+            else None
+        ),
+        "split_design_columns": (
+            [name.strip() for name in args.split_design_columns.split(",") if name.strip()]
+            if args.split_design_columns is not None
+            else None
+        ),
+        "eval_dataset_path": args.eval_dataset_path,
         "device": args.device,
     }
     merged.update({k: v for k, v in cli_overrides.items() if v is not None})

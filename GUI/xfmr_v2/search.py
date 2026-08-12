@@ -20,7 +20,7 @@ from typing import Any
 
 from .data import CACHE_PATH, DATA_ROOT
 from .progress import ProgressCallback, StopChecker, emit_progress, request_stop
-from .runner import TrainConfig, make_run_dir, run_baseline_trial
+from .runner import TrainConfig, canonical_model_type, make_run_dir, run_baseline_trial
 from .suggest import SuggestConfig, suggest_initial_settings
 
 
@@ -41,6 +41,13 @@ class SearchConfig:
     max_samples: int | None = None
     search_max_samples: int | None = None
     model_type: str = "SpectraNet"
+    # SpectraHydraProj only — same semantics as the TrainConfig fields.
+    projection_columns: list[str] | None = None
+    projection_dim: int = 16
+    # Same semantics as ``TrainConfig.split_corner_columns``: when set, every trial
+    # uses the design-level split so the rankings are free of corner-row leakage.
+    split_corner_columns: list[str] | None = None
+    split_design_columns: list[str] | None = None
     trial_count: int = 6
     epochs_per_trial: int = 60
     objective: str = "balanced"
@@ -83,6 +90,8 @@ def quick_hyperparameter_search(
             seed=config.seed,
             train_frac=config.train_frac,
             val_frac=config.val_frac,
+            split_corner_columns=config.split_corner_columns,
+            split_design_columns=config.split_design_columns,
             max_samples=search_sample_cap,
             variance_threshold=config.variance_threshold,
         ),
@@ -102,6 +111,10 @@ def quick_hyperparameter_search(
 
     base_trial_config = TrainConfig(**suggestion["suggested_baseline_config"])
     base_trial_config.model_type = config.model_type
+    base_trial_config.projection_columns = config.projection_columns
+    base_trial_config.projection_dim = config.projection_dim
+    base_trial_config.split_corner_columns = config.split_corner_columns
+    base_trial_config.split_design_columns = config.split_design_columns
     base_trial_config.epochs = config.epochs_per_trial
     base_trial_config.max_samples = search_sample_cap
 
@@ -109,6 +122,10 @@ def quick_hyperparameter_search(
     # search-specific epoch cap, so the best candidate can be recommended for a full run.
     base_full_config = TrainConfig(**suggestion["suggested_baseline_config"])
     base_full_config.model_type = config.model_type
+    base_full_config.projection_columns = config.projection_columns
+    base_full_config.projection_dim = config.projection_dim
+    base_full_config.split_corner_columns = config.split_corner_columns
+    base_full_config.split_design_columns = config.split_design_columns
     base_full_config.max_samples = config.max_samples
 
     # Build a compact set of nearby alternatives rather than a huge Cartesian grid.
@@ -301,6 +318,13 @@ def _validate_search_config(config: SearchConfig, objective: str) -> None:
         raise ValueError("trial_count must be at least 1.")
     if config.epochs_per_trial <= 0:
         raise ValueError("epochs_per_trial must be at least 1.")
+    if canonical_model_type(config.model_type) == "SpectraHydraProj" and not config.projection_columns:
+        # Otherwise the missing corner columns only surface inside the first trial,
+        # after the (comparatively slow) suggestion pass has already run.
+        raise ValueError(
+            "SpectraHydraProj needs projection_columns (PVT corner column names) "
+            "set on the SearchConfig."
+        )
     if not 0.0 < config.train_frac < 1.0:
         raise ValueError("train_frac must be between 0 and 1.")
     if not 0.0 <= config.val_frac < 1.0:

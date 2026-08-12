@@ -19,7 +19,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from .data import CACHE_PATH, DATA_ROOT, ensure_cache, split_indices
+from .data import CACHE_PATH, DATA_ROOT, design_split_indices, ensure_cache, split_indices
 from .progress import ProgressCallback, StopChecker, emit_progress, request_stop
 from .runner import TrainConfig
 
@@ -36,6 +36,12 @@ class SuggestConfig:
     seed: int = 42
     train_frac: float = 0.8
     val_frac: float = 0.1
+    # Same semantics as ``TrainConfig.split_corner_columns``: when set, the
+    # diagnostics and heuristics are computed from the design-level split so they
+    # describe the split the recommended run will actually train on.
+    split_corner_columns: list[str] | None = None
+    # Names the columns that IDENTIFY a design instead (safer; see TrainConfig).
+    split_design_columns: list[str] | None = None
     max_samples: int | None = None
     variance_threshold: float = 0.95
 
@@ -90,8 +96,21 @@ def suggest_initial_settings(
         targets = targets[: config.max_samples]
 
     # All statistics are computed from the training split only so the heuristic mirrors
-    # the information a real training pipeline should legitimately use.
-    split = split_indices(len(features), config.train_frac, config.val_frac, config.seed)
+    # the information a real training pipeline should legitimately use. The split mode
+    # must match the recommended run's, or the persisted diagnostics (split sizes,
+    # train-count-driven epoch/capacity tiers) would describe a split it never uses.
+    if config.split_corner_columns or config.split_design_columns:
+        split = design_split_indices(
+            features,
+            input_feature_names,
+            config.split_corner_columns,
+            config.train_frac,
+            config.val_frac,
+            config.seed,
+            config.split_design_columns,
+        )
+    else:
+        split = split_indices(len(features), config.train_frac, config.val_frac, config.seed)
     train_features_raw = features[split["train"]]
     # Match the training pipeline's active-feature criterion (data.py / runner.py):
     # max != min keeps features with tiny but meaningful SI-unit values (e.g.
@@ -401,8 +420,10 @@ def _estimate_params(
     model_type: str, input_dim: int, channels: int, frequency_point_count: int, width: int, depth: int
 ) -> int:
     # Dispatch to the right size proxy so the overfit/confidence estimates reflect the
-    # architecture the heuristic actually recommends.
-    if model_type == "SpectraHydra":
+    # architecture the heuristic actually recommends. SpectraHydraProj is a SpectraHydra
+    # plus a small corner projection (Linear(corners -> 16), negligible next to the
+    # trunk), so it shares the SpectraHydra estimate.
+    if model_type in ("SpectraHydra", "SpectraHydraProj"):
         return _estimate_spectrahydra_params(input_dim, channels, frequency_point_count, width, depth)
     return _estimate_spectranet_params(input_dim, channels, frequency_point_count, width, depth)
 
@@ -573,6 +594,8 @@ def _suggest_baseline(
         weight_decay=weight_decay,
         train_frac=request.train_frac,
         val_frac=request.val_frac,
+        split_corner_columns=request.split_corner_columns,
+        split_design_columns=request.split_design_columns,
         model_type=model_type,
         width=width,
         depth=depth,

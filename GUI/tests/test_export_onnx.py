@@ -41,6 +41,12 @@ def _make_checkpoint(
     can reach the large magnitudes (e.g. phase in degrees) that stress the exporter.
     """
     run_dir.mkdir(parents=True, exist_ok=True)
+    # SpectraHydraProj resolves its corner columns by name from the config; mirror
+    # what a real training run persists (names in config, indices at build time).
+    projection_columns = ["f1", "f2"] if model_type == "SpectraHydraProj" else None
+    projection_kwargs = (
+        {"corner_indices": [1, 2], "projection_dim": 4} if projection_columns else {}
+    )
     model = build_model(
         model_type,
         num_frequencies=freqs,
@@ -48,6 +54,7 @@ def _make_checkpoint(
         ground_truth_channels=channels,
         width=width,
         depth=depth,
+        **projection_kwargs,
     )
     model.eval()
     rng = np.random.default_rng(0)
@@ -68,9 +75,13 @@ def _make_checkpoint(
             sweep_label=np.asarray("Frequency (GHz)"),
         )
 
+    config = {"model_type": model_type, "width": width, "depth": depth, "cache_path": cache_path}
+    if projection_columns:
+        config["projection_columns"] = projection_columns
+        config["projection_dim"] = projection_kwargs["projection_dim"]
     checkpoint = {
         "model_state": model.state_dict(),
-        "config": {"model_type": model_type, "width": width, "depth": depth, "cache_path": cache_path},
+        "config": config,
         "active_input_feature_names": [f"f{i}" for i in range(n_features)],
         "target_channel_names": [f"ch{i}" for i in range(channels)],
         "input_feature_mean": input_mean,
@@ -105,7 +116,7 @@ def _reference(ref: dict, x: np.ndarray) -> np.ndarray:
     return y.reshape(x.shape[0], ref["channels"] * ref["freqs"])
 
 
-@pytest.mark.parametrize("model_type", ["SpectraHydra", "SpectraNet"])
+@pytest.mark.parametrize("model_type", ["SpectraHydra", "SpectraNet", "SpectraHydraProj"])
 def test_export_matches_torch_pipeline(tmp_path: Path, model_type: str) -> None:
     ckpt, ref = _make_checkpoint(tmp_path / model_type, model_type=model_type, with_cache=True)
     out = export_checkpoint_to_onnx(ckpt)
@@ -120,6 +131,21 @@ def test_export_matches_torch_pipeline(tmp_path: Path, model_type: str) -> None:
 
     assert onnx_out.shape == (5, ref["channels"] * ref["freqs"])
     assert np.max(np.abs(onnx_out - expected)) < 1e-3
+
+
+def test_projection_export_records_corner_metadata(tmp_path: Path) -> None:
+    """A SpectraHydraProj export keeps the raw-feature input contract and records
+    which columns feed the corner projection in the meta sidecar."""
+    ckpt, ref = _make_checkpoint(tmp_path / "proj_meta", model_type="SpectraHydraProj", with_cache=True)
+    out = export_checkpoint_to_onnx(ckpt)
+    meta = json.loads(out.with_suffix(".meta.json").read_text())
+
+    assert meta["model_type"] == "SpectraHydraProj"
+    # The graph input stays the raw active-feature vector; the projection is internal.
+    assert meta["input_feature_names"] == [f"f{i}" for i in range(ref["n_features"])]
+    assert meta["projection_columns"] == ["f1", "f2"]
+    assert meta["projection_corner_indices"] == [1, 2]
+    assert meta["projection_dim"] == 4
 
 
 def test_log10_channel_is_inverted_in_graph(tmp_path: Path) -> None:
@@ -191,29 +217,32 @@ def test_no_nan_with_large_nonlog10_outputs(tmp_path: Path) -> None:
 
 
 def _make_transfer_run(tmp_path: Path, *, freqs: int = 9, num_bands: int = 3, channels: int = 2,
-                       n_features: int = 4, width: int = 16, depth: int = 3) -> tuple[Path, dict]:
+                       n_features: int = 4, width: int = 16, depth: int = 3,
+                       model_type: str = "SpectraHydra") -> tuple[Path, dict]:
     """Build a synthetic self-transfer run dir (baseline + per-band submodels)."""
     base_dir = tmp_path / "baseline"
-    ckpt, ref = _make_checkpoint(base_dir, model_type="SpectraHydra", n_features=n_features,
+    ckpt, ref = _make_checkpoint(base_dir, model_type=model_type, n_features=n_features,
                                  channels=channels, freqs=freqs, width=width, depth=depth, with_cache=True)
+    model_kwargs = {"input_feature_dim": n_features, "ground_truth_channels": channels,
+                    "width": width, "depth": depth}
+    if model_type == "SpectraHydraProj":
+        # Matches the corner setup _make_checkpoint uses for this model type.
+        model_kwargs.update({"corner_indices": [1, 2], "projection_dim": 4})
     size = freqs // num_bands
     bands = [np.arange(i * size, (i + 1) * size, dtype=np.int64) for i in range(num_bands)]
     states = []
     for band in bands:
-        sub = build_model("SpectraHydra", num_frequencies=int(len(band)), input_feature_dim=n_features,
-                          ground_truth_channels=channels, width=width, depth=depth)
+        sub = build_model(model_type, num_frequencies=int(len(band)), **model_kwargs)
         states.append(sub.state_dict())
     trun = tmp_path / "transfer"
     trun.mkdir(parents=True, exist_ok=True)
     torch.save({"states": states,
-                "model_kwargs": {"input_feature_dim": n_features, "ground_truth_channels": channels,
-                                 "width": width, "depth": depth},
+                "model_kwargs": model_kwargs,
                 "bands": [b for b in bands]}, trun / "final_submodels.pt")
     (trun / "summary.json").write_text(json.dumps({"base_run_dir": str(base_dir)}))
     return trun, {"states": states, "bands": bands, "ref": ref, "channels": channels,
-                  "freqs": freqs, "n_features": n_features, "model_kwargs": {
-                      "input_feature_dim": n_features, "ground_truth_channels": channels,
-                      "width": width, "depth": depth}}
+                  "freqs": freqs, "n_features": n_features, "model_kwargs": model_kwargs,
+                  "model_type": model_type}
 
 
 def test_transfer_export_matches_stitched_torch(tmp_path: Path) -> None:
@@ -242,4 +271,33 @@ def test_transfer_export_matches_stitched_torch(tmp_path: Path) -> None:
 
     onnx_out = ort.InferenceSession(str(out)).run(["prediction"], {"input_features": x})[0]
     assert not np.isnan(onnx_out).any()
+    assert np.max(np.abs(onnx_out - stitched.reshape(len(x), C * F))) < 1e-3
+
+
+def test_transfer_export_supports_projection_bundle(tmp_path: Path) -> None:
+    """A SpectraHydraProj transfer bundle re-instantiates from its saved model_kwargs
+    (corner indices + projection dim included) and stitches correctly."""
+    trun, info = _make_transfer_run(tmp_path, freqs=9, num_bands=3, model_type="SpectraHydraProj")
+    out = export_transfer_to_onnx(trun)
+
+    meta = json.loads(out.with_suffix(".meta.json").read_text())
+    assert "SpectraHydraProj" in meta["model_type"]
+    assert meta["projection_columns"] == ["f1", "f2"]
+    assert meta["projection_dim"] == 4
+
+    ref = info["ref"]
+    rng = np.random.default_rng(6)
+    x = rng.standard_normal((4, info["n_features"])).astype(np.float32)
+    xn = torch.from_numpy(((x - ref["input_mean"]) / ref["input_std"]).astype(np.float32))
+    C, F = info["channels"], info["freqs"]
+    stitched = np.zeros((len(x), C, F), dtype=np.float32)
+    for state, band in zip(info["states"], info["bands"]):
+        m = build_model(info["model_type"], num_frequencies=int(len(band)), **info["model_kwargs"])
+        m.load_state_dict(state)
+        m.eval()
+        with torch.no_grad():
+            o = m(xn).numpy()
+        stitched[:, :, band] = o * ref["target_std"][:, band][None] + ref["target_mean"][:, band][None]
+
+    onnx_out = ort.InferenceSession(str(out)).run(["prediction"], {"input_features": x})[0]
     assert np.max(np.abs(onnx_out - stitched.reshape(len(x), C * F))) < 1e-3

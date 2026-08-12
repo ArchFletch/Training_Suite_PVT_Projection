@@ -82,6 +82,7 @@ def test_scan_dataset_loads_existing_cache(monkeypatch: pytest.MonkeyPatch, tmp_
             active_names=["x", "y"],
             dropped_names=[],
             channel_names=["S11_re", "S11_im"],
+            design_counts=None,
         ),
     )
 
@@ -131,3 +132,69 @@ def test_run_search_filters_noisy_trial_progress(monkeypatch: pytest.MonkeyPatch
     assert any(payload["event"] == "epoch_end" and payload["epoch"] == 5 for payload in forwarded)
     assert any(payload["event"] == "epoch_end" and payload["epoch"] == 10 for payload in forwarded)
     assert not any(payload["event"] == "epoch_end" and payload["epoch"] == 2 for payload in forwarded)
+
+
+def _write_pvt_backend_cache(path, num_designs: int = 12) -> None:
+    corners = [(temp, vdd) for temp in (-40.0, 27.0, 125.0) for vdd in (0.9, 1.0)]
+    features = np.asarray(
+        [
+            [0.5 * design, 1.25 * design + 3.0, temp, vdd]
+            for temp, vdd in corners
+            for design in range(num_designs)
+        ],
+        dtype=np.float32,
+    )
+    rng = np.random.default_rng(3)
+    np.savez_compressed(
+        path,
+        features=features,
+        targets=rng.standard_normal((len(features), 2, 4)).astype(np.float32),
+        frequency_hz=np.linspace(1e9, 4e9, 4).astype(np.float32),
+        input_feature_names=np.asarray(["geom_a", "geom_b", "Temp_C", "VDD"]),
+        target_names=np.asarray(["gain", "phase"]),
+        channel_names=np.asarray(["gain", "phase"]),
+        channel_units=np.asarray(["dB", "deg"]),
+        channel_transforms=np.asarray(["", ""]),
+        sweep_label=np.asarray("Frequency (GHz)"),
+    )
+
+
+def test_scan_dataset_previews_design_level_split(tmp_path: Path) -> None:
+    """The preview must show the split the run would use, not always row-level."""
+    cache_path = tmp_path / "pvt_cache.npz"
+    _write_pvt_backend_cache(cache_path)
+
+    result = gui_backend.scan_dataset(
+        cache_path=str(cache_path),
+        train_frac=0.8,
+        val_frac=0.1,
+        seed=42,
+        split_corner_columns=["Temp_C", "VDD"],
+    )
+
+    rows = dict(result["preview_rows"])
+    # 12 designs x 6 corners -> 9/1/2 designs = 54/6/12 rows (row-level: 57/7/8).
+    assert rows["Training Samples"] == "54"
+    assert rows["Validation Samples"] == "6"
+    assert rows["Test Samples"] == "12"
+    assert rows["Split Mode"].startswith("Design-level: 9 / 1 / 2")
+
+
+def test_scan_dataset_falls_back_to_row_level_on_bad_corner_columns(tmp_path: Path) -> None:
+    """A stale corner selection must not break scanning (scanning is what
+    populates the picker) — the preview drops to row-level and says why."""
+    cache_path = tmp_path / "pvt_cache.npz"
+    _write_pvt_backend_cache(cache_path)
+
+    result = gui_backend.scan_dataset(
+        cache_path=str(cache_path),
+        train_frac=0.8,
+        val_frac=0.1,
+        seed=42,
+        split_corner_columns=["Temp_K"],  # not a column of this dataset
+    )
+
+    rows = dict(result["preview_rows"])
+    assert rows["Training Samples"] == "57"
+    assert rows["Split Mode"].startswith("Row-level (requested design-level split unavailable")
+    assert "Temp_K" in rows["Split Mode"]

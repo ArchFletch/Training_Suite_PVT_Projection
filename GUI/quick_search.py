@@ -30,6 +30,32 @@ def main() -> None:
     parser.add_argument("--val-frac", type=float, default=defaults.val_frac)
     parser.add_argument("--max-samples", type=int, default=defaults.max_samples)
     parser.add_argument("--search-max-samples", type=int, default=defaults.search_max_samples)
+    parser.add_argument("--model-type", default=defaults.model_type)
+    parser.add_argument(
+        "--projection-columns",
+        default=None,
+        help="Comma-separated input-feature names of the PVT corner columns fed to the "
+        "learned projection (SpectraHydraProj only), e.g. 'Temp_C,VDD,proc_tt'.",
+    )
+    parser.add_argument(
+        "--projection-dim",
+        type=int,
+        default=defaults.projection_dim,
+        help="Corner-embedding width (SpectraHydraProj only).",
+    )
+    parser.add_argument(
+        "--split-design-columns",
+        default=None,
+        help="Comma-separated names of the columns that IDENTIFY a design (the geometry parameters). Every other column is treated as corner-varying, so the design-level split cannot be silently defeated by a derived corner column the way --split-corner-columns can. Prefer this flag.",
+    )
+    parser.add_argument(
+        "--split-corner-columns",
+        default=None,
+        help="Comma-separated PVT corner column names enabling the design-level split "
+        "for every trial: rows identical in every other input column are one design "
+        "and all of its corner rows stay in the same train/val/test fold (prevents "
+        "corner-row leakage). Works with every model type.",
+    )
     parser.add_argument("--trial-count", type=int, default=defaults.trial_count)
     parser.add_argument("--epochs-per-trial", type=int, default=defaults.epochs_per_trial)
     parser.add_argument(
@@ -61,6 +87,23 @@ def main() -> None:
             val_frac=args.val_frac,
             max_samples=args.max_samples,
             search_max_samples=args.search_max_samples,
+            model_type=args.model_type,
+            projection_columns=(
+                [name.strip() for name in args.projection_columns.split(",") if name.strip()]
+                if args.projection_columns is not None
+                else None
+            ),
+            projection_dim=args.projection_dim,
+            split_corner_columns=(
+                [name.strip() for name in args.split_corner_columns.split(",") if name.strip()]
+                if args.split_corner_columns is not None
+                else None
+            ),
+            split_design_columns=(
+                [name.strip() for name in args.split_design_columns.split(",") if name.strip()]
+                if args.split_design_columns is not None
+                else None
+            ),
             trial_count=args.trial_count,
             epochs_per_trial=args.epochs_per_trial,
             objective=args.objective,

@@ -10,7 +10,7 @@ Implementation-oriented architecture for the core training workflow.
 - `data.py`: raw-data loading, cache creation, split preparation
 - `suggest.py`: scan-only heuristics
 - `search.py`: bounded quick search around a suggested baseline
-- `model.py`: feed-forward surrogate models (SpectraNet, SpectraHydra)
+- `model.py`: feed-forward surrogate models (SpectraNet, SpectraHydra, SpectraHydraProj)
 - `runner.py`: baseline and transfer execution, evaluation, artifact writing
 - CLI wrappers: thin command entrypoints
 
@@ -89,7 +89,12 @@ flowchart LR
 ### Reproducibility
 
 - explicit seeds
-- deterministic splits
+- deterministic splits (row-level by default; naming the design-identifying columns
+  via `split_design_columns` — or, less safely, the corner columns via
+  `split_corner_columns` — switches to a design-level split that keeps all corner
+  rows of a design in one fold, preventing design leakage between splits. The
+  grouping refuses to run when it would give every row its own design, since that
+  is a row-level split by another name)
 - persisted configs and summaries
 
 ### Observability

@@ -18,6 +18,44 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 
+@pytest.fixture(autouse=True)
+def isolated_app_state(tmp_path_factory, monkeypatch):
+    """Point every writable app location at a temp dir for the whole test session.
+
+    In source mode the GUI keeps its session, license config, and default output
+    under <repo>/GUI/artifacts, so any test that constructs the window or saves a
+    config writes over the developer's real GUI state -- which has happened: a run
+    picked up a pytest tmp_path as its output folder and cache. Individual tests
+    used to guard this by monkeypatching save_last_session, which only protects the
+    tests that remember to. Redirect the paths themselves instead.
+
+    ``app_paths`` itself is left alone so its own tests still see the real policy.
+    """
+    from xfmr_v2 import app_paths
+
+    root = tmp_path_factory.mktemp("app_state")
+    gui_state = root / "gui"
+    gui_state.mkdir()
+    paths = app_paths.RuntimePaths(
+        mode="source",
+        config_dir=gui_state,
+        state_dir=gui_state,
+        cache_dir=root / "cache",
+        log_dir=root / "logs",
+        default_output_dir=root / "output",
+        license_client_path=gui_state / app_paths.LICENSE_CLIENT_FILENAME,
+        last_session_path=gui_state / app_paths.LAST_SESSION_FILENAME,
+    )
+    for module in ("xfmr_v2.gui_backend", "xfmr_v2.gui_window", "xfmr_v2.licensing.client_config"):
+        try:
+            __import__(module)
+        except ImportError:
+            continue  # optional dependency (e.g. PySide6 absent)
+        import sys
+        monkeypatch.setattr(sys.modules[module], "current_runtime_paths", lambda: paths, raising=False)
+    return paths
+
+
 def _write_touchstone_sample(path: Path, sample_index: int) -> None:
     """Write one small two-port Touchstone file with predictable values.
 

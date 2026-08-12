@@ -411,3 +411,478 @@ def test_window_export_to_onnx_handles_backend_error(gui_window, tmp_path, monke
     assert gui_window.current_task is None
     assert gui_window.export_onnx_button.isEnabled()
     assert "Error: simulated export failure" in gui_window.run_log_text_edit.toPlainText()
+
+
+def _check_projection_column(window, name: str) -> None:
+    from PySide6.QtCore import Qt
+
+    widget = window.baseline_projection_columns_list
+    for index in range(widget.count()):
+        if widget.item(index).text() == name:
+            widget.item(index).setCheckState(Qt.CheckState.Checked)
+            return
+    raise AssertionError(f"column {name!r} not in picker")
+
+
+def test_projection_controls_gate_on_model_type(gui_window) -> None:
+    combo = gui_window.baseline_model_type_combo_box
+    assert combo.findText("SpectraHydraProj") >= 0
+
+    # Default SpectraNet: projection controls are disabled.
+    assert combo.currentText() == "SpectraNet"
+    assert not gui_window.baseline_projection_columns_list.isEnabled()
+    assert not gui_window.baseline_projection_dim_spin_box.isEnabled()
+
+    combo.setCurrentText("SpectraHydraProj")
+    assert gui_window.baseline_projection_columns_list.isEnabled()
+    assert gui_window.baseline_projection_dim_spin_box.isEnabled()
+
+    combo.setCurrentText("SpectraHydra")
+    assert not gui_window.baseline_projection_columns_list.isEnabled()
+
+
+def test_projection_columns_flow_from_scan_into_configs(
+    gui_window, synthetic_dataset, tmp_path
+) -> None:
+    _configure_dataset_paths(gui_window, synthetic_dataset, tmp_path)
+    gui_window.scan_dataset()
+
+    # The picker lists the scanned dataset's active feature columns ('const' is
+    # dropped as constant and therefore not offered).
+    widget = gui_window.baseline_projection_columns_list
+    assert [widget.item(i).text() for i in range(widget.count())] == ["x", "y"]
+
+    gui_window.baseline_model_type_combo_box.setCurrentText("SpectraHydraProj")
+    gui_window.baseline_projection_dim_spin_box.setValue(4)
+    _check_projection_column(gui_window, "y")
+
+    baseline_config = gui_window._build_baseline_train_config()
+    assert baseline_config.model_type == "SpectraHydraProj"
+    assert baseline_config.projection_columns == ["y"]
+    assert baseline_config.projection_dim == 4
+
+    transfer_config = gui_window._build_transfer_config()
+    assert transfer_config.model_type == "SpectraHydraProj"
+    assert transfer_config.projection_columns == ["y"]
+    assert transfer_config.projection_dim == 4
+
+
+def test_projection_start_blocked_without_corner_columns(
+    gui_window, synthetic_dataset, tmp_path, monkeypatch
+) -> None:
+    _configure_dataset_paths(gui_window, synthetic_dataset, tmp_path)
+    gui_window.scan_dataset()
+    gui_window.baseline_model_type_combo_box.setCurrentText("SpectraHydraProj")
+
+    launched: list[dict] = []
+    monkeypatch.setattr(
+        gui_window_module,
+        "run_training_workflow",
+        lambda **kwargs: launched.append(kwargs) or {"status": "ok", "baseline": None, "transfer": None},
+    )
+    warnings: list[str] = []
+    monkeypatch.setattr(gui_window, "_show_warning", lambda message: warnings.append(message))
+
+    gui_window.start_baseline_training()
+    assert not launched, "training must not start without corner columns selected"
+    assert any("corner column" in message for message in warnings)
+
+    gui_window.start_transfer_learning()
+    assert not launched
+
+    # Selecting a corner column unblocks the run.
+    _check_projection_column(gui_window, "y")
+    gui_window.start_baseline_training()
+    assert len(launched) == 1
+    assert launched[0]["baseline_config"].projection_columns == ["y"]
+
+
+def test_projection_form_roundtrip_and_suggestion_keeps_selection(gui_window) -> None:
+    # Session restore happens before any scan: the restored names become visible
+    # picker items and survive into the collected form payload.
+    gui_window._apply_baseline_form(
+        {
+            "model_type": "SpectraHydraProj",
+            "projection_columns": ["Temp_C", "VDD"],
+            "projection_dim": 8,
+        }
+    )
+    assert gui_window.baseline_model_type_combo_box.currentText() == "SpectraHydraProj"
+    form = gui_window._collect_baseline_form()
+    assert form["projection_columns"] == ["Temp_C", "VDD"]
+    assert form["projection_dim"] == 8
+
+    # Configs from suggest/search are built via asdict(TrainConfig(...)) and carry
+    # the dataclass DEFAULTS (projection_columns=None, projection_dim=16) for the
+    # non-projection model types they recommend. Applying one must not clear the
+    # corner selection or reset the projection width (regression: the dim used to
+    # snap back to 16 because 16 is not None).
+    gui_window._apply_baseline_form(
+        {"model_type": "SpectraHydra", "width": 128, "projection_columns": None, "projection_dim": 16}
+    )
+    form = gui_window._collect_baseline_form()
+    assert form["projection_columns"] == ["Temp_C", "VDD"]
+    assert form["projection_dim"] == 8
+
+
+def _check_design_column(window, name: str) -> None:
+    from PySide6.QtCore import Qt
+
+    widget = window.baseline_design_columns_list
+    for index in range(widget.count()):
+        if widget.item(index).text() == name:
+            widget.item(index).setCheckState(Qt.CheckState.Checked)
+            return
+    raise AssertionError(f"column {name!r} not in design picker")
+
+
+def test_design_split_checkbox_gates_picker_and_flows_into_configs(
+    gui_window, synthetic_dataset, tmp_path
+) -> None:
+    # The design-identity picker serves the split for EVERY model type, so ticking
+    # the checkbox unlocks it while SpectraNet is selected. The corner picker and
+    # projection width stay SpectraHydraProj-only controls.
+    assert gui_window.baseline_model_type_combo_box.currentText() == "SpectraNet"
+    assert not gui_window.baseline_design_columns_list.isEnabled()
+    gui_window.baseline_design_split_checkbox.setChecked(True)
+    assert gui_window.baseline_design_columns_list.isEnabled()
+    assert not gui_window.baseline_projection_columns_list.isEnabled()
+    assert not gui_window.baseline_projection_dim_spin_box.isEnabled()
+
+    _configure_dataset_paths(gui_window, synthetic_dataset, tmp_path)
+    gui_window.scan_dataset()
+    _check_design_column(gui_window, "x")
+
+    assert gui_window._build_baseline_train_config().split_design_columns == ["x"]
+    assert gui_window._build_transfer_config().split_design_columns == ["x"]
+
+    # Unticking reverts to the row-level split and re-locks the picker.
+    gui_window.baseline_design_split_checkbox.setChecked(False)
+    assert gui_window._build_baseline_train_config().split_design_columns is None
+    assert gui_window._build_transfer_config().split_design_columns is None
+    assert not gui_window.baseline_design_columns_list.isEnabled()
+
+
+def test_design_split_start_blocked_without_design_columns(
+    gui_window, synthetic_dataset, tmp_path, monkeypatch
+) -> None:
+    _configure_dataset_paths(gui_window, synthetic_dataset, tmp_path)
+    gui_window.scan_dataset()
+    gui_window.baseline_design_split_checkbox.setChecked(True)
+
+    launched: list[dict] = []
+    monkeypatch.setattr(
+        gui_window_module,
+        "run_training_workflow",
+        lambda **kwargs: launched.append(kwargs) or {"status": "ok", "baseline": None, "transfer": None},
+    )
+    warnings: list[str] = []
+    monkeypatch.setattr(gui_window, "_show_warning", lambda message: warnings.append(message))
+
+    gui_window.start_baseline_training()
+    assert not launched, "training must not start while the split has no design columns"
+    assert any("Design Identity column" in message for message in warnings)
+    gui_window.start_transfer_learning()
+    assert not launched
+
+    _check_design_column(gui_window, "x")
+    gui_window.start_baseline_training()
+    assert len(launched) == 1
+    assert launched[0]["baseline_config"].split_design_columns == ["x"]
+
+
+def test_design_split_form_roundtrip_and_suggestion_keeps_it(gui_window) -> None:
+    # Session restore before any scan: the design columns become picker items,
+    # and the checkbox state rides on whether the persisted list is non-empty.
+    gui_window._apply_baseline_form(
+        {"model_type": "SpectraNet", "split_design_columns": ["CS_fF", "LD_pH"]}
+    )
+    assert gui_window.baseline_design_split_checkbox.isChecked()
+    form = gui_window._collect_baseline_form()
+    assert form["split_design_columns"] == ["CS_fF", "LD_pH"]
+
+    # Suggest/search payloads built from TrainConfig defaults carry
+    # split_design_columns=None and must not disturb the user's split setup
+    # (same guard as the projection fields).
+    gui_window._apply_baseline_form({"model_type": "SpectraHydra", "split_design_columns": None})
+    assert gui_window.baseline_design_split_checkbox.isChecked()
+    assert gui_window._collect_baseline_form()["split_design_columns"] == ["CS_fF", "LD_pH"]
+
+    # A form that saved the split as off ([]) restores it as off.
+    gui_window._apply_baseline_form({"split_design_columns": []})
+    assert not gui_window.baseline_design_split_checkbox.isChecked()
+    assert gui_window._collect_baseline_form()["split_design_columns"] == []
+
+
+def test_design_split_all_columns_guard_blocks_degenerate_selection(
+    gui_window, synthetic_dataset, tmp_path, monkeypatch
+) -> None:
+    """Checking every varying column as design identity leaves nothing to vary
+    across corners, so every row would be its own design — a row-level split
+    wearing a design-level label. The guard must compare against the ACTIVE
+    names only: the picker never offers dropped (constant) columns, so a guard
+    that unions dropped names in can never fire on a dataset with a constant
+    column (the fixture drops 'const', making it the regression case)."""
+    _configure_dataset_paths(gui_window, synthetic_dataset, tmp_path)
+    gui_window.scan_dataset()
+    assert gui_window.last_scan_result["dropped_input_feature_names"] == ["const"]
+
+    gui_window.baseline_design_split_checkbox.setChecked(True)
+    for name in ("x", "y"):  # every ACTIVE column
+        _check_design_column(gui_window, name)
+
+    launched: list[dict] = []
+    monkeypatch.setattr(
+        gui_window_module,
+        "run_training_workflow",
+        lambda **kwargs: launched.append(kwargs) or {"status": "ok", "baseline": None, "transfer": None},
+    )
+    warnings: list[str] = []
+    monkeypatch.setattr(gui_window, "_show_warning", lambda message: warnings.append(message))
+
+    gui_window.start_baseline_training()
+    assert not launched
+    assert any("every row would be its own design" in message for message in warnings)
+
+
+def test_corner_form_split_from_a_loaded_config_still_runs(gui_window) -> None:
+    """A CLI-written config specifies the split by corner columns. Loading it must
+    reproduce that run, and an explicit design-identity pick must supersede it so
+    the two forms can never both reach the engine."""
+    gui_window._apply_baseline_form({"split_corner_columns": ["Temp_C", "VDD"]})
+    assert gui_window.baseline_design_split_checkbox.isChecked()
+    assert gui_window._current_split_corner_columns() == ["Temp_C", "VDD"]
+    assert gui_window._current_split_design_columns() is None
+
+    gui_window._set_design_columns_selection(["CS_fF"])
+    gui_window._on_design_column_toggled(None)
+    assert gui_window._current_split_design_columns() == ["CS_fF"]
+    assert gui_window._current_split_corner_columns() is None
+
+
+def test_scan_split_warnings_reach_the_run_log(gui_window, monkeypatch) -> None:
+    """warnings.warn goes to stderr, which a packaged GUI never shows — and the
+    crossing warning is the only signal for splintering that auto-fold cannot
+    repair, so the scan must put it in the run log."""
+    monkeypatch.setattr(
+        gui_window_module,
+        "build_and_scan_dataset",
+        lambda **kwargs: {
+            "status": "ok",
+            "split_warnings": ["no design appears at more than 5 of them"],
+            "preview_rows": [],
+            "active_input_feature_names": ["x"],
+            "dropped_input_feature_names": [],
+            "dataset_name": "d",
+            "schema_status": "Valid",
+            "schema": {},
+            "cache_summary": {"num_samples": 10, "status": "existing"},
+            "cache_path": "c.npz",
+            "frequency_count": 3,
+            "frequency_range_ghz": [1.0, 3.0],
+            "sweep_label": "Frequency (GHz)",
+        },
+    )
+    gui_window._on_scan_completed(gui_window_module.build_and_scan_dataset())
+    assert "no design appears at more than 5" in gui_window.run_log_text_edit.toPlainText()
+
+
+def test_inherited_corner_split_survives_a_session_roundtrip(gui_window) -> None:
+    """A CLI config's corner-form split must persist across a restart; dropping it
+    would silently revert the run to the leaky row-level split."""
+    gui_window._apply_baseline_form({"split_corner_columns": ["Temp_C", "VDD"]})
+    saved = gui_window._collect_baseline_form()
+    assert saved["split_corner_columns"] == ["Temp_C", "VDD"]
+
+    gui_window.baseline_design_split_checkbox.setChecked(False)
+    gui_window._config_split_corner_columns = []
+    gui_window._apply_baseline_form(saved)
+    assert gui_window.baseline_design_split_checkbox.isChecked()
+    assert gui_window._current_split_corner_columns() == ["Temp_C", "VDD"]
+
+
+def test_column_checked_as_both_corner_and_design_identity_is_blocked(
+    gui_window, synthetic_dataset, tmp_path, monkeypatch
+) -> None:
+    """A corner column used as design identity splinters each design into one
+    'design' per corner — the exact leakage this feature removes."""
+    _configure_dataset_paths(gui_window, synthetic_dataset, tmp_path)
+    gui_window.scan_dataset()
+    gui_window.baseline_model_type_combo_box.setCurrentText("SpectraHydraProj")
+    _check_projection_column(gui_window, "y")
+    gui_window.baseline_design_split_checkbox.setChecked(True)
+    _check_design_column(gui_window, "x")
+    _check_design_column(gui_window, "y")  # also a corner column -> contradiction
+
+    warnings: list[str] = []
+    monkeypatch.setattr(gui_window, "_show_warning", lambda message: warnings.append(message))
+    assert gui_window._validate_projection_settings() is False
+    assert any("checked as PVT Corner Columns and as Design Identity" in m for m in warnings)
+
+
+def test_dataset_folder_survives_a_session_roundtrip(gui_window, tmp_path) -> None:
+    """The single-folder dataset field is the primary data source. When it was not
+    persisted, a restarted GUI forgot the dataset and kept only a stale cache path
+    -- which is how a run ended up pointed at a leftover pytest directory."""
+    folder = tmp_path / "my_dataset"
+    folder.mkdir()
+    gui_window.dataset_folder_edit.setText(str(folder))
+
+    payload = gui_window.collect_config_payload()
+    assert payload["data_sources"]["dataset_folder"] == str(folder)
+
+    gui_window.dataset_folder_edit.setText("")
+    gui_window.apply_config_payload(payload)
+    assert gui_window.dataset_folder_edit.text() == str(folder)
+
+
+def test_tests_never_write_the_real_gui_state(isolated_app_state) -> None:
+    """Guard the guard: the autouse fixture must redirect every writable location
+    away from <repo>/GUI/artifacts, or a test can clobber the developer's session."""
+    from xfmr_v2 import gui_backend
+    from xfmr_v2.licensing import client_config
+
+    repo_artifacts = Path(gui_backend.__file__).resolve().parent.parent / "artifacts"
+    gui_backend.save_last_session({"marker": "from-test"})
+
+    written = gui_backend.current_runtime_paths().last_session_path
+    assert written == isolated_app_state.last_session_path
+    assert written.exists() and repo_artifacts not in written.parents
+    assert repo_artifacts not in client_config.license_client_config_path().parents
+    assert gui_backend.load_last_session()["marker"] == "from-test"
+
+
+def test_per_channel_mae_cards_appear_from_the_run(gui_window) -> None:
+    """The per-channel MAE is the number with physical units, so it must be visible
+    without any interaction. The averaged card mixes dB/deg/decades and is titled
+    accordingly so it is not mistaken for a comparable per-channel figure."""
+    gui_window._update_baseline_progress(
+        {
+            "event": "evaluation_completed",
+            "frequency_ghz": [1.0, 2.0],
+            "frequency_mae": [0.1, 0.2],
+            "average_evaluation_mae": 0.366261,
+            "channel_mae_with_units": [
+                "gain: 0.2671 dB", "phase: 0.8179 deg", "noise: 0.0138 decades",
+            ],
+        },
+    )
+    cards = gui_window._channel_metric_cards
+    assert list(cards) == ["gain", "phase", "noise"]
+    assert cards["gain"].value_label.text() == "0.2671 dB"
+    assert cards["phase"].value_label.text() == "0.8179 deg"
+    assert gui_window.metric_cards["average_mae"].value_label.text() == "0.366261"
+
+    # A new run clears stale values rather than leaving the last run's numbers up.
+    gui_window._reset_baseline_plots()
+    assert cards["gain"].value_label.text() == "-"
+
+
+def test_holdout_mae_cards_stay_apart_from_test_fold_cards(gui_window) -> None:
+    """External eval-set MAE gets its own 'Holdout' card family: the honest
+    external number must never overwrite — or be mistaken for — the internal
+    test fold's, which moves with the split seed."""
+    gui_window._update_baseline_progress(
+        {"event": "evaluation_completed", "frequency_ghz": [1.0], "frequency_mae": [0.1],
+         "average_evaluation_mae": 0.2,
+         "channel_mae_with_units": ["gain: 0.2064 dB"]},
+    )
+    gui_window._update_baseline_progress(
+        {"event": "external_evaluation_completed",
+         "external_channel_mae_with_units": ["gain: 0.1291 dB"]},
+    )
+    cards = gui_window._channel_metric_cards
+    assert list(cards) == ["gain", "holdout:gain"]
+    assert cards["gain"].value_label.text() == "0.2064 dB"
+    assert cards["holdout:gain"].value_label.text() == "0.1291 dB"
+
+    # A new run clears the holdout family together with the internal one.
+    gui_window._reset_baseline_plots()
+    assert cards["holdout:gain"].value_label.text() == "-"
+
+
+def test_design_split_is_off_until_asked_for(gui_window) -> None:
+    """A fresh form starts with the design-level split off, and asks for nothing.
+
+    The usual flow scores an External Eval Set, which is design-disjoint already, so
+    the split is opt-in. Pinning this keeps a stray setChecked(True) — or a widget
+    swap whose default differs — from silently changing every new run's protocol.
+    """
+    assert gui_window.baseline_design_split_checkbox.isChecked() is False
+    form = gui_window._collect_baseline_form()
+    assert form["split_design_columns"] == []
+    assert form["split_corner_columns"] == []
+    assert gui_window._current_split_design_columns() is None
+    assert gui_window._current_split_corner_columns() is None
+
+
+def test_transfer_start_clears_stale_holdout_cards(gui_window, monkeypatch) -> None:
+    """Self-transfer never scores the external eval set and only overwrites the
+    internal card family as it iterates — so a prior baseline's Holdout numbers
+    must be cleared at transfer start or they masquerade as this run's."""
+    gui_window._update_baseline_progress(
+        {"event": "external_evaluation_completed",
+         "external_channel_mae_with_units": ["gain: 0.1291 dB"]},
+    )
+    assert gui_window._channel_metric_cards["holdout:gain"].value_label.text() == "0.1291 dB"
+
+    monkeypatch.setattr(gui_window, "_ensure_license_ready_for_training", lambda: True)
+    monkeypatch.setattr(gui_window, "_require_data_paths", lambda: {})
+    monkeypatch.setattr(gui_window, "_validate_transfer_ready", lambda: True)
+    monkeypatch.setattr(gui_window, "_validate_projection_settings", lambda: True)
+    monkeypatch.setattr(gui_window, "_build_transfer_config", lambda: None)
+    monkeypatch.setattr(gui_window, "_start_task", lambda *args, **kwargs: None)
+    gui_window.last_scan_result = {"dataset_name": "x"}
+    gui_window.start_transfer_learning()
+
+    assert gui_window._channel_metric_cards["holdout:gain"].value_label.text() == "-"
+
+
+def test_eval_dataset_path_round_trips_and_none_does_not_clobber(gui_window, tmp_path) -> None:
+    """The External Eval Set path persists with the session; a dataclass-default
+    payload (None, from suggest/search) leaves it alone, an explicit empty
+    string clears it — same contract as the projection and split fields."""
+    eval_file = tmp_path / "holdout.npz"
+    eval_file.write_bytes(b"")
+    gui_window.baseline_eval_dataset_edit.setText(str(eval_file))
+
+    payload = gui_window.collect_config_payload()
+    assert payload["baseline"]["eval_dataset_path"] == str(eval_file)
+
+    gui_window.baseline_eval_dataset_edit.setText("")
+    gui_window.apply_config_payload(payload)
+    assert gui_window.baseline_eval_dataset_edit.text() == str(eval_file)
+
+    gui_window._apply_baseline_form({"eval_dataset_path": None})
+    assert gui_window.baseline_eval_dataset_edit.text() == str(eval_file)
+    gui_window._apply_baseline_form({"eval_dataset_path": ""})
+    assert gui_window.baseline_eval_dataset_edit.text() == ""
+
+
+def test_bad_eval_dataset_path_blocks_start(gui_window, tmp_path, monkeypatch) -> None:
+    """A typo'd eval path must be caught before training, not after 300 epochs."""
+    warnings: list[str] = []
+    monkeypatch.setattr(gui_window, "_show_warning", lambda message: warnings.append(message))
+
+    gui_window.baseline_eval_dataset_edit.setText(str(tmp_path / "nope.npz"))
+    assert gui_window._validate_eval_dataset_path() is False
+    assert any("does not exist" in message for message in warnings)
+
+    wrong_type = tmp_path / "holdout.txt"
+    wrong_type.write_text("not an npz")
+    gui_window.baseline_eval_dataset_edit.setText(str(wrong_type))
+    assert gui_window._validate_eval_dataset_path() is False
+
+    gui_window.baseline_eval_dataset_edit.setText("")
+    assert gui_window._validate_eval_dataset_path() is True
+
+
+def test_datasets_without_channel_units_keep_the_single_card(gui_window) -> None:
+    """The runner omits channel_mae_with_units when a dataset declares no units
+    (e.g. raw Touchstone), so no per-channel cards should be invented."""
+    gui_window._update_baseline_progress(
+        {"event": "evaluation_completed", "frequency_ghz": [1.0],
+         "frequency_mae": [0.1], "average_evaluation_mae": 0.5},
+    )
+    assert gui_window._channel_metric_cards == {}
+    assert gui_window.metric_cards["average_mae"].value_label.text() == "0.500000"

@@ -24,6 +24,8 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -607,6 +609,68 @@ class MlpTrainingStudio(QMainWindow):
         self.baseline_model_type_combo_box = _NoScrollComboBox()
         self.baseline_model_type_combo_box.addItems(list(MODEL_TYPES))
         self.baseline_model_type_combo_box.setCurrentText("SpectraNet")
+        self.baseline_model_type_combo_box.currentTextChanged.connect(
+            self._refresh_projection_controls_enabled
+        )
+        # SpectraHydraProj settings: which input-feature columns are PVT corner
+        # conditions (fed to the learned projection) and the embedding width.
+        # The list is populated with the dataset's active feature names after a
+        # scan; until then it shows whatever a restored session selected.
+        self._projection_column_selection: list[str] = []
+        self.baseline_projection_columns_list = QListWidget()
+        self.baseline_projection_columns_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.baseline_projection_columns_list.setMaximumHeight(96)
+        self.baseline_projection_columns_list.setToolTip(
+            "Check the PVT corner/condition columns (e.g. temperature, supply, process "
+            "one-hots). They feed SpectraHydraProj's learned corner projection and, when "
+            "the design-level split is enabled, define which rows are corner copies of "
+            "one design. Scan the dataset to list its input-feature columns."
+        )
+        self.baseline_projection_columns_list.itemChanged.connect(self._on_projection_column_toggled)
+        self.baseline_projection_dim_spin_box = self._make_int_spin(1, 256, 16)
+        # Design-level split: uses the corner-column selection above to keep all
+        # corner rows of one design in the same train/val/test fold.
+        # The split is specified by the columns that IDENTIFY a design, not by the
+        # corner columns: forgetting one design column merges designs (a coarser,
+        # still leak-free split), while forgetting one corner column splinters each
+        # design into per-corner designs and silently restores the leakage. It is
+        # also the shorter list to tick — the geometry parameters, not every
+        # temperature/supply/process column plus everything derived from them.
+        self._design_column_selection: list[str] = []
+        # Corner-form split inherited from a loaded config; see _current_split_corner_columns.
+        self._config_split_corner_columns: list[str] = []
+        self.baseline_design_columns_list = QListWidget()
+        self.baseline_design_columns_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.baseline_design_columns_list.setMaximumHeight(96)
+        self.baseline_design_columns_list.setToolTip(
+            "Check the columns that identify one design — the geometry/parameter "
+            "columns that stay the same as a design is re-simulated across PVT "
+            "corners. Every other column is treated as corner-varying. Scan the "
+            "dataset to list its input-feature columns."
+        )
+        self.baseline_design_columns_list.itemChanged.connect(self._on_design_column_toggled)
+        # Off by default: the common flow scores an External Eval Set, which is
+        # already design-disjoint, so the internal folds are only a checkpoint-
+        # selection device there. Tick this when the GUI's own MAE cards have to be
+        # trustworthy on their own.
+        self.baseline_design_split_checkbox = QCheckBox("Hold out whole designs")
+        self.baseline_design_split_checkbox.setChecked(False)
+        self.baseline_design_split_checkbox.setToolTip(
+            "Design-level split: rows that agree on every checked Design Identity "
+            "column are the same design measured at different PVT corners, and all "
+            "of them stay in the same train/validation/test fold. Without this, the "
+            "same design appears in train at one corner and in test at another, "
+            "which leaks design information and makes test error look too good. "
+            "Works with every model type; requires at least one checked Design "
+            "Identity column.\n\n"
+            "Leave this off when an External Eval Set supplies the honest number. "
+            "Tick it when the GUI's own MAE cards must be trustworthy without an "
+            "external file — and then raise Train Fraction (measured: 0.92 / 0.07 "
+            "works well), because holding out whole designs removes them from "
+            "training and it is design variety, not row count, that the model "
+            "needs to generalize to new designs."
+        )
+        self.baseline_design_split_checkbox.toggled.connect(self._refresh_projection_controls_enabled)
         self.baseline_epochs_spin_box = self._make_int_spin(1, 5000, 300)
         self.baseline_batch_size_spin_box = self._make_int_spin(1, 4096, 16)
         self.baseline_learning_rate_spin_box = self._make_float_spin(1e-6, 1.0, 1e-4, decimals=6, step=1e-5, scientific=True)
@@ -622,11 +686,27 @@ class MlpTrainingStudio(QMainWindow):
         self.baseline_train_fraction_spin_box = self._make_float_spin(0.05, 0.95, 0.80, decimals=3, step=0.01)
         self.baseline_validation_fraction_spin_box = self._make_float_spin(0.0, 0.90, 0.10, decimals=3, step=0.01)
         self.baseline_seed_spin_box = self._make_int_spin(0, 1000000, 42)
+        self.baseline_eval_dataset_edit = QLineEdit()
+        self.baseline_eval_dataset_edit.setPlaceholderText("Optional: .npz scored after training (e.g. held-out designs)")
+        self.baseline_eval_dataset_edit.setToolTip(
+            "Optional external evaluation set: an .npz file holding features, "
+            "targets, and feature_names arrays (a dataset bundle.npz works). "
+            "After training, the best checkpoint is scored on it and shown as "
+            "the Holdout MAE cards. Point it at data this dataset does not "
+            "contain — e.g. designs kept out of the dataset entirely — for an "
+            "honest benchmark that does not move with the split seed. Feature "
+            "columns are matched by name; targets must share this dataset's "
+            "channels and frequency grid."
+        )
+        self.browse_eval_dataset_button = self._make_button("Browse...", secondary=True)
+        self.browse_eval_dataset_button.clicked.connect(self._browse_eval_dataset_path)
         self.restore_recommended_baseline_button = self._make_button("Restore Recommended", secondary=True)
         self.restore_recommended_baseline_button.clicked.connect(self._restore_recommended_baseline)
 
         fields = [
             ("Model Type", self.baseline_model_type_combo_box),
+            ("PVT Corner Columns", self.baseline_projection_columns_list),
+            ("Corner Projection Width", self.baseline_projection_dim_spin_box),
             ("Full Training Epochs", self.baseline_epochs_spin_box),
             ("Batch Size", self.baseline_batch_size_spin_box),
             ("Learning Rate", self.baseline_learning_rate_spin_box),
@@ -637,11 +717,18 @@ class MlpTrainingStudio(QMainWindow):
             ("LR Scheduler", self.baseline_scheduler_combo_box),
             ("Train Fraction", self.baseline_train_fraction_spin_box),
             ("Validation Fraction", self.baseline_validation_fraction_spin_box),
+            ("Design-Level Split", self.baseline_design_split_checkbox),
+            ("Design Identity Columns", self.baseline_design_columns_list),
             ("Random Seed", self.baseline_seed_spin_box),
         ]
         for row, (label, widget) in enumerate(fields):
             self._add_form_row(grid, row, label, widget)
-        grid.addWidget(self.restore_recommended_baseline_button, len(fields), 1)
+        self._add_path_row(
+            grid, len(fields), "External Eval Set (.npz)",
+            self.baseline_eval_dataset_edit, self.browse_eval_dataset_button,
+        )
+        grid.addWidget(self.restore_recommended_baseline_button, len(fields) + 1, 1)
+        self._refresh_projection_controls_enabled()
         return tab
 
     def _build_transfer_tab(self) -> QWidget:
@@ -661,8 +748,9 @@ class MlpTrainingStudio(QMainWindow):
 
         self.transfer_notes_label = QLabel(
             "Self-transfer trains per-band models from scratch on the scanned dataset "
-            "(no baseline run required). It uses the Model Type, Network Width, and "
-            "Network Depth from the Baseline tab."
+            "(no baseline run required). It uses the Model Type, Network Width, "
+            "Network Depth, and (for SpectraHydraProj) the PVT corner projection "
+            "settings from the Baseline tab."
         )
         self.transfer_notes_label.setWordWrap(True)
 
@@ -727,6 +815,42 @@ class MlpTrainingStudio(QMainWindow):
         layout.addLayout(status_row)
         return card
 
+    def _update_channel_metric_cards(
+        self, labels: list[str], key_prefix: str = "", title_prefix: str = ""
+    ) -> None:
+        """Show one MAE card per ground-truth channel, in the run's channel order.
+
+        ``labels`` are the runner's ready-formatted "gain: 0.2671 dB" strings; the
+        runner emits them only when the dataset declares channel units, so datasets
+        without units keep the single averaged card and nothing is created here.
+        The prefixes keep a second card family apart from the internal test-fold
+        one: external evaluation-set results use ``key_prefix="holdout:"`` and
+        ``title_prefix="Holdout "`` so "gain" and "holdout gain" never share a card.
+        """
+        for label in labels:
+            name, _, value = str(label).partition(":")
+            name, value = name.strip(), value.strip()
+            if not name or not value:
+                continue
+            card = self._channel_metric_cards.get(key_prefix + name)
+            if card is None:
+                card = MetricCard(f"{title_prefix}MAE {name}")
+                self._channel_metric_cards[key_prefix + name] = card
+                position = len(self._channel_metric_cards) - 1
+                self._channel_metric_grid.addWidget(
+                    card, self._channel_metric_row + position // 3, position % 3
+                )
+            card.set_value(value)
+
+    def _reset_channel_metric_cards(self) -> None:
+        """Clear stale per-channel values when a new run starts.
+
+        The cards themselves are kept so the layout does not jump between runs on
+        the same dataset; only a dataset with different channels replaces them.
+        """
+        for card in self._channel_metric_cards.values():
+            card.set_value("-")
+
     def _build_metrics_card(self) -> QWidget:
         card = CardFrame()
         card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
@@ -745,7 +869,7 @@ class MlpTrainingStudio(QMainWindow):
             ("best_metric", "Best Metric"),
             ("train_loss", "Train Loss"),
             ("validation_loss", "Validation Loss"),
-            ("average_mae", "Average MAE"),
+            ("average_mae", "Average MAE (mixed units)"),
             ("elapsed", "Elapsed"),
             ("eta", "ETA"),
         ]
@@ -754,6 +878,12 @@ class MlpTrainingStudio(QMainWindow):
             card_widget = MetricCard(title)
             self.metric_cards[key] = card_widget
             grid.addWidget(card_widget, index // 3, index % 3)
+        # Per-channel MAE is the number that carries physical units, so it is shown
+        # outright rather than hidden behind a toggle. The cards are created from the
+        # run's own channel list because channel count and names vary by dataset.
+        self._channel_metric_row = (len(metric_titles) + 2) // 3
+        self._channel_metric_cards: dict[str, MetricCard] = {}
+        self._channel_metric_grid = grid
         layout.addLayout(grid)
         return card
 
@@ -842,6 +972,10 @@ class MlpTrainingStudio(QMainWindow):
         return {
             "device": self._current_device_id(),
             "data_sources": {
+                # The single-folder dataset field is the primary data source; without
+                # it a restored session silently forgets which dataset was loaded and
+                # falls back to whatever stale cache path it kept.
+                "dataset_folder": self.dataset_folder_edit.text().strip(),
                 "input_feature_path": self.input_feature_path_edit.text().strip(),
                 "ground_truth_data_dir": self.ground_truth_data_folder_path_edit.text().strip(),
                 "output_dir": self.model_output_folder_path_edit.text().strip(),
@@ -863,6 +997,7 @@ class MlpTrainingStudio(QMainWindow):
     def apply_config_payload(self, payload: dict[str, Any]) -> None:
         self._set_device_selection(payload.get("device"))
         data_sources = payload.get("data_sources", {})
+        self.dataset_folder_edit.setText(str(data_sources.get("dataset_folder", "")))
         self.input_feature_path_edit.setText(str(data_sources.get("input_feature_path", "")))
         self.ground_truth_data_folder_path_edit.setText(str(data_sources.get("ground_truth_data_dir", "")))
         output_dir = data_sources.get("output_dir", data_sources.get("model_output_dir", self.model_output_folder_path_edit.text()))
@@ -1057,6 +1192,11 @@ class MlpTrainingStudio(QMainWindow):
                 "val_frac": self.baseline_validation_fraction_spin_box.value(),
                 "seed": self.baseline_seed_spin_box.value(),
                 "max_samples": None,
+                # Preview the same split mode a run would use (the backend falls
+                # back to row-level with a note if the selection does not fit
+                # this dataset, so a stale selection cannot break scanning).
+                "split_corner_columns": self._current_split_corner_columns(),
+                "split_design_columns": self._current_split_design_columns(),
                 # Auto-managed cache: rebuild from the folder. Manually-selected cache:
                 # reuse it if present (only build when missing).
                 "overwrite": not self._cache_path_manually_selected,
@@ -1080,6 +1220,8 @@ class MlpTrainingStudio(QMainWindow):
                 "train_frac": self.baseline_train_fraction_spin_box.value(),
                 "val_frac": self.baseline_validation_fraction_spin_box.value(),
                 "max_samples": None,
+                "split_corner_columns": self._current_split_corner_columns(),
+                "split_design_columns": self._current_split_design_columns(),
             },
             task_name="suggest",
             busy_state="Suggesting",
@@ -1096,6 +1238,10 @@ class MlpTrainingStudio(QMainWindow):
             self._show_warning("Please scan the dataset before starting training.")
             return
         if not self._validate_split_fractions():
+            return
+        if not self._validate_projection_settings():
+            return
+        if not self._validate_eval_dataset_path():
             return
 
         self._reset_baseline_plots()
@@ -1124,8 +1270,15 @@ class MlpTrainingStudio(QMainWindow):
             return
         if not self._validate_transfer_ready():
             return
+        if not self._validate_projection_settings():
+            return
 
         self._reset_transfer_plots()
+        # Transfer overwrites the internal per-channel cards as it iterates, but
+        # never the Holdout family (it does not support the external eval set) —
+        # without this reset a prior baseline's holdout numbers would sit next to
+        # this run's transfer metrics as if they belonged to it.
+        self._reset_channel_metric_cards()
         self.last_workflow_summary = None
 
         self._start_task(
@@ -1153,6 +1306,16 @@ class MlpTrainingStudio(QMainWindow):
         path = QFileDialog.getExistingDirectory(self, "Select Dataset Folder", self.dataset_folder_edit.text())
         if path:
             self.dataset_folder_edit.setText(path)
+
+    def _browse_eval_dataset_path(self) -> None:
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Select External Evaluation Set",
+            self.baseline_eval_dataset_edit.text().strip() or str(self._default_dialog_root()),
+            "NumPy archives (*.npz)",
+        )
+        if path:
+            self.baseline_eval_dataset_edit.setText(path)
 
     def browse_input_feature_path(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Select Input-Feature File", self.input_feature_path_edit.text(), "Text Files (*.txt);;All Files (*)")
@@ -1411,6 +1574,11 @@ class MlpTrainingStudio(QMainWindow):
         self.last_scan_result = result
         self._sweep_label = result.get("sweep_label", "Frequency (GHz)")
         self.dataset_schema_status_badge.set_status(result.get("schema_status", "Valid"))
+        for message in result.get("split_warnings", []):
+            self.append_log(f"[Split] {message}")
+        scanned_columns = list(result.get("active_input_feature_names", []))
+        self._populate_projection_columns(scanned_columns)
+        self._populate_design_columns(scanned_columns)
         self._fill_table(self.data_preview_table, result["preview_rows"])
         self._set_cache_path_value(result["cache_path"], manually_selected=self._cache_path_manually_selected)
         self.append_log(f"Dataset scan completed for {result['dataset_name']}.")
@@ -1739,10 +1907,20 @@ class MlpTrainingStudio(QMainWindow):
             self.run_progress_bar.setValue(int(100.0 * epoch / max(total_epochs, 1)))
         elif event == "evaluation_completed":
             self.baseline_frequency_curve.setData(payload.get("frequency_ghz", []), payload.get("frequency_mae", []))
-            # Show a single MAE averaged over all ground-truth channels (no per-channel split).
+            # The averaged card mixes channel units (dB / deg / decades); the
+            # per-channel cards beside it carry the numbers that mean something.
             average_mae = payload.get("average_evaluation_mae", payload.get("average_test_mae"))
             if average_mae is not None:
                 self.metric_cards["average_mae"].set_value(f"{average_mae:.6f}")
+            self._update_channel_metric_cards(list(payload.get("channel_mae_with_units") or []))
+        elif event == "external_evaluation_completed":
+            # The digest-comparable numbers: same best checkpoint, scored on the
+            # user-supplied external evaluation set instead of the internal fold.
+            self._update_channel_metric_cards(
+                list(payload.get("external_channel_mae_with_units") or []),
+                key_prefix="holdout:",
+                title_prefix="Holdout ",
+            )
         elif event == "completed":
             self.run_progress_bar.setValue(100)
             self.run_state_badge.set_status("Completed")
@@ -1805,6 +1983,11 @@ class MlpTrainingStudio(QMainWindow):
             per_channel = list(payload.get("per_channel_mae") or [])
             for name, value in zip(channel_names, per_channel):
                 self._transfer_channel_mae.setdefault(name, []).append(float(value))
+            # Transfer emits names and values separately; format them into the same
+            # "name: value" shape the baseline path already produces.
+            self._update_channel_metric_cards(
+                [f"{name}: {float(value):.4f}" for name, value in zip(channel_names, per_channel)]
+            )
             self._plot_transfer_average()
             # The card shows a single MAE averaged over all ground-truth channels; the
             # per-channel breakdown remains in the plot above.
@@ -1838,6 +2021,22 @@ class MlpTrainingStudio(QMainWindow):
     def _collect_baseline_form(self) -> dict[str, Any]:
         return {
             "model_type": self.baseline_model_type_combo_box.currentText(),
+            "projection_columns": self._selected_projection_columns(),
+            "projection_dim": self.baseline_projection_dim_spin_box.value(),
+            # [] means "design-level split off" — the checkbox state is encoded in
+            # whether the list is empty, so one key round-trips both.
+            "split_design_columns": (
+                self._selected_design_columns()
+                if self.baseline_design_split_checkbox.isChecked()
+                else []
+            ),
+            # A split inherited from a CLI config is persisted too; without it a
+            # session restart would quietly drop back to the row-level split.
+            "split_corner_columns": (
+                list(self._config_split_corner_columns)
+                if self.baseline_design_split_checkbox.isChecked()
+                else []
+            ),
             "epochs": self.baseline_epochs_spin_box.value(),
             "batch_size": self.baseline_batch_size_spin_box.value(),
             "learning_rate": float(self.baseline_learning_rate_spin_box.value()),
@@ -1849,6 +2048,7 @@ class MlpTrainingStudio(QMainWindow):
             "train_frac": float(self.baseline_train_fraction_spin_box.value()),
             "val_frac": float(self.baseline_validation_fraction_spin_box.value()),
             "seed": self.baseline_seed_spin_box.value(),
+            "eval_dataset_path": self.baseline_eval_dataset_edit.text().strip(),
         }
 
     def _apply_baseline_form(self, payload: dict[str, Any]) -> None:
@@ -1859,6 +2059,37 @@ class MlpTrainingStudio(QMainWindow):
         model_type = canonical_model_type(payload.get("model_type", "SpectraNet"))
         if model_type in MODEL_TYPES:
             self.baseline_model_type_combo_box.setCurrentText(model_type)
+        # Projection fields are only applied from a payload that actually selects
+        # the projection model. Suggest/search configs are built via
+        # asdict(TrainConfig(...)) and therefore always carry the dataclass
+        # defaults (projection_columns=None, projection_dim=16) for the other
+        # model types — applying those would silently clear or reset a user's
+        # corner setup.
+        if model_type == "SpectraHydraProj":
+            projection_columns = payload.get("projection_columns")
+            if projection_columns is not None:
+                self._set_projection_columns_selection([str(name) for name in projection_columns])
+            projection_dim = payload.get("projection_dim")
+            if projection_dim is not None:
+                self.baseline_projection_dim_spin_box.setValue(int(projection_dim))
+        # Design-level split. Form dicts persist the design-column list ([] == off),
+        # so it round-trips exactly. Configs built from TrainConfig defaults (suggest,
+        # and search results that ran without the split) carry None, which must leave
+        # the user's split setup untouched — same guard as the projection fields above.
+        split_design_columns = payload.get("split_design_columns")
+        if split_design_columns is not None:
+            self.baseline_design_split_checkbox.setChecked(bool(split_design_columns))
+            if split_design_columns:
+                self._set_design_columns_selection([str(name) for name in split_design_columns])
+        # A config written by the CLI (or an older session) may specify the split the
+        # other way round, by corner columns. Carry that through untouched so loading
+        # it reproduces the run it describes; the picker above still wins once the
+        # user checks design columns of their own.
+        split_corner_columns = payload.get("split_corner_columns")
+        if split_corner_columns is not None:
+            self._config_split_corner_columns = [str(name) for name in split_corner_columns]
+            if split_corner_columns and not self._selected_design_columns():
+                self.baseline_design_split_checkbox.setChecked(True)
         self.baseline_epochs_spin_box.setValue(int(payload.get("epochs", self.baseline_epochs_spin_box.value())))
         self.baseline_batch_size_spin_box.setValue(int(payload.get("batch_size", self.baseline_batch_size_spin_box.value())))
         self.baseline_learning_rate_spin_box.setValue(float(payload.get("learning_rate", self.baseline_learning_rate_spin_box.value())))
@@ -1874,6 +2105,12 @@ class MlpTrainingStudio(QMainWindow):
         self.baseline_train_fraction_spin_box.setValue(float(payload.get("train_frac", self.baseline_train_fraction_spin_box.value())))
         self.baseline_validation_fraction_spin_box.setValue(float(payload.get("val_frac", self.baseline_validation_fraction_spin_box.value())))
         self.baseline_seed_spin_box.setValue(int(payload.get("seed", self.baseline_seed_spin_box.value())))
+        # None means "payload carries the dataclass default" (suggest/search
+        # configs) and leaves the field untouched; a string — empty included —
+        # is an explicit value, so a session that cleared the field stays clear.
+        eval_dataset_path = payload.get("eval_dataset_path")
+        if eval_dataset_path is not None:
+            self.baseline_eval_dataset_edit.setText(str(eval_dataset_path))
 
     def _collect_transfer_form(self) -> dict[str, Any]:
         return {
@@ -1899,6 +2136,246 @@ class MlpTrainingStudio(QMainWindow):
         self.transfer_seed_spin_box.setValue(int(payload.get("seed", self.transfer_seed_spin_box.value())))
         self._refresh_transfer_note_text()
 
+    # ------------------------------------------------------------------
+    # PVT corner-column picker (SpectraHydraProj)
+    # ------------------------------------------------------------------
+    def _selected_projection_columns(self) -> list[str]:
+        return list(self._projection_column_selection)
+
+    def _selected_design_columns(self) -> list[str]:
+        return list(self._design_column_selection)
+
+    def _current_split_design_columns(self) -> list[str] | None:
+        """Design-identity columns for the split, or None when it is off."""
+        if not self.baseline_design_split_checkbox.isChecked():
+            return None
+        return self._selected_design_columns() or None
+
+    def _current_split_corner_columns(self) -> list[str] | None:
+        """Corner columns from a loaded config, used only when no design columns are picked.
+
+        The GUI itself always specifies the split by design identity; this keeps a
+        CLI-written config that used the corner form running as its author meant.
+        """
+        if not self.baseline_design_split_checkbox.isChecked() or self._selected_design_columns():
+            return None
+        return list(self._config_split_corner_columns) or None
+
+    def _on_design_column_toggled(self, _item: QListWidgetItem) -> None:
+        widget = self.baseline_design_columns_list
+        self._design_column_selection = [
+            widget.item(index).text()
+            for index in range(widget.count())
+            if widget.item(index).checkState() == Qt.CheckState.Checked
+        ]
+        # An explicit design-identity pick supersedes a corner list inherited from a
+        # loaded config, so the two can never both reach the run config.
+        if self._design_column_selection:
+            self._config_split_corner_columns = []
+
+    def _rebuild_design_column_items(self, names: list[str]) -> None:
+        widget = self.baseline_design_columns_list
+        widget.blockSignals(True)
+        widget.clear()
+        for name in names:
+            item = QListWidgetItem(name)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.CheckState.Checked
+                if name in self._design_column_selection
+                else Qt.CheckState.Unchecked
+            )
+            widget.addItem(item)
+        widget.blockSignals(False)
+
+    def _populate_design_columns(self, names: list[str]) -> None:
+        """Fill the design-identity picker from the scanned dataset's feature names."""
+        missing = [name for name in self._design_column_selection if name not in names]
+        if missing:
+            self.append_log(
+                "Design identity column(s) not present in the scanned dataset were "
+                "unselected: " + ", ".join(missing)
+            )
+        self._design_column_selection = [
+            name for name in self._design_column_selection if name in names
+        ]
+        self._rebuild_design_column_items(names)
+
+    def _set_design_columns_selection(self, names: list[str]) -> None:
+        """Programmatically select design columns (session restore / config load)."""
+        self._design_column_selection = [str(name) for name in names]
+        widget = self.baseline_design_columns_list
+        existing = [widget.item(index).text() for index in range(widget.count())]
+        items = existing + [name for name in self._design_column_selection if name not in existing]
+        self._rebuild_design_column_items(items)
+
+    def _on_projection_column_toggled(self, _item: QListWidgetItem) -> None:
+        # Recompute from widget state so the selection stays in dataset column
+        # order regardless of the order boxes were clicked in.
+        widget = self.baseline_projection_columns_list
+        self._projection_column_selection = [
+            widget.item(index).text()
+            for index in range(widget.count())
+            if widget.item(index).checkState() == Qt.CheckState.Checked
+        ]
+
+    def _rebuild_projection_column_items(self, names: list[str]) -> None:
+        widget = self.baseline_projection_columns_list
+        widget.blockSignals(True)
+        widget.clear()
+        for name in names:
+            item = QListWidgetItem(name)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.CheckState.Checked
+                if name in self._projection_column_selection
+                else Qt.CheckState.Unchecked
+            )
+            widget.addItem(item)
+        widget.blockSignals(False)
+
+    def _populate_projection_columns(self, names: list[str]) -> None:
+        """Fill the corner-column picker with the scanned dataset's feature names.
+
+        The checked selection survives repopulation by name. Selected names that
+        do not exist in the newly scanned dataset are unselected with a log line
+        instead of failing later at training time.
+        """
+        missing = [name for name in self._projection_column_selection if name not in names]
+        if missing:
+            self.append_log(
+                "PVT corner column(s) not present in the scanned dataset were unselected: "
+                + ", ".join(missing)
+            )
+        self._projection_column_selection = [
+            name for name in self._projection_column_selection if name in names
+        ]
+        self._rebuild_projection_column_items(names)
+
+    def _set_projection_columns_selection(self, names: list[str]) -> None:
+        """Programmatically select corner columns (session restore / config load).
+
+        Before a dataset scan the picker has no items, so restored names are
+        appended as items to keep the pending selection visible.
+        """
+        self._projection_column_selection = [str(name) for name in names]
+        widget = self.baseline_projection_columns_list
+        existing = [widget.item(index).text() for index in range(widget.count())]
+        items = existing + [name for name in self._projection_column_selection if name not in existing]
+        self._rebuild_projection_column_items(items)
+
+    def _refresh_projection_controls_enabled(self) -> None:
+        is_projection = (
+            canonical_model_type(self.baseline_model_type_combo_box.currentText())
+            == "SpectraHydraProj"
+        )
+        # The corner picker feeds the projection embedding only; the split is
+        # driven by the separate design-identity picker below.
+        design_split = self.baseline_design_split_checkbox.isChecked()
+        self.baseline_projection_columns_list.setEnabled(is_projection)
+        self.baseline_projection_dim_spin_box.setEnabled(is_projection)
+        self.baseline_design_columns_list.setEnabled(design_split)
+
+    def _validate_projection_settings(self) -> bool:
+        is_projection = (
+            canonical_model_type(self.baseline_model_type_combo_box.currentText())
+            == "SpectraHydraProj"
+        )
+        design_split = self.baseline_design_split_checkbox.isChecked()
+        if not is_projection and not design_split:
+            return True
+        known: set[str] = set()
+        known_active: set[str] = set()
+        if self.last_scan_result is not None:
+            known_active = set(self.last_scan_result.get("active_input_feature_names", []))
+            known = known_active | set(self.last_scan_result.get("dropped_input_feature_names", []))
+
+        if is_projection:
+            selected = self._selected_projection_columns()
+            if not selected:
+                self._show_warning(
+                    "SpectraHydraProj needs at least one PVT corner column. Check the "
+                    "corner/condition columns (e.g. temperature, supply, or process "
+                    "one-hots) in the Baseline tab's PVT Corner Columns list."
+                )
+                return False
+            unknown = [name for name in selected if name not in known]
+            if known and unknown:
+                self._show_warning(
+                    "These PVT corner columns are not input features of the scanned "
+                    "dataset: " + ", ".join(unknown) + ". Re-select the corner columns "
+                    "for this dataset."
+                )
+                return False
+
+        if design_split:
+            # A config loaded from the CLI may specify the split by corner columns
+            # instead; that form is validated by the engine, which now rejects a
+            # selection that leaves every row its own design.
+            design_columns = self._selected_design_columns()
+            if not design_columns:
+                if self._config_split_corner_columns:
+                    return True
+                self._show_warning(
+                    "The design-level split needs at least one Design Identity column "
+                    "so it knows which rows are the same design at different corners. "
+                    "Check the geometry/parameter columns in the Baseline tab's Design "
+                    "Identity Columns list, or untick 'Hold out whole designs'."
+                )
+                return False
+            unknown = [name for name in design_columns if name not in known]
+            if known and unknown:
+                self._show_warning(
+                    "These design identity columns are not input features of the "
+                    "scanned dataset: " + ", ".join(unknown) + ". Re-select them for "
+                    "this dataset."
+                )
+                return False
+            overlap = [name for name in design_columns if name in set(self._selected_projection_columns())]
+            if overlap:
+                self._show_warning(
+                    "These columns are checked as PVT Corner Columns and as Design "
+                    "Identity columns: " + ", ".join(overlap) + ". A corner column "
+                    "used as design identity splits one design into a separate "
+                    "'design' per corner, which puts the same physical design in "
+                    "train and test again. Uncheck them from Design Identity Columns."
+                )
+                return False
+            # Every varying column marked as design identity leaves nothing that can
+            # vary across a design's corners, so each row becomes its own design and
+            # the split silently degrades to a row-level one.
+            if known_active and set(design_columns) >= known_active:
+                self._show_warning(
+                    "Every varying input column of the scanned dataset is checked as "
+                    "a Design Identity column, so no column is left to vary across a "
+                    "design's PVT corners and every row would be its own design. "
+                    "Check only the geometry/parameter columns."
+                )
+                return False
+        return True
+
+    def _validate_eval_dataset_path(self) -> bool:
+        """Cheap pre-flight check of the optional External Eval Set field.
+
+        Only existence and file type are checked here; the engine validates the
+        arrays themselves (feature coverage, channel count, frequency grid)
+        before any training epoch runs, so a mismatched file still fails fast.
+        """
+        path_text = self.baseline_eval_dataset_edit.text().strip()
+        if not path_text:
+            return True
+        path = Path(path_text)
+        if not path.is_file():
+            self._show_warning(f"The External Eval Set file does not exist: {path}")
+            return False
+        if path.suffix.lower() != ".npz":
+            self._show_warning(
+                "The External Eval Set must be an .npz file holding features, "
+                "targets, and feature_names arrays (a dataset bundle.npz works)."
+            )
+            return False
+        return True
+
     def _build_baseline_train_config(self) -> TrainConfig:
         roots = make_run_roots(self.model_output_folder_path_edit.text().strip(), self.run_name_edit.text().strip())
         form = self._collect_baseline_form()
@@ -1920,6 +2397,10 @@ class MlpTrainingStudio(QMainWindow):
             cache_path=self._ensure_cache_path(),
             output_dir=roots["baseline"],
             model_type=form["model_type"],
+            projection_columns=form["projection_columns"] or None,
+            projection_dim=form["projection_dim"],
+            split_corner_columns=self._current_split_corner_columns(),
+            split_design_columns=self._current_split_design_columns(),
             seed=form["seed"],
             batch_size=form["batch_size"],
             epochs=form["epochs"],
@@ -1934,6 +2415,7 @@ class MlpTrainingStudio(QMainWindow):
             use_amp=form.get("use_amp", True),
             max_samples=None,
             device=self._current_device_id(),
+            eval_dataset_path=form["eval_dataset_path"] or None,
         )
 
     def _build_transfer_config(self) -> TransferConfig:
@@ -1947,6 +2429,10 @@ class MlpTrainingStudio(QMainWindow):
             model_type=self.baseline_model_type_combo_box.currentText(),
             width=self.baseline_width_spin_box.value(),
             depth=self.baseline_depth_spin_box.value(),
+            projection_columns=self._selected_projection_columns() or None,
+            projection_dim=self.baseline_projection_dim_spin_box.value(),
+            split_corner_columns=self._current_split_corner_columns(),
+            split_design_columns=self._current_split_design_columns(),
             seed=form["seed"],
             train_frac=float(self.baseline_train_fraction_spin_box.value()),
             val_frac=float(self.baseline_validation_fraction_spin_box.value()),
@@ -2057,6 +2543,7 @@ class MlpTrainingStudio(QMainWindow):
     # Plot helpers
     # ------------------------------------------------------------------
     def _reset_baseline_plots(self) -> None:
+        self._reset_channel_metric_cards()
         self._baseline_epochs.clear()
         self._baseline_train_losses.clear()
         self._baseline_val_losses.clear()
@@ -2453,10 +2940,15 @@ class MlpTrainingStudio(QMainWindow):
             self._baseline_val_losses = [float(entry["val_loss"]) for entry in history if "val_loss" in entry]
             self.baseline_train_curve.setData(self._baseline_epochs, self._baseline_train_losses)
             self.baseline_val_curve.setData(self._baseline_epochs, self._baseline_val_losses)
-        # Show a single MAE averaged over all ground-truth channels (no per-channel split).
         average_mae = summary.get("average_evaluation_mae", summary.get("average_test_mae"))
         if average_mae is not None:
             self.metric_cards["average_mae"].set_value(f"{float(average_mae):.6f}")
+        self._update_channel_metric_cards(list(summary.get("channel_mae_with_units") or []))
+        self._update_channel_metric_cards(
+            list(summary.get("external_channel_mae_with_units") or []),
+            key_prefix="holdout:",
+            title_prefix="Holdout ",
+        )
         best_val_loss = summary.get("best_val_loss")
         if best_val_loss is not None:
             self.metric_cards["best_metric"].set_value(f"Best val {float(best_val_loss):.6f}")

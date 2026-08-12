@@ -33,7 +33,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from .runner import build_model
+from .runner import build_model, resolve_projection_kwargs
 
 
 def _apply_log10_inverse(y: torch.Tensor, log10_mask: torch.Tensor, has_log10: bool) -> torch.Tensor:
@@ -208,6 +208,17 @@ def export_checkpoint_to_onnx(
     transforms = axis_meta["channel_transforms"] or [""] * num_channels
     log10_mask = [t == "log10" for t in transforms]
 
+    # SpectraHydraProj checkpoints resolve their corner columns exactly as training
+    # did: by name against the checkpoint's own active feature list. Other model
+    # types get an empty dict. Old checkpoints lack the projection keys entirely,
+    # which the .get defaults tolerate.
+    projection_kwargs = resolve_projection_kwargs(
+        config.get("model_type", "SpectraNet"),
+        config.get("projection_columns"),
+        int(config.get("projection_dim", 16) or 16),
+        active_names,
+        list(checkpoint.get("dropped_input_feature_names", [])),
+    )
     model = build_model(
         config.get("model_type", "SpectraNet"),
         num_frequencies=num_frequencies,
@@ -215,6 +226,7 @@ def export_checkpoint_to_onnx(
         ground_truth_channels=num_channels,
         width=int(config["width"]),
         depth=int(config["depth"]),
+        **projection_kwargs,
     )
     model.load_state_dict(_get(checkpoint, "model_state", "model_state_dict"))
     model.eval()
@@ -255,6 +267,12 @@ def export_checkpoint_to_onnx(
         "target_std": target_std.tolist(),
         "output_layout": "row-major (channel, frequency); reshape to [num_frequencies, num_channels].' in MATLAB",
     }
+    if projection_kwargs:
+        # Informative only: the graph input stays the raw feature vector; the
+        # corner projection happens inside the exported network.
+        sidecar["projection_columns"] = [active_names[i] for i in projection_kwargs["corner_indices"]]
+        sidecar["projection_corner_indices"] = list(projection_kwargs["corner_indices"])
+        sidecar["projection_dim"] = int(projection_kwargs["projection_dim"])
     meta_path = out_path.with_suffix(".meta.json")
     meta_path.write_text(json.dumps(sidecar, indent=2))
 
@@ -288,8 +306,12 @@ def export_transfer_to_onnx(
     model_kwargs = dict(bundle["model_kwargs"])
     bands = [np.asarray(b, dtype=np.int64) for b in bundle["bands"]]
 
-    if "target_mean" in bundle and baseline_checkpoint is None:
-        # Standalone transfer run: normalization + metadata are embedded in the bundle.
+    if "target_mean" in bundle:
+        # Standalone transfer run: the bundle's embedded normalization + metadata are
+        # authoritative — they are what the submodels were trained with. An explicitly
+        # passed baseline_checkpoint is redundant here and is ignored: mixing a foreign
+        # baseline's stats or model_type with this bundle's states/model_kwargs would
+        # export a wrong (or unbuildable) graph.
         model_type = bundle.get("model_type", "SpectraNet")
         active_names = list(bundle["active_input_feature_names"])
         channel_names = list(bundle["target_channel_names"])
@@ -315,7 +337,10 @@ def export_transfer_to_onnx(
         baseline_checkpoint = Path(baseline_checkpoint)
         base = torch.load(baseline_checkpoint, map_location="cpu", weights_only=False)
         config = base["config"]
-        model_type = config.get("model_type", "SpectraNet")
+        # The bundle's submodels were built from its own model_kwargs, so a bundle
+        # model_type (when recorded) beats the baseline's — they must agree with
+        # each other, not with a possibly retrained baseline.
+        model_type = bundle.get("model_type") or config.get("model_type", "SpectraNet")
         active_names = list(_get(base, "active_input_feature_names", "active_feature_names"))
         channel_names = list(base["target_channel_names"])
         input_mean = np.asarray(_get(base, "input_feature_mean", "input_mean"), dtype=np.float32)
@@ -380,6 +405,11 @@ def export_transfer_to_onnx(
         "baseline_checkpoint": str(baseline_checkpoint) if baseline_checkpoint else None,
         "output_layout": "row-major (channel, frequency); reshape to [num_frequencies, num_channels].' in MATLAB",
     }
+    if "corner_indices" in model_kwargs:
+        corner_indices = [int(i) for i in model_kwargs["corner_indices"]]
+        sidecar["projection_columns"] = [active_names[i] for i in corner_indices]
+        sidecar["projection_corner_indices"] = corner_indices
+        sidecar["projection_dim"] = int(model_kwargs.get("projection_dim", 16))
     out_path.with_suffix(".meta.json").write_text(json.dumps(sidecar, indent=2))
 
     if check:

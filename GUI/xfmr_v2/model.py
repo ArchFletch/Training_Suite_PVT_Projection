@@ -4,9 +4,13 @@ Each model maps per-sample input features to an entire ``(channels, frequency)``
 output curve in one shot:
 - :class:`SpectraNet` is a single dense network from inputs to the flattened output.
 - :class:`SpectraHydra` shares an encoder and uses one linear head per channel.
+- :class:`SpectraHydraProj` adds a learned projection of PVT corner columns on
+  top of :class:`SpectraHydra`.
 """
 
 from __future__ import annotations
+
+from collections.abc import Sequence
 
 import torch
 from torch import nn
@@ -146,3 +150,58 @@ class SpectraHydra(nn.Module):
         latent = self.encoder(input_features)
         # Stack per-channel predictions into (batch, channels, frequency).
         return torch.stack([head(latent) for head in self.heads], dim=1)
+
+
+class SpectraHydraProj(SpectraHydra):
+    """:class:`SpectraHydra` with a learned linear projection of PVT corner columns.
+
+    For PVT (process / voltage / temperature) datasets, the corner-condition
+    columns (e.g. ``Temp_C``, ``VDD``, process one-hots) are passed through a
+    trainable ``Linear(len(corner_indices) -> projection_dim)`` and the projected
+    embedding is concatenated onto the full input-feature vector before the
+    shared encoder.  The projection is a regular submodule, so it trains
+    end-to-end with the rest of the network — during baseline training and
+    inside every band submodel during self-transfer.
+
+    ``corner_indices`` index into the model's input features (the *active*
+    feature columns, after constant columns are dropped), in the same order the
+    features are fed to :meth:`forward`.  ``input_feature_dim`` is still the raw
+    input width: callers feed the same feature vector as for the other models,
+    and the embedding is derived internally.
+    """
+
+    def __init__(
+        self,
+        input_feature_dim: int,
+        ground_truth_channels: int,
+        num_frequencies: int,
+        width: int = 256,
+        depth: int = 5,
+        corner_indices: Sequence[int] = (),
+        projection_dim: int = 16,
+    ) -> None:
+        corner_indices = [int(i) for i in corner_indices]
+        if not corner_indices:
+            raise ValueError("SpectraHydraProj requires at least one corner column index.")
+        if any(i < 0 or i >= input_feature_dim for i in corner_indices):
+            raise ValueError(
+                f"corner_indices {corner_indices} out of range for input_feature_dim={input_feature_dim}."
+            )
+        if projection_dim <= 0:
+            raise ValueError("projection_dim must be a positive integer.")
+        # The encoder sees the raw features plus the projected corner embedding.
+        super().__init__(
+            input_feature_dim + projection_dim,
+            ground_truth_channels,
+            num_frequencies,
+            width,
+            depth,
+        )
+        self.cemb = nn.Linear(len(corner_indices), projection_dim)
+        # A buffer (not a parameter) so the indices travel inside every state dict:
+        # band-to-band warm starts, checkpoint reloads, and ONNX export all see them.
+        self.register_buffer("corner_indices", torch.tensor(corner_indices, dtype=torch.long))
+
+    def forward(self, input_features: torch.Tensor) -> torch.Tensor:
+        embedding = self.cemb(input_features[:, self.corner_indices])
+        return super().forward(torch.cat([input_features, embedding], dim=-1))

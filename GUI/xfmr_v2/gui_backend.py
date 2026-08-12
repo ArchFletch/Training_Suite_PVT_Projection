@@ -15,6 +15,7 @@ GUI-friendly surface that can:
 from __future__ import annotations
 
 import json
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +58,8 @@ def scan_dataset(
     val_frac: float,
     seed: int,
     max_samples: int | None = None,
+    split_corner_columns: list[str] | None = None,
+    split_design_columns: list[str] | None = None,
     progress_callback=None,
     should_stop=None,
     # Legacy params — kept for signature compat but ignored.
@@ -87,15 +90,52 @@ def scan_dataset(
              "cache_status": cache_summary["status"]}
         )
 
-    bundle = load_split_bundle(
-        cache_path=cache_path,
-        batch_size=16,
-        seed=seed,
-        train_frac=train_frac,
-        val_frac=val_frac,
-        max_samples=max_samples,
-        pin_memory=False,
-    )
+    # Preview the SAME split the run would use. A scan may run before the corner
+    # picker is validated against this dataset (scanning is what populates it),
+    # so a bad selection must not break the scan itself — fall back to the
+    # row-level preview and say so, instead of failing or silently previewing a
+    # split the run will not use.
+    split_note = ""
+    split_warnings: list[str] = []
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            bundle = load_split_bundle(
+                cache_path=cache_path,
+                batch_size=16,
+                seed=seed,
+                train_frac=train_frac,
+                val_frac=val_frac,
+                max_samples=max_samples,
+                pin_memory=False,
+                split_corner_columns=split_corner_columns,
+                split_design_columns=split_design_columns,
+            )
+        split_warnings = [str(entry.message) for entry in caught]
+    except ValueError as error:
+        if not (split_corner_columns or split_design_columns):
+            raise
+        split_note = str(error)
+        bundle = load_split_bundle(
+            cache_path=cache_path,
+            batch_size=16,
+            seed=seed,
+            train_frac=train_frac,
+            val_frac=val_frac,
+            max_samples=max_samples,
+            pin_memory=False,
+        )
+
+    if bundle.design_counts is not None:
+        counts = bundle.design_counts
+        split_mode = (
+            f"Design-level: {counts['train']} / {counts['val']} / {counts['test']} "
+            "train/val/test designs (all corner rows of a design stay in one fold)"
+        )
+    elif split_note:
+        split_mode = f"Row-level (requested design-level split unavailable: {split_note})"
+    else:
+        split_mode = "Row-level"
 
     schema = cache_summary.get("dataset_schema", {})
     preview_rows = [
@@ -103,6 +143,8 @@ def scan_dataset(
         ("Training Samples", str(len(bundle.split_indices["train"]))),
         ("Validation Samples", str(len(bundle.split_indices["val"]))),
         ("Test Samples", str(len(bundle.split_indices["test"]))),
+        ("Split Mode", split_mode),
+        ("Split Warnings", _join_values(split_warnings) or "None"),
         ("Sweep Points", str(cache_summary["num_frequencies"])),
         ("Dataset Name", cache_summary.get("dataset_name", "")),
         ("Active Input-Feature Columns", _join_values(bundle.active_names)),
@@ -123,6 +165,7 @@ def scan_dataset(
         "cache_path": cache_summary["cache_path"],
         "schema": schema,
         "preview_rows": preview_rows,
+        "split_warnings": split_warnings,
         "active_input_feature_names": bundle.active_names,
         "dropped_input_feature_names": bundle.dropped_names,
         "frequency_count": int(cache_summary["num_frequencies"]),
@@ -154,6 +197,8 @@ def build_and_scan_dataset(
     val_frac: float,
     seed: int,
     max_samples: int | None = None,
+    split_corner_columns: list[str] | None = None,
+    split_design_columns: list[str] | None = None,
     dataset_root: str = "",
     input_feature_path: str = "",
     ground_truth_data_dir: str = "",
@@ -188,6 +233,8 @@ def build_and_scan_dataset(
         val_frac=val_frac,
         seed=seed,
         max_samples=max_samples,
+        split_corner_columns=split_corner_columns,
+        split_design_columns=split_design_columns,
         progress_callback=progress_callback,
         should_stop=should_stop,
     )
@@ -329,6 +376,8 @@ def build_suggest_result(
     train_frac: float,
     val_frac: float,
     max_samples: int | None,
+    split_corner_columns: list[str] | None = None,
+    split_design_columns: list[str] | None = None,
     progress_callback=None,
     should_stop=None,
 ) -> dict[str, Any]:
@@ -356,6 +405,8 @@ def build_suggest_result(
             seed=seed,
             train_frac=train_frac,
             val_frac=val_frac,
+            split_corner_columns=split_corner_columns,
+            split_design_columns=split_design_columns,
             max_samples=max_samples,
         ),
         show_progress=False,

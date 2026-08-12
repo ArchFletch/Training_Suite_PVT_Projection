@@ -35,6 +35,32 @@ The training core turns a README-described dataset into reproducible modeling ru
 - optional self-transfer learning
 - saved checkpoints, JSON summaries, and plots
 
+Three architectures are available: `SpectraNet` (flat dense net), `SpectraHydra`
+(shared encoder with per-channel heads), and `SpectraHydraProj` (SpectraHydra plus a
+learned projection of PVT corner columns — pick the corner/condition feature columns
+such as temperature, supply, and process one-hots, and the model concatenates their
+trained embedding onto the inputs; the projection also trains live inside every band
+submodel during self-transfer).
+
+For PVT-style datasets where each design appears once per corner, the optional
+design-level split (the GUI's "Hold out whole designs" checkbox, any model type) keeps
+every corner row of a design in the same train/validation/test fold. The default
+row-level split would place a design at one corner in train and the same design at
+another corner in test, which leaks design information and makes test error look better
+than it is.
+
+Specify it by naming the columns that **identify a design** — the geometry parameters —
+via the GUI's "Design Identity Columns" list or `--split-design-columns`. Everything else
+is then treated as corner-varying. The older `--split-corner-columns` form (name the
+corner columns instead) still works, but it must cover *every* column that moves with the
+corner, derived ones included: physics anchors, a frozen corner embedding (`e0`…`e15`),
+and so on. Miss one and each design fractures into per-corner designs, which is a
+row-level split wearing a design-level label. The engine now folds provably
+corner-determined columns in automatically, refuses a grouping that gives every row its
+own design, and warns when no design reaches every corner in the data — but naming the
+design columns avoids the whole class of mistake, because an omission there merges
+designs (coarser, still leak-free) instead of splintering them.
+
 Primary code lives in [`xfmr_v2/`](xfmr_v2/), with thin root-level entrypoints for local development.
 
 ### 2. Desktop GUI
@@ -99,11 +125,15 @@ python train_baseline.py
 python run_self_transfer.py --base-run-dir <path-to-compatible-baseline-run>
 ```
 
-`prepare_cache.py` auto-detects the dataset format (SPData/Touchstone or Cadence CSV)
-from the folder contents. The other entrypoints build the cache on demand when it is
-missing — point them at the dataset with `--data-root <path-to-dataset-folder>` (or
-the explicit `--input-feature-path` / `--ground-truth-data-dir` paths, which are used
-to locate the dataset folder).
+`prepare_cache.py` auto-detects the dataset format from the folder contents:
+SPData/Touchstone (`log.txt` + a folder of `.sNp` files), Cadence CSV (`*.csv`), or a
+prebuilt `.npz` already holding `features` / `targets` / `frequency_hz` arrays — either
+this engine's own cache layout or a barer bundle from an offline preparation script.
+The prebuilt-array case is checked last, so a raw source always wins when a folder
+holds both. The other entrypoints build the cache on demand when it is missing — point
+them at the dataset with `--data-root <path-to-dataset-folder>` (or the explicit
+`--input-feature-path` / `--ground-truth-data-dir` paths, which are used to locate the
+dataset folder).
 
 ### Desktop GUI
 
