@@ -579,7 +579,12 @@ print(key_pem)
             throw "Checkout was not granted: $checkoutJson"
         }
         Start-Sleep -Seconds 2
-        $releasePayload = @{ lease_id = $checkout.lease_id } | ConvertTo-Json -Compress
+        # machine_id authenticates the release, exactly as it does the heartbeat, and
+        # ReleaseRequest forbids extra fields -- a lease_id-only body is a 422.
+        $releasePayload = @{
+            lease_id = $checkout.lease_id
+            machine_id = $checkoutPayload.machine_id
+        } | ConvertTo-Json -Compress
         $release = Invoke-RestMethod -Method Post -Uri $releaseUrl -ContentType "application/json" -Body $releasePayload
 
         $summary = [ordered]@{

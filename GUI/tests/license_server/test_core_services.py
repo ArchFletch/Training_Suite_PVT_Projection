@@ -242,3 +242,48 @@ def test_license_downgrade_immediately_evicts_excess_leases(runtime, monkeypatch
     )
     assert evicted_heartbeat.ok is False
     assert evicted_heartbeat.reason_code == "invalid_lease"
+
+
+def test_release_requires_the_machine_that_owns_the_lease(runtime, monkeypatch: pytest.MonkeyPatch) -> None:
+    server_runtime = runtime["runtime"]
+
+    monkeypatch.setattr("license_server.services.license_service.utc_now", lambda: _utc(2026, 3, 13, 12, 5, 0))
+    license_envelope = _make_signed_license(
+        runtime,
+        seat_count=1,
+        starts_at=_utc(2026, 3, 13, 0, 0, 0),
+        ends_at=_utc(2026, 4, 13, 0, 0, 0),
+        license_id="lic_release_binding",
+    )
+    server_runtime.license_service.import_license(license_envelope)
+
+    checkout_time = _utc(2026, 3, 13, 12, 10, 0)
+    monkeypatch.setattr("license_server.services.lease_service.utc_now", lambda: checkout_time)
+    checkout = server_runtime.lease_service.checkout(_checkout_request("cli_owner", "eda-win-17"))
+    assert checkout.granted is True
+
+    stolen = server_runtime.lease_service.release(
+        ReleaseRequest(lease_id=checkout.lease_id, machine_id="cli_thief")
+    )
+    assert stolen.ok is False
+    assert stolen.reason_code == "machine_mismatch"
+
+    still_held = server_runtime.lease_service.list_active_leases(now=checkout_time)
+    assert [lease.lease_id for lease in still_held] == [checkout.lease_id]
+
+    released = server_runtime.lease_service.release(
+        ReleaseRequest(lease_id=checkout.lease_id, machine_id="cli_owner")
+    )
+    assert released.ok is True
+    assert server_runtime.lease_service.list_active_leases(now=checkout_time) == []
+
+
+def test_release_rejects_an_unknown_lease(runtime) -> None:
+    server_runtime = runtime["runtime"]
+
+    missing = server_runtime.lease_service.release(
+        ReleaseRequest(lease_id="lease_does_not_exist", machine_id="cli_owner")
+    )
+
+    assert missing.ok is False
+    assert missing.reason_code == "invalid_lease"

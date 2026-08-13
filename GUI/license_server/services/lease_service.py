@@ -197,6 +197,15 @@ class LeaseService:
             existing = self.repository.get_lease(connection, request.lease_id)
             if existing is None:
                 return ReleaseResponse(ok=False, reason_code="invalid_lease", message="Lease not found.")
+            # A lease_id is not an authenticator: release used to accept one on its
+            # own, so anyone who learned another client's lease_id could drop that
+            # seat. Bind the release to the owning machine the way heartbeat does.
+            if existing.machine_id != request.machine_id:
+                return ReleaseResponse(
+                    ok=False,
+                    reason_code="machine_mismatch",
+                    message="The lease is owned by a different machine_id.",
+                )
             updated = self.repository.release_lease(
                 connection,
                 lease_id=request.lease_id,

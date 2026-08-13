@@ -358,9 +358,14 @@ Request:
 
 ```json
 {
-  "lease_id": "lease_001"
+  "lease_id": "lease_001",
+  "machine_id": "cli_7bde9f61"
 }
 ```
+
+`machine_id` authenticates the release the same way it does a heartbeat: a lease
+is only released by the machine holding it. A body carrying `lease_id` alone is
+rejected, so knowing another client's lease id is not enough to drop its seat.
 
 Response:
 

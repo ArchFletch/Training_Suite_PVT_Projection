@@ -262,7 +262,10 @@ class LicenseLeaseController:
         release_error: str | None = None
         if snapshot.server_url and snapshot.lease_id:
             try:
-                result = self._make_client(snapshot.server_url).release(lease_id=snapshot.lease_id)
+                result = self._make_client(snapshot.server_url).release(
+                    lease_id=snapshot.lease_id,
+                    machine_id=snapshot.machine_id or self.identity.machine_id,
+                )
                 released_ok = bool(result.ok)
                 if not result.ok:
                     release_error = "The license server did not confirm the release."

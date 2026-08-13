@@ -12,13 +12,32 @@ bootstrap scripts.
   service definition.
 - `windows/mlp-license-server-service.xml.template`: WinSW XML template used by the PowerShell
   installer.
+- `linux/build_bundle.sh`: stages the Linux customer tarball with the application package, the
+  service-install assets, and the sample config.
 - `linux/install_linux_service.sh`: creates the Linux service account, installs sample files, and
   renders the `systemd` unit.
 - `linux/mlp-license-server.service.template`: `systemd` unit template for the server.
 - `linux/mlp-license-server.env.sample`: sample environment file that carries the final service
   command string.
+- `linux/INSTALL.md.template`: customer-admin instructions rendered into the staged Linux bundle.
 - `shared/config.windows.toml.sample`: sample Windows config layout.
 - `shared/config.linux.toml.sample`: sample Linux config layout.
+
+## Customer Bundles
+
+Both bundles are the complete customer delivery, so neither carries `license_vendor/`, tests, or
+internal reports. Customers never receive a source checkout.
+
+- Windows: `windows/build_bundle.ps1 -WinSWExePath <winsw.exe>` stages
+  `artifacts\packaging\license_server\windows\MLP License Server\` and zips it. `-SkipArchive`
+  stages without the zip.
+- Linux: `linux/build_bundle.sh` stages
+  `artifacts/packaging/license_server/linux/mlp-license-server/` and writes
+  `mlp-license-server-linux.tar.gz` beside it. `--skip-archive` stages without the tarball.
+
+The Linux bundle keeps `linux/` and `shared/` side by side because
+`install_linux_service.sh` resolves its templates relative to its own directory, so the customer
+runs it straight out of the extracted tarball.
 
 ## Current Runtime Commands
 

@@ -40,8 +40,8 @@ class _FakeLicenseClient:
             raise self.server.heartbeat_error
         return self.server.heartbeat_result
 
-    def release(self, *, lease_id: str) -> LicenseReleaseResult:
-        self.server.release_calls.append(lease_id)
+    def release(self, *, lease_id: str, machine_id: str) -> LicenseReleaseResult:
+        self.server.release_calls.append((lease_id, machine_id))
         return self.server.release_result
 
 
@@ -67,7 +67,7 @@ class _FakeServer:
         self.heartbeat_error: Exception | None = None
         self.checkout_calls: list[object] = []
         self.heartbeat_calls: list[tuple[str, str]] = []
-        self.release_calls: list[str] = []
+        self.release_calls: list[tuple[str, str]] = []
 
     def factory(self, server_url: str, timeout_seconds: float) -> _FakeLicenseClient:
         assert server_url == "http://license-host:27850"
@@ -112,4 +112,7 @@ def test_controller_releases_active_lease_cleanly() -> None:
 
     assert released.phase == "released"
     assert released.lease_id is None
-    assert server.release_calls == ["lease_001"]
+    # The server authenticates a release by machine_id the same way it does a
+    # heartbeat, so the controller has to send it. A fake that accepted lease_id
+    # alone let the real client's signature drift out from under this caller.
+    assert server.release_calls == [("lease_001", controller.identity.machine_id)]

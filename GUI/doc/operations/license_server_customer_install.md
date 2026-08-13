@@ -3,8 +3,13 @@
 These steps describe the intended customer IT install path for the on-prem
 floating license server.
 
-For Windows, the target delivery is a self-contained service bundle rather than
-a source checkout plus manual Python staging.
+On both Windows and Linux the delivery is a service bundle rather than a source
+checkout. The two are not equivalent beyond that: the Windows bundle embeds its
+own Python runtime, while the Linux bundle ships application code only and the
+admin builds a virtual environment on the host. A Linux install therefore needs
+the host to reach both an apt mirror (for `python3-venv`) and PyPI (for the
+runtime requirements); an air-gapped Linux host needs those wheels staged
+separately.
 
 ## Current Runtime Defaults
 
@@ -62,6 +67,18 @@ Linux is a service-bundle workflow rooted outside the repo. Ubuntu 22.04/24.04
 and other `systemd` distributions are supported. Python 3.12 is the baseline;
 `python3-venv` must be installed before staging.
 
+The delivered artifact is `mlp-license-server-linux.tar.gz`, built by
+`packaging/license_server/linux/build_bundle.sh`. It extracts to a single
+`mlp-license-server/` directory holding:
+
+- `license_server/`: the application package, including `requirements.txt`
+- `linux/`: `install_linux_service.sh` plus the unit and environment templates
+- `shared/config.linux.toml.sample`: the config rendered by the installer
+- `INSTALL.md`: the condensed version of this flow for the customer admin
+
+Nothing else ships. The vendor signing tooling in `license_vendor/` is never
+part of a customer bundle, and no customer host needs a source checkout.
+
 ### Default Linux Layout
 
 - install root: `/opt/mlp-license-server/`
@@ -82,17 +99,24 @@ The listening port comes from the service command in `service.env`, not from
 
 ### Linux Install Flow
 
+Extract the delivered bundle anywhere the admin can read it, for example the
+admin home directory. Every command below runs from that directory.
+
+```bash
+tar -xzf mlp-license-server-linux.tar.gz
+cd mlp-license-server
+```
+
 Steps 1 and 2 must both complete before the service is started: the installer
 creates the service account and unit but does **not** stage code or build a
 virtual environment, so starting earlier gives a unit with nothing to run.
 
 1. Run the installer as `root`, passing the final service command explicitly.
-   Use the absolute path to the script inside the staged bundle or source
-   checkout; it reads two sibling templates and `../shared/config.linux.toml.sample`,
-   so it cannot be moved on its own.
+   Use the copy inside the extracted bundle; it reads two sibling templates and
+   `../shared/config.linux.toml.sample`, so it cannot be moved on its own.
 
 ```bash
-sudo bash /path/to/packaging/license_server/linux/install_linux_service.sh \
+sudo bash ./linux/install_linux_service.sh \
   --install-root /opt/mlp-license-server \
   --service-command "/opt/mlp-license-server/.venv/bin/python -m uvicorn license_server.main:app --host 0.0.0.0 --port 27850"
 ```
@@ -105,7 +129,7 @@ or `--start` yet.
 
 ```bash
 sudo apt install -y python3-venv
-sudo cp -rT /path/to/license_server /opt/mlp-license-server/license_server
+sudo cp -rT ./license_server /opt/mlp-license-server/license_server
 sudo python3 -m venv /opt/mlp-license-server/.venv
 sudo /opt/mlp-license-server/.venv/bin/pip install \
   -r /opt/mlp-license-server/license_server/requirements.txt
@@ -178,6 +202,7 @@ sudo firewall-cmd --permanent --add-port=27850/tcp && sudo firewall-cmd --reload
 ## Clean-Install Notes
 
 - customer-facing runtime behavior must not depend on the source checkout
+- customer bundles must never carry `license_vendor/`, the vendor signing tooling
 - Windows packaging must bundle WinSW directly
 - Windows packaging must not require customer IT to install Python separately
 - release validation should rehearse the same happy path from packaged artifacts before customer rollout

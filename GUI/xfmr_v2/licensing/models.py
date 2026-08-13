@@ -185,11 +185,18 @@ class LicenseReleaseResult:
     """Release response returned by ``POST /release``."""
 
     ok: bool
+    reason_code: str | None = None
+    message: str = ""
     raw: dict[str, Any] = field(default_factory=dict, repr=False)
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "LicenseReleaseResult":
-        return cls(ok=bool(payload.get("ok", False)), raw=dict(payload))
+        return cls(
+            ok=bool(payload.get("ok", False)),
+            reason_code=_optional_str(payload.get("reason_code")),
+            message=_optional_str(payload.get("message")) or "",
+            raw=dict(payload),
+        )
 
 
 @dataclass(frozen=True)

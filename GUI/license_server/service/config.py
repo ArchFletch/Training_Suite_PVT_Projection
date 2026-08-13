@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 import os
 from pathlib import Path
 import platform as runtime_platform
@@ -10,6 +11,8 @@ import tomllib
 
 from license_server.schemas import PRODUCT_NAME
 
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 30
 DEFAULT_LEASE_TTL_SECONDS = 120
@@ -159,21 +162,65 @@ def resolve_config_path(config_dir: Path) -> Path:
     return config_dir / CONFIG_FILENAME
 
 
+def _config_path_was_configured(config_path: Path) -> bool:
+    """Report whether this path came from the operator rather than the default."""
+
+    override = os.environ.get(CONFIG_PATH_ENV, "").strip()
+    return bool(override) and Path(override).expanduser() == config_path
+
+
 def load_lease_settings(config_path: Path) -> dict[str, int]:
     """Read the `[leases]` block from a deployment config file.
 
     A missing, unreadable, or malformed file yields no overrides so the server
-    still starts on documented defaults rather than refusing to run.
+    still starts on documented defaults rather than refusing to run. Every case
+    warns first, except a file absent from the default location: an admin who
+    tightens permissions on the config otherwise gets the defaults back with
+    nothing in the journal, which is indistinguishable from the config having
+    been applied.
     """
 
     try:
         with config_path.open("rb") as handle:
             document = tomllib.load(handle)
-    except (OSError, tomllib.TOMLDecodeError):
+    except FileNotFoundError:
+        # Absent from the default location is the ordinary local-dev case and stays
+        # quiet. Absent from a path the operator named is a misconfiguration: both
+        # service units set MLP_LICENSE_SERVER_CONFIG, so a file missing there was
+        # moved, renamed, or restored away -- and re-running the installer will not
+        # replace it, because that step is guarded on the file not existing.
+        if _config_path_was_configured(config_path):
+            logger.warning(
+                "License server config %s is set by %s but does not exist; using built-in lease defaults",
+                config_path,
+                CONFIG_PATH_ENV,
+            )
+        return {}
+    except OSError as error:
+        logger.warning(
+            "Cannot read license server config %s (%s); using built-in lease defaults", config_path, error
+        )
+        return {}
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as error:
+        # UnicodeDecodeError is not a TOMLDecodeError: tomllib decodes the whole file
+        # as UTF-8 before parsing it. Letting it escape would propagate out of
+        # create_app() at import time, so a config an admin re-saved as UTF-16 from
+        # Notepad would stop the service from starting at all -- strictly worse than
+        # the silent-downgrade bug this warning exists to fix.
+        logger.warning(
+            "Cannot parse license server config %s (%s); using built-in lease defaults", config_path, error
+        )
         return {}
 
     leases = document.get("leases")
+    if leases is None:
+        return {}
     if not isinstance(leases, dict):
+        logger.warning(
+            "Ignoring [leases] in license server config %s: expected a table, got %s; using built-in lease defaults",
+            config_path,
+            type(leases).__name__,
+        )
         return {}
 
     supported = {
@@ -181,11 +228,33 @@ def load_lease_settings(config_path: Path) -> dict[str, int]:
         "lease_ttl_seconds": "lease_ttl_seconds",
         "heartbeat_grace_seconds": "grace_seconds",
     }
+    # A key the server does not recognize is the same silent downgrade as a bad
+    # value, and easier to hit: the file spells the grace window
+    # heartbeat_grace_seconds while the API and the docs call it grace_seconds.
+    unknown_keys = sorted(set(leases) - set(supported))
+    if unknown_keys:
+        logger.warning(
+            "Ignoring unrecognized key(s) in [leases] of license server config %s: %s; supported keys are %s",
+            config_path,
+            ", ".join(unknown_keys),
+            ", ".join(sorted(supported)),
+        )
+
     settings: dict[str, int] = {}
     for file_key, config_key in supported.items():
         value = leases.get(file_key)
+        if value is None:
+            continue
         if isinstance(value, int) and not isinstance(value, bool) and value > 0:
             settings[config_key] = value
+            continue
+        logger.warning(
+            "Ignoring leases.%s = %r in license server config %s: expected a positive integer; "
+            "using the built-in default",
+            file_key,
+            value,
+            config_path,
+        )
     return settings
 
 

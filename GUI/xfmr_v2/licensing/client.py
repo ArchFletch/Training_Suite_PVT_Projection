@@ -54,8 +54,10 @@ class LicenseHttpClient:
             self._request_json("POST", "/heartbeat", payload={"lease_id": lease_id, "machine_id": machine_id})
         )
 
-    def release(self, *, lease_id: str) -> LicenseReleaseResult:
-        return LicenseReleaseResult.from_payload(self._request_json("POST", "/release", payload={"lease_id": lease_id}))
+    def release(self, *, lease_id: str, machine_id: str) -> LicenseReleaseResult:
+        return LicenseReleaseResult.from_payload(
+            self._request_json("POST", "/release", payload={"lease_id": lease_id, "machine_id": machine_id})
+        )
 
     def _request_json(self, method: str, path: str, *, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         body: bytes | None = None
