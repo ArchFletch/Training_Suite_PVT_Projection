@@ -1,0 +1,118 @@
+# MLP License Server (Linux)
+
+This bundle is the complete Linux delivery: the application package, the
+`systemd` install script with its templates, and the sample config. It is not a
+source checkout and it carries no license signing tooling.
+
+Requirements: a `systemd` host (Ubuntu 22.04/24.04 or equivalent), Python 3.12,
+and `python3-venv`. Run the install from an account that can `sudo`.
+
+## 1. Extract the bundle
+
+```bash
+tar -xzf __TARBALL_NAME__
+cd __BUNDLE_NAME__
+```
+
+Every command below runs from that extracted directory.
+
+## 2. Install the service account and unit
+
+Run the copy of the script inside the bundle. It reads two sibling templates and
+`../shared/config.linux.toml.sample`, so it cannot be moved on its own.
+
+```bash
+sudo bash ./linux/install_linux_service.sh \
+  --install-root /opt/mlp-license-server \
+  --service-command "/opt/mlp-license-server/.venv/bin/python -m uvicorn license_server.main:app --host 0.0.0.0 --port 27850"
+```
+
+This creates the `mlp-license-server` account, the config/data/log directories,
+`/etc/mlp-license-server/config.toml`, `/etc/mlp-license-server/service.env` and
+the systemd unit. Do not pass `--enable` or `--start` yet.
+
+Steps 2 and 3 must both complete before the service is started: the installer
+creates the service account and unit but does **not** stage code or build a
+virtual environment, so starting earlier gives a unit with nothing to run.
+
+The listening port comes from the service command in
+`/etc/mlp-license-server/service.env`, not from `config.toml`. Changing a port in
+`config.toml` has no effect.
+
+## 3. Stage the application and build its virtual environment
+
+```bash
+sudo apt install -y python3-venv
+sudo cp -rT ./license_server /opt/mlp-license-server/license_server
+sudo python3 -m venv /opt/mlp-license-server/.venv
+sudo /opt/mlp-license-server/.venv/bin/pip install \
+  -r /opt/mlp-license-server/license_server/requirements.txt
+```
+
+Confirm the service account can import the package from the unit's working
+directory before involving systemd:
+
+```bash
+sudo -u mlp-license-server env -C /opt/mlp-license-server \
+  /opt/mlp-license-server/.venv/bin/python -c "import license_server; print('ok')"
+```
+
+## 4. Create the identity and export the license request
+
+Run every admin command as the service account: a root-created `license.db`
+leaves the service unable to write it, which presents as a successful activation
+followed by failures on every seat request.
+
+```bash
+svc() { sudo -u mlp-license-server env -C /opt/mlp-license-server \
+        /opt/mlp-license-server/.venv/bin/python -m license_server.cli "$@"; }
+
+svc init --runtime-root /var/lib/mlp-license-server
+svc export-request /var/lib/mlp-license-server/license_request.json \
+    --runtime-root /var/lib/mlp-license-server
+```
+
+Send `license_request.json` to the vendor. It contains only a server ID, a host
+fingerprint, the hostname, and the OS family.
+
+## 5. Import the signed license
+
+The vendor public key is delivered once per customer; renewals reuse it.
+
+```bash
+sudo install -m 0644 vendor_public_key.pem /etc/mlp-license-server/vendor_public_key.pem
+sudo install -o mlp-license-server -g mlp-license-server -m 0640 \
+  license.json /var/lib/mlp-license-server/license.json
+
+svc import-license /var/lib/mlp-license-server/license.json \
+    --runtime-root /var/lib/mlp-license-server \
+    --vendor-public-key /etc/mlp-license-server/vendor_public_key.pem
+```
+
+Import reports `license_state`. If it returns `expired` or `not_started` the
+license is active on the server but no seat will be granted until the term
+covers the current date.
+
+## 6. Start the service and verify
+
+Verify by the listening socket rather than the unit state.
+
+```bash
+sudo systemctl enable --now mlp-license-server
+ss -ltnp | grep 27850
+curl -s http://localhost:27850/api/v1/status
+```
+
+Expect `"ok": true` with the company name and seat count. `svc show-status`
+gives the fuller admin view, including `license_state`, the term, enabled
+features, and every active lease. Service logs go to the journal:
+`journalctl -u mlp-license-server`.
+
+## 7. Open the port for LAN clients
+
+```bash
+sudo ufw allow 27850/tcp          # Ubuntu / Debian
+sudo firewall-cmd --permanent --add-port=27850/tcp && sudo firewall-cmd --reload
+```
+
+Share the LAN URL with engineers, for example `http://mlp-license-01:27850`.

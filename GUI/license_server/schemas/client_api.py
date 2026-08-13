@@ -110,6 +110,7 @@ class ReleaseRequest(LicenseServerSchemaModel):
     """Release request sent during clean client shutdown."""
 
     lease_id: LeaseId
+    machine_id: MachineId
 
 
 class ReleaseResponse(LicenseServerSchemaModel):

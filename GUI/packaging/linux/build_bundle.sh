@@ -47,6 +47,17 @@ if [[ -z "$output_dir" ]]; then
   output_dir="$repo_root/artifacts/packaging/linux"
 fi
 
+# The launcher written below execs "$binary_name" out of app/, so a standalone
+# directory without it yields a bundle that cannot start. That is not theoretical:
+# when the Nuitka step fails, pyside6-deploy still leaves an empty .dist behind and
+# exits, and this script happily packaged it into a 690-byte tarball and reported
+# success -- a dead bundle that looks like a delivery.
+if [[ ! -f "$standalone_dir/$binary_name" ]]; then
+  echo "Standalone directory has no '$binary_name': $standalone_dir" >&2
+  echo "The GUI build did not complete. Refusing to package an unusable bundle." >&2
+  exit 1
+fi
+
 staging_root="$output_dir/$bundle_name"
 tarball_path="$output_dir/${bundle_name}-linux.tar.gz"
 desktop_template="$repo_root/packaging/linux/mlp-training-studio.desktop.in"
@@ -88,6 +99,11 @@ into either:
 EOF
 
 mkdir -p "$output_dir"
-tar -C "$output_dir" -czf "$tarball_path" "$bundle_name"
+# --mode='go-w' strips group and world write from every recorded member. It is a no-op
+# for a build on a native filesystem, and it is what makes a build run from a Windows
+# mount safe to ship: drvfs reports every file 0777 and silently ignores chmod, so the
+# staged tree cannot be corrected in place. u+x is preserved, which the launcher and the
+# Nuitka binary both need.
+tar -C "$output_dir" --mode='go-w' -czf "$tarball_path" "$bundle_name"
 
 echo "Linux bundle created at $tarball_path"

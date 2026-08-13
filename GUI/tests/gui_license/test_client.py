@@ -50,7 +50,7 @@ def test_http_client_calls_status_checkout_heartbeat_and_release(monkeypatch) ->
     status = client.get_status()
     checkout = client.checkout(identity)
     heartbeat = client.heartbeat(lease_id="lease_001", machine_id="gui_machine")
-    release = client.release(lease_id="lease_001")
+    release = client.release(lease_id="lease_001", machine_id="gui_machine")
 
     assert status.company_name == "Acme"
     assert checkout.granted is True
@@ -81,7 +81,28 @@ def test_http_client_calls_status_checkout_heartbeat_and_release(monkeypatch) ->
         (
             "http://license-host:27850/api/v1/release",
             "POST",
-            {"lease_id": "lease_001"},
+            {"lease_id": "lease_001", "machine_id": "gui_machine"},
             9.5,
         ),
     ]
+
+
+def test_release_result_carries_the_server_rejection_reason(monkeypatch) -> None:
+    def fake_urlopen(request, timeout: float):
+        return _FakeResponse(
+            {
+                "ok": False,
+                "reason_code": "machine_mismatch",
+                "message": "The lease is owned by a different machine_id.",
+            }
+        )
+
+    monkeypatch.setattr(license_client_module.urllib.request, "urlopen", fake_urlopen)
+
+    result = LicenseHttpClient("http://license-host:27850").release(
+        lease_id="lease_001", machine_id="gui_other_machine"
+    )
+
+    assert result.ok is False
+    assert result.reason_code == "machine_mismatch"
+    assert result.message == "The lease is owned by a different machine_id."

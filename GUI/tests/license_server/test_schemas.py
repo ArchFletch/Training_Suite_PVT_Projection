@@ -52,6 +52,7 @@ INVALID_MODEL_FIXTURES = [
     ("license_envelope_end_before_start.json", SignedLicenseEnvelope),
     ("checkout_request_bad_platform.json", CheckoutRequest),
     ("heartbeat_response_missing_reason.json", HeartbeatResponse),
+    ("release_request_missing_machine_id.json", ReleaseRequest),
     ("release_response_missing_reason.json", ReleaseResponse),
     ("status_response_active_missing_company.json", StatusResponse),
     ("status_response_overbooked.json", StatusResponse),
@@ -100,6 +101,11 @@ def test_invalid_model_fixtures_raise_validation_error(fixture_name: str, model_
 
     with pytest.raises(ValidationError):
         model_cls.model_validate(payload)
+
+
+def test_release_request_is_authenticated_like_a_heartbeat() -> None:
+    assert set(ReleaseRequest.model_fields) == set(HeartbeatRequest.model_fields)
+    assert ReleaseRequest.model_fields["machine_id"].is_required()
 
 
 def test_invalid_checkout_denial_reason_code_is_rejected() -> None:

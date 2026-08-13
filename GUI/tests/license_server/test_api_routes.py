@@ -7,6 +7,7 @@ from pathlib import Path
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from license_server.api.app import create_app
@@ -52,9 +53,7 @@ def _build_license(identity_payload: dict[str, object], *, private_key_pem: str,
     )
 
 
-def test_client_routes_cover_a_full_single_lease_flow(tmp_path: Path) -> None:
-    """A single desktop client should be able to status-check, lease, heartbeat, and release."""
-
+def _create_single_seat_app(tmp_path: Path) -> FastAPI:
     private_key_pem, public_key_pem = _generate_signing_keys()
     config = build_server_config(
         runtime_root=tmp_path / "server-runtime",
@@ -67,6 +66,14 @@ def test_client_routes_cover_a_full_single_lease_flow(tmp_path: Path) -> None:
     runtime.license_service.import_license(
         _build_license(identity.to_dict(), private_key_pem=private_key_pem, seat_count=1)
     )
+    return app
+
+
+def test_client_routes_cover_a_full_single_lease_flow(tmp_path: Path) -> None:
+    """A single desktop client should be able to status-check, lease, heartbeat, and release."""
+
+    app = _create_single_seat_app(tmp_path)
+    runtime = app.state.runtime
 
     with TestClient(app) as client:
         status_before = client.get("/api/v1/status")
@@ -124,7 +131,7 @@ def test_client_routes_cover_a_full_single_lease_flow(tmp_path: Path) -> None:
 
         release_response = client.post(
             "/api/v1/release",
-            json={"lease_id": checkout_payload["lease_id"]},
+            json={"lease_id": checkout_payload["lease_id"], "machine_id": "cli_7bde9f61"},
         )
         assert release_response.status_code == 200
         assert release_response.json() == {
@@ -142,3 +149,49 @@ def test_client_routes_cover_a_full_single_lease_flow(tmp_path: Path) -> None:
     assert "checkout_granted" in event_types
     assert "heartbeat_renewed" in event_types
     assert "lease_released" in event_types
+
+
+def test_release_route_refuses_a_lease_id_from_another_machine(tmp_path: Path) -> None:
+    """A stolen lease_id alone must not be enough to drop somebody else's seat."""
+
+    app = _create_single_seat_app(tmp_path)
+
+    with TestClient(app) as client:
+        checkout_payload = client.post(
+            "/api/v1/checkout",
+            json={
+                "product": "Surrogate Model Training Suite",
+                "product_version": "0.1.0",
+                "machine_id": "cli_7bde9f61",
+                "hostname": "eda-win-17",
+                "username": "jdoe",
+                "platform": "windows",
+            },
+        ).json()
+        assert checkout_payload["granted"] is True
+
+        anonymous_release = client.post(
+            "/api/v1/release",
+            json={"lease_id": checkout_payload["lease_id"]},
+        )
+        assert anonymous_release.status_code == 422
+
+        foreign_release = client.post(
+            "/api/v1/release",
+            json={"lease_id": checkout_payload["lease_id"], "machine_id": "cli_7bde9f62"},
+        )
+        assert foreign_release.status_code == 200
+        assert foreign_release.json() == {
+            "ok": False,
+            "reason_code": "machine_mismatch",
+            "message": "The lease is owned by a different machine_id.",
+        }
+
+        assert client.get("/api/v1/status").json()["seats_in_use"] == 1
+
+        owner_release = client.post(
+            "/api/v1/release",
+            json={"lease_id": checkout_payload["lease_id"], "machine_id": "cli_7bde9f61"},
+        )
+        assert owner_release.json()["ok"] is True
+        assert client.get("/api/v1/status").json()["seats_in_use"] == 0

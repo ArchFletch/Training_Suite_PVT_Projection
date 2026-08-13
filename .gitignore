@@ -32,7 +32,27 @@ Thumbs.db
 /gui_smoke_out.txt
 /nuitka-crash-report.xml
 /runtime/
-/license_vendor_issuance_log.jsonl
+
+# Vendor license issuance material.
+#
+# These are never tracked and never shipped. The signing key JSON carries the
+# raw Ed25519 private seed, so anyone holding it can mint unlimited licenses
+# against any server_id -- and the server verifies offline, so a leaked key
+# cannot be revoked. The issuance log is a cross-customer business record.
+#
+# The patterns are unanchored on purpose: license_vendor/README.md tells the
+# operator to run the commands with these exact filenames from whatever
+# directory they happen to be in, so a root-anchored rule would miss the file
+# one `cd` away. The earlier /license_vendor_issuance_log.jsonl rule matched
+# only the repo root and left vendor_signing_key.json uncovered entirely.
+vendor_signing_key.json
+*signing_key*.json
+vendor_public_key.pem
+license.json
+eval_license.json
+paid_license.json
+license_vendor_issuance_log.jsonl
+issuance_log.jsonl
 
 # Claude Code
 .claude/

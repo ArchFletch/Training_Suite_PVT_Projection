@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -22,6 +23,11 @@ DEFAULT_FEATURES = ("baseline", "transfer")
 DEFAULT_EVALUATION_NOTES = "14-day floating POC, non-production"
 DEFAULT_PAID_NOTES = "Paid floating term license"
 DEFAULT_ISSUANCE_LOG = "license_vendor_issuance_log.jsonl"
+
+# RFC 8410 fixes the Ed25519 SubjectPublicKeyInfo header, and the encoded body stays at 60
+# characters, below the 64-column PEM wrap. Building the PEM here keeps the vendor tool free of
+# the cryptography dependency that the pure-Python signer in signer.py already avoids.
+_ED25519_SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")
 
 
 def _normalize_cli_timestamp(value: str | None, *, boundary: str, default: datetime | None) -> str:
@@ -140,6 +146,38 @@ def _create_key(args: argparse.Namespace) -> int:
     return 0
 
 
+def _public_key_pem(public_key: bytes) -> str:
+    body = base64.b64encode(_ED25519_SPKI_PREFIX + public_key).decode("ascii")
+    return f"-----BEGIN PUBLIC KEY-----\n{body}\n-----END PUBLIC KEY-----\n"
+
+
+def _export_public_key(args: argparse.Namespace) -> int:
+    signing_key = load_signing_key(args.signing_key_file)
+    output_path = Path(args.output)
+    # The signing key is read before the output is written, so pointing --output at
+    # it would replace the only copy of the private seed with a public PEM. The two
+    # filenames differ by one word and sit in the same directory.
+    if output_path.resolve() == Path(args.signing_key_file).resolve():
+        raise SystemExit(
+            f"Refusing to overwrite the signing key at {output_path} with the public key. "
+            "Choose a different --output path, conventionally vendor_public_key.pem."
+        )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    # Written as bytes so the PEM keeps LF endings when it is issued on Windows and installed on
+    # a Linux server.
+    output_path.write_bytes(_public_key_pem(signing_key.public_key).encode("ascii"))
+    summary = {
+        "status": "ok",
+        "algorithm": signing_key.algorithm,
+        "key_id": signing_key.key_id,
+        "created_at": signing_key.created_at,
+        "output_path": str(output_path),
+        "public_key": signing_key.public_key_base64,
+    }
+    print(json.dumps(summary, ensure_ascii=True))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Construct the vendor CLI parser."""
 
@@ -153,6 +191,22 @@ def build_parser() -> argparse.ArgumentParser:
     create_key.add_argument("--key-id", required=True, help="Short identifier for the signing key.")
     create_key.add_argument("--output", required=True, help="Path to write the vendor signing key JSON.")
     create_key.set_defaults(handler=_create_key)
+
+    export_key = subparsers.add_parser(
+        "export-public-key",
+        help="Write the vendor public key as the SubjectPublicKeyInfo PEM the server verifies with.",
+    )
+    export_key.add_argument(
+        "--signing-key-file",
+        required=True,
+        help="Path to the vendor signing key JSON created by init-key.",
+    )
+    export_key.add_argument(
+        "--output",
+        required=True,
+        help="Path to write the vendor public key PEM sent to the customer.",
+    )
+    export_key.set_defaults(handler=_export_public_key)
 
     for command_name, license_type, default_days in (
         ("issue-eval", "evaluation", 14),
