@@ -56,10 +56,24 @@ fi
 "$python_bin" "${render_args[@]}"
 
 deploy_args=(-c "$spec_path" --name mlp-training-studio --keep-deployment-files --force --verbose)
-if command -v pyside6-deploy >/dev/null 2>&1; then
-  pyside6-deploy "${deploy_args[@]}"
+
+# Prefer the console script belonging to the interpreter we were told to build with.
+# `python -m PySide6.scripts.deploy` is not a usable entry point: deploy.py does a bare
+# `from deploy_lib import ...`, which only resolves because the console script puts its
+# own directory on sys.path. Probing the bare PATH is wrong for the same reason -- with
+# --python pointing at a venv it finds either nothing or another environment's copy, and
+# the old fallback then failed with "No module named 'deploy_lib'".
+python_bindir="$(dirname "$python_exe")"
+if [[ -x "$python_bindir/pyside6-deploy" ]]; then
+  deploy_bin="$python_bindir/pyside6-deploy"
+elif command -v pyside6-deploy >/dev/null 2>&1; then
+  deploy_bin="$(command -v pyside6-deploy)"
 else
-  "$python_bin" -m PySide6.scripts.deploy "${deploy_args[@]}"
+  echo "pyside6-deploy was not found next to $python_exe or on PATH." >&2
+  echo "Install PySide6 into that interpreter, or point --python at one that has it." >&2
+  exit 1
 fi
+
+"$deploy_bin" "${deploy_args[@]}"
 
 echo "Standalone Linux build completed. Inspect $output_dir for the deployment folder."

@@ -1,0 +1,97 @@
+# Runtime and test dependencies for the GUI and training side: launch_gui.py,
+# the top-level CLI wrappers, and xfmr_v2/.
+#
+# ONE COMMAND installs everything the test suite needs, run from this (GUI/)
+# directory:
+#
+#     pip install -r requirements.txt
+#
+# There is no second command to remember: the test section below pulls in the
+# license server's own pins with -r, so this file is installable-complete.
+# Note that this means a plain install also brings in the test stack (pytest and
+# the license-server libraries). That has always been true of this file -- pytest
+# was already unconditional here -- and it is the price of one reproducible
+# command. The runtime-only subset is everything above the "Test-only" divider.
+#
+# Packaging additionally needs Nuitka and, on Windows, Inno Setup 6. Those are
+# build-time tools used only by packaging/, never imported at runtime, so they
+# are deliberately not listed here.
+
+# ---------------------------------------------------------------------------
+# Supported interpreters: CPython 3.11 through 3.14.
+#
+# 3.11 is a hard floor, not a preference: license_server/service/config.py
+# imports tomllib unconditionally at module scope, and tomllib entered the
+# stdlib in 3.11. Both ends of the range are exercised in practice -- the
+# checked-in tests/__pycache__ carries both cpython-311 and cpython-314
+# bytecode.
+#
+# The floors below are the oldest versions that work on the OLDEST supported
+# interpreter (3.11). They are not claims of 3.14 support: numpy 1.24,
+# torch 2.3, PySide6 6.5 and matplotlib 3.7 all predate CPython 3.14 and
+# publish no 3.14 wheels. On 3.14 the resolver simply selects far newer
+# releases, which is intended -- do not read a floor as "known good on 3.14".
+#
+# Exactly one combination has been observed to work end to end (Linux venv,
+# CPython 3.14): PySide6 6.11.1, pyqtgraph 0.14.0, numpy 2.5.2 and
+# torch 2.13.0+cu130 installed cleanly, and `import xfmr_v2.gui_window`
+# succeeded headless under QT_QPA_PLATFORM=offscreen. No other interpreter or
+# version combination has been rehearsed.
+# ---------------------------------------------------------------------------
+
+numpy>=1.24
+PySide6>=6.5
+pyqtgraph>=0.13
+
+# No index-url is pinned here, so a plain `pip install -r requirements.txt`
+# gets whatever the default PyPI index serves -- on Linux that is the CPU-only
+# build. This file is otherwise the reproducible build recipe, so state the gap
+# plainly: if you need a GPU build, install torch first from the matching
+# PyTorch index and let this floor be satisfied by what is already present:
+#
+#     pip install torch --index-url https://download.pytorch.org/whl/cu130
+#
+# The observed-good 2.13.0+cu130 above carries a +cu130 local version tag,
+# which indicates it came from that CUDA index and not from default PyPI.
+torch>=2.3
+
+# Imported inside the plot helpers rather than at module scope, so grepping the
+# top of xfmr_v2/runner.py and xfmr_v2/search.py will not find it. That lazy
+# import is a startup-cost optimization, NOT an optionality guard: there is no
+# try/except around it, and xfmr_v2/runner.py calls _plot_loss and
+# _plot_frequency_mae unconditionally on every full training run (runner.py
+# lines 726-727), so a missing matplotlib is an ImportError partway through a
+# run that has already done its training. Hard runtime requirement.
+matplotlib>=3.7
+
+# Genuinely optional -- both are behind try/except ImportError. Without onnx,
+# xfmr_v2/gui_backend.py raises an actionable RuntimeError telling you to
+# install it; without onnxruntime, xfmr_v2/export_onnx.py prints a notice and
+# skips its numerical verification step. Uncomment to enable ONNX export.
+# onnx>=1.14
+# onnxruntime>=1.16
+
+# --- Test-only -------------------------------------------------------------
+# Nothing below this line is imported by the shipped GUI.
+
+# The license-server and vendor suites import fastapi, pydantic, cryptography
+# and typer. Include the server's pins directly rather than duplicating them in
+# prose or in a second list that would drift. pip resolves a nested -r path
+# relative to THIS file, not to the current working directory, so this works
+# from anywhere; the resolved target is GUI/license_server/requirements.txt,
+# which is present.
+-r license_server/requirements.txt
+
+pytest>=7.4
+
+# Supplies the `qtbot` fixture used by tests/test_gui_window.py and
+# tests/gui_license/test_gui_integration.py. pytest-qt is the distribution
+# name; its import name (pytestqt) never appears in the suite because pytest
+# loads it as a plugin via entry point, so an import grep will not find it.
+pytest-qt>=4.2
+
+# Required by fastapi.testclient.TestClient, used in
+# tests/license_server/test_api_routes.py. TestClient fails at construction
+# time if httpx is absent, and a plain `pip install fastapi` does not pull it
+# in, so it must be declared explicitly rather than assumed transitive.
+httpx>=0.27
