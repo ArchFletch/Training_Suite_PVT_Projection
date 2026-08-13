@@ -33,7 +33,7 @@ log_dir="/var/log/mlp-license-server"
 service_user="mlp-license-server"
 service_group="mlp-license-server"
 service_name="mlp-license-server"
-service_command="/opt/mlp-license-server/.venv/bin/python -m uvicorn license_server.main:app --host 0.0.0.0 --port 8090"
+service_command="/opt/mlp-license-server/.venv/bin/python -m uvicorn license_server.main:app --host 0.0.0.0 --port 27850"
 enable_service=0
 start_service=0
 
@@ -145,10 +145,17 @@ render_file() {
 
 if [[ ! -f "$config_path" ]]; then
   render_file "$config_template" "$config_path"
+  # The service reads this file as "$service_user", so it must be group-readable.
+  # Left root-owned and mode 0600 it is silently unreadable, and the server falls
+  # back to built-in lease defaults with no error.
+  chown "root:${service_group}" "$config_path"
   chmod 0640 "$config_path"
 fi
 
+# service.env is consumed by systemd as root before privileges are dropped, so
+# it deliberately stays root-only.
 render_file "$env_template" "$env_path"
+chown root:root "$env_path"
 chmod 0640 "$env_path"
 
 render_file "$unit_template" "$unit_path"

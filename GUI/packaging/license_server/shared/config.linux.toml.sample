@@ -1,22 +1,24 @@
-# Copy to /etc/mlp-license-server/config.toml and replace any remaining __...__ tokens.
-
-[server]
-host = "0.0.0.0"
-port = 8090
-
-[paths]
-data_dir = "__DATA_DIR__"
-log_dir = "__LOG_DIR__"
-database_path = "__DATA_DIR__/license.db"
-identity_path = "__DATA_DIR__/server_identity.json"
-license_path = "__DATA_DIR__/active_license.json"
-request_export_path = "__DATA_DIR__/license_request.json"
+# Rendered to /etc/mlp-license-server/config.toml by install_linux_service.sh.
+# The server reads this file from the path in MLP_LICENSE_SERVER_CONFIG.
+#
+# Only the [leases] section below is read. Two things are deliberately NOT
+# configured here, because they are owned elsewhere:
+#
+#   listening host and port
+#       Set in the uvicorn command in /etc/mlp-license-server/service.env
+#       (MLP_LICENSE_SERVER_COMMAND). Editing a port here would do nothing.
+#
+#   data, config and log locations
+#       Derived from the runtime root in MLP_LICENSE_SERVER_RUNTIME_DIR,
+#       which the systemd unit sets to /var/lib/mlp-license-server. That gives
+#       config in /etc/mlp-license-server, state in /var/lib/mlp-license-server
+#       (server_identity.json, active_license.json, license.db) and logs to
+#       journald -- read them with: journalctl -u mlp-license-server
 
 [leases]
+# How long a seat survives without a heartbeat.
 lease_ttl_seconds = 120
+# How often a running desktop client renews its seat.
 heartbeat_interval_seconds = 30
+# How long a client may keep working after heartbeats start failing.
 heartbeat_grace_seconds = 300
-
-[logging]
-level = "INFO"
-format = "text"

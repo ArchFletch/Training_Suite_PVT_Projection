@@ -90,6 +90,8 @@ class LicenseImportResult(JsonRecord):
     imported_at: str | None = None
     evicted_lease_ids: tuple[str, ...] = ()
     message: str | None = None
+    license_state: str | None = None
+    warning: str | None = None
 
 
 @dataclass(frozen=True)
