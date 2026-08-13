@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import platform as runtime_platform
+import tomllib
 
 from license_server.schemas import PRODUCT_NAME
 
@@ -13,6 +14,9 @@ from license_server.schemas import PRODUCT_NAME
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 30
 DEFAULT_LEASE_TTL_SECONDS = 120
 DEFAULT_GRACE_SECONDS = 300
+
+CONFIG_FILENAME = "config.toml"
+CONFIG_PATH_ENV = "MLP_LICENSE_SERVER_CONFIG"
 
 
 @dataclass(frozen=True)
@@ -80,6 +84,19 @@ def recommended_system_config_root(os_family: str, runtime_root: Path) -> Path:
     return runtime_root
 
 
+def recommended_system_log_root(os_family: str, runtime_root: Path) -> Path:
+    """Return the production log root, matching what the installers create.
+
+    On Linux the service bundle creates `/var/log/mlp-license-server`; keeping
+    the resolved path in step with it avoids an empty directory that looks like
+    the place to find logs but never receives any.
+    """
+
+    if os_family == "linux" and runtime_root == Path("/var/lib/mlp-license-server"):
+        return Path("/var/log/mlp-license-server")
+    return runtime_root / "logs"
+
+
 def resolve_server_paths(
     *,
     runtime_root: Path | str | None = None,
@@ -106,7 +123,7 @@ def resolve_server_paths(
     if root_text == system_root_text:
         config_dir = recommended_system_config_root(normalized_os, root_path)
         data_dir = root_path
-        logs_dir = root_path / "logs"
+        logs_dir = recommended_system_log_root(normalized_os, root_path)
     else:
         config_dir = root_path / "config"
         data_dir = root_path / "data"
@@ -133,27 +150,79 @@ def ensure_runtime_directories(paths: ServerPaths) -> None:
     paths.logs_dir.mkdir(parents=True, exist_ok=True)
 
 
+def resolve_config_path(config_dir: Path) -> Path:
+    """Return the config file the server should read for this deployment."""
+
+    override = os.environ.get(CONFIG_PATH_ENV, "").strip()
+    if override:
+        return Path(override).expanduser()
+    return config_dir / CONFIG_FILENAME
+
+
+def load_lease_settings(config_path: Path) -> dict[str, int]:
+    """Read the `[leases]` block from a deployment config file.
+
+    A missing, unreadable, or malformed file yields no overrides so the server
+    still starts on documented defaults rather than refusing to run.
+    """
+
+    try:
+        with config_path.open("rb") as handle:
+            document = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+
+    leases = document.get("leases")
+    if not isinstance(leases, dict):
+        return {}
+
+    supported = {
+        "heartbeat_interval_seconds": "heartbeat_interval_seconds",
+        "lease_ttl_seconds": "lease_ttl_seconds",
+        "heartbeat_grace_seconds": "grace_seconds",
+    }
+    settings: dict[str, int] = {}
+    for file_key, config_key in supported.items():
+        value = leases.get(file_key)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            settings[config_key] = value
+    return settings
+
+
 def build_server_config(
     *,
     runtime_root: Path | str | None = None,
     os_family: str | None = None,
     vendor_public_key_pem: str = "",
-    heartbeat_interval_seconds: int = DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
-    lease_ttl_seconds: int = DEFAULT_LEASE_TTL_SECONDS,
-    grace_seconds: int = DEFAULT_GRACE_SECONDS,
+    heartbeat_interval_seconds: int | None = None,
+    lease_ttl_seconds: int | None = None,
+    grace_seconds: int | None = None,
     product: str = PRODUCT_NAME,
     start_path: Path | None = None,
 ) -> ServerConfig:
-    """Build a normalized config object for the service layer and tests."""
+    """Build a normalized config object for the service layer and tests.
+
+    Lease timings resolve as: explicit argument, then the `[leases]` block of
+    the deployment config file, then the documented defaults.
+    """
 
     normalized_os = detect_os_family(os_family)
     paths = resolve_server_paths(runtime_root=runtime_root, os_family=normalized_os, start_path=start_path)
+    from_file = load_lease_settings(resolve_config_path(paths.config_dir))
+
+    def resolve(name: str, explicit: int | None, fallback: int) -> int:
+        if explicit is not None:
+            return explicit
+        return from_file.get(name, fallback)
+
     return ServerConfig(
         product=product,
         os_family=normalized_os,
         vendor_public_key_pem=vendor_public_key_pem,
-        heartbeat_interval_seconds=heartbeat_interval_seconds,
-        lease_ttl_seconds=lease_ttl_seconds,
-        grace_seconds=grace_seconds,
+        heartbeat_interval_seconds=resolve(
+            "heartbeat_interval_seconds", heartbeat_interval_seconds, DEFAULT_HEARTBEAT_INTERVAL_SECONDS
+        ),
+        lease_ttl_seconds=resolve("lease_ttl_seconds", lease_ttl_seconds, DEFAULT_LEASE_TTL_SECONDS),
+        grace_seconds=resolve("grace_seconds", grace_seconds, DEFAULT_GRACE_SECONDS),
         paths=paths,
     )

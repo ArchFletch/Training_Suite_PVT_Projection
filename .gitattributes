@@ -1,0 +1,21 @@
+# Normalize line endings in the repository to LF.
+#
+# Without this, a Windows checkout with core.autocrlf=true rewrites every
+# tracked text file to CRLF. Shell scripts, systemd unit templates and
+# environment files copied from such a checkout to Linux then fail:
+#   install_linux_service.sh: line 2: set: pipefail: invalid option name
+# and a rendered systemd unit gets a trailing CR on every value, so
+# "User=mlp-license-server\r" is not a valid user.
+* text=auto eol=lf
+
+# Windows batch files are the one case that genuinely needs CRLF: cmd.exe can
+# mis-handle labels and goto in LF-only .bat/.cmd files.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary assets must never be line-ending converted.
+*.png binary
+*.ico binary
+*.npz binary
+*.pt binary
+*.onnx binary

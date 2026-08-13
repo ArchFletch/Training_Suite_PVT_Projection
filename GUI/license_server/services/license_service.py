@@ -16,6 +16,27 @@ from license_server.service import ServerConfig, coerce_utc_datetime, format_utc
 from .exceptions import LicenseImportError
 
 
+LICENSE_STATE_ACTIVE = "active"
+LICENSE_STATE_EXPIRED = "expired"
+LICENSE_STATE_NOT_STARTED = "not_started"
+LICENSE_STATE_NONE = "none"
+
+
+def resolve_license_state(payload, *, now: str) -> str:
+    """Classify an imported license against the current time.
+
+    Term validity is deliberately separate from signature validity: a license
+    can verify perfectly and still be outside its window.
+    """
+
+    current_time = coerce_utc_datetime(now)
+    if current_time < coerce_utc_datetime(payload.starts_at):
+        return LICENSE_STATE_NOT_STARTED
+    if current_time > coerce_utc_datetime(payload.ends_at):
+        return LICENSE_STATE_EXPIRED
+    return LICENSE_STATE_ACTIVE
+
+
 class LicenseService:
     """Manage active-license persistence, verification, and status rules."""
 
@@ -86,6 +107,8 @@ class LicenseService:
                         },
                     )
 
+            license_state = resolve_license_state(license_payload, now=imported_at)
+
             self.repository.add_audit_event(
                 connection,
                 event_type="license_imported",
@@ -95,16 +118,36 @@ class LicenseService:
                     "license_type": license_payload.license_type,
                     "seat_count": license_payload.seat_count,
                     "evicted_lease_ids": evicted_ids,
+                    "license_state": license_state,
                 },
             )
 
         self._write_json(self.config.paths.active_license_path, imported_license.envelope.to_dict())
+
+        # A license can verify perfectly and still be outside its term. Saying so
+        # here is the difference between an admin fixing it now and every user
+        # being blocked at launch with no explanation.
+        warning = None
+        if license_state == LICENSE_STATE_EXPIRED:
+            warning = (
+                f"This license ended at {license_payload.ends_at} and is already expired. "
+                "It is now the active license, but every seat request will be denied "
+                "until a license covering the current date is imported."
+            )
+        elif license_state == LICENSE_STATE_NOT_STARTED:
+            warning = (
+                f"This license does not start until {license_payload.starts_at}. "
+                "Seat requests will be denied until then."
+            )
+
         return LicenseImportResult(
             ok=True,
             license_id=imported_license.payload.license_id,
             imported_at=imported_at,
             evicted_lease_ids=tuple(evicted_ids),
             message="License imported successfully.",
+            license_state=license_state,
+            warning=warning,
         )
 
     def get_active_license(self, connection: sqlite3.Connection | None = None) -> ImportedLicense | None:
@@ -180,17 +223,28 @@ class LicenseService:
         with self.session_factory.session() as connection:
             imported_license = self.repository.get_active_license(connection)
             seats_in_use = self.repository.count_active_leases(connection, now=current_time)
+
+        inactive = StatusResponse(
+            ok=False,
+            product=self.config.product,
+            company_name=None,
+            license_type=None,
+            starts_at=None,
+            ends_at=None,
+            seat_count=0,
+            seats_in_use=0,
+        )
         if imported_license is None:
-            return StatusResponse(
-                ok=False,
-                product=self.config.product,
-                company_name=None,
-                license_type=None,
-                starts_at=None,
-                ends_at=None,
-                seat_count=0,
-                seats_in_use=0,
-            )
+            return inactive
+
+        # `ok` means "this server can grant a seat right now". An imported but
+        # out-of-term license cannot, so reporting it as ok would tell the GUI
+        # connection test that everything is fine while every checkout fails.
+        # The wire contract requires the license fields be omitted when not ok;
+        # the admin CLI still surfaces the full term and the reason.
+        if resolve_license_state(imported_license.payload, now=current_time) != LICENSE_STATE_ACTIVE:
+            return inactive
+
         payload = imported_license.payload
         return StatusResponse(
             ok=True,

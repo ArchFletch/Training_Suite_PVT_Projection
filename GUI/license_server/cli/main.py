@@ -11,6 +11,11 @@ import typer
 from license_server.schemas import SignedLicense
 from license_server.service import LicenseServerRuntime, build_server_config, create_runtime, format_utc_datetime, utc_now
 from license_server.services import LicenseImportError
+from license_server.services.license_service import (
+    LICENSE_STATE_ACTIVE,
+    LICENSE_STATE_NONE,
+    resolve_license_state,
+)
 
 
 app = typer.Typer(
@@ -58,27 +63,37 @@ def _fail(message: str, *, exit_code: int = 1) -> None:
 
 def _build_admin_status(runtime: LicenseServerRuntime) -> dict[str, object]:
     now = format_utc_datetime(utc_now())
-    status = runtime.license_service.get_status(now=now).to_dict()
     with runtime.session_factory.session() as connection:
         identity = runtime.repository.get_server_identity(connection)
         active_license = runtime.repository.get_active_license(connection)
         active_leases = runtime.repository.list_active_leases(connection, now=now)
+        seats_in_use = runtime.repository.count_active_leases(connection, now=now)
+
+    # The client-facing status omits license detail whenever a seat cannot be
+    # granted. The admin needs the opposite: the term and the reason are exactly
+    # what explains an outage, so read them from the payload directly.
+    payload = active_license.payload if active_license is not None else None
+    license_state = (
+        resolve_license_state(payload, now=now) if payload is not None else LICENSE_STATE_NONE
+    )
 
     return {
         "ok": True,
         "runtime_root": str(runtime.config.paths.runtime_root),
         "data_dir": str(runtime.config.paths.data_dir),
         "license_loaded": active_license is not None,
+        "license_state": license_state,
+        "can_grant_seats": license_state == LICENSE_STATE_ACTIVE,
         "identity": identity.to_dict() if identity is not None else None,
-        "license_id": active_license.payload.license_id if active_license is not None else None,
-        "product": status["product"],
-        "company_name": status.get("company_name"),
-        "license_type": status.get("license_type"),
-        "starts_at": status.get("starts_at"),
-        "ends_at": status.get("ends_at"),
-        "seat_count": status["seat_count"],
-        "seats_in_use": status["seats_in_use"],
-        "features": list(active_license.payload.features) if active_license is not None else [],
+        "license_id": payload.license_id if payload is not None else None,
+        "product": runtime.config.product,
+        "company_name": payload.company_name if payload is not None else None,
+        "license_type": payload.license_type if payload is not None else None,
+        "starts_at": format_utc_datetime(payload.starts_at) if payload is not None else None,
+        "ends_at": format_utc_datetime(payload.ends_at) if payload is not None else None,
+        "seat_count": payload.seat_count if payload is not None else 0,
+        "seats_in_use": seats_in_use,
+        "features": list(payload.features) if payload is not None else [],
         "active_leases": [lease.to_dict() for lease in active_leases],
     }
 
@@ -174,9 +189,13 @@ def import_license(
             "imported_at": result.imported_at,
             "evicted_lease_ids": list(result.evicted_lease_ids),
             "message": result.message,
+            "license_state": result.license_state,
+            "warning": result.warning,
             "license": imported_license.payload.to_dict() if imported_license is not None else None,
         }
     )
+    if result.warning:
+        typer.secho(f"WARNING: {result.warning}", err=True, fg=typer.colors.YELLOW)
 
 
 @app.command("show-status")
