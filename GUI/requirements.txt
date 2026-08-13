@@ -64,12 +64,22 @@ torch>=2.3
 # run that has already done its training. Hard runtime requirement.
 matplotlib>=3.7
 
-# Genuinely optional -- both are behind try/except ImportError. Without onnx,
-# xfmr_v2/gui_backend.py raises an actionable RuntimeError telling you to
-# install it; without onnxruntime, xfmr_v2/export_onnx.py prints a notice and
-# skips its numerical verification step. Uncomment to enable ONNX export.
-# onnx>=1.14
-# onnxruntime>=1.16
+# ONNX export. Optional for a source checkout -- all three are behind
+# try/except ImportError, so without onnx xfmr_v2/gui_backend.py raises an
+# actionable RuntimeError and without onnxruntime xfmr_v2/export_onnx.py skips
+# its numerical verification step. They are NOT optional for a packaged build:
+# the MATLAB helpers under matlab/ consume exported models, so the Export to
+# ONNX button is customer-facing and must work in the shipped app.
+onnx>=1.14
+onnxruntime>=1.16
+
+# Required by torch >= 2.6, and easy to miss. torch.onnx.export now routes
+# through the dynamo exporter, which imports onnxscript internally -- so
+# installing onnx alone still fails at export time with
+# "ModuleNotFoundError: No module named 'onnxscript'", raised from inside torch
+# rather than from any import in this repository. There is no try/except on that
+# path, so ONNX export is dead without it.
+onnxscript>=0.1
 
 # --- Test-only -------------------------------------------------------------
 # Nothing below this line is imported by the shipped GUI.

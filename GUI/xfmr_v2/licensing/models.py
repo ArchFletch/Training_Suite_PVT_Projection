@@ -15,6 +15,13 @@ from typing import Any
 PRODUCT_NAME = "Surrogate Model Training Suite"
 DEFAULT_PRODUCT_VERSION = "desktop"
 
+# Shown wherever no seat is held. Worded as a requirement rather than an option:
+# licensing is enforced, so "enter a URL to enable checkout" would misdescribe it.
+LICENSE_REQUIRED_MESSAGE = (
+    "A license server is required. Enter your server URL, then click Acquire Seat "
+    "to check out a seat before starting a run."
+)
+
 
 def normalize_server_url(server_url: str) -> str:
     """Normalize a configured server URL into a stable form."""
@@ -228,7 +235,7 @@ class LicenseLeaseState:
     phase: str = "unconfigured"
     badge_text: str = "Unconfigured"
     server_url: str = ""
-    message: str = "Enter a license server URL to enable floating-seat checkout."
+    message: str = LICENSE_REQUIRED_MESSAGE
     last_status: LicenseStatus | None = None
     lease_id: str | None = None
     machine_id: str | None = None
@@ -251,7 +258,19 @@ class LicenseLeaseState:
 
     @property
     def can_start_runs(self) -> bool:
-        return (not self.licensing_enabled) or self.phase == "checked_out"
+        """Whether a new training run may start.
+
+        Fail closed: a healthy seat is required, always. This previously read
+        ``(not self.licensing_enabled) or self.phase == "checked_out"``, so a user
+        who simply never filled in the server URL got unlimited unlicensed use --
+        the product shipped ungated by default rather than by decision.
+
+        Grace deliberately does not qualify. ``heartbeat_warning`` lets a run
+        already in flight finish, but starting new work on a lease the server has
+        stopped confirming would let one seat quietly become many.
+        """
+
+        return self.phase == "checked_out"
 
     @property
     def seat_summary(self) -> str:

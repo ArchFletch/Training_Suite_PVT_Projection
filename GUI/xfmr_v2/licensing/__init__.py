@@ -10,6 +10,7 @@ from .client import (
 from .controller import LicenseLeaseController
 from .models import (
     DEFAULT_PRODUCT_VERSION,
+    LICENSE_REQUIRED_MESSAGE,
     PRODUCT_NAME,
     LicenseCheckoutResult,
     LicenseHeartbeatResult,
@@ -23,6 +24,7 @@ from .models import (
 
 __all__ = [
     "DEFAULT_PRODUCT_VERSION",
+    "LICENSE_REQUIRED_MESSAGE",
     "PRODUCT_NAME",
     "LicenseCheckoutResult",
     "LicenseClientError",

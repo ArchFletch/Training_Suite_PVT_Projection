@@ -29,7 +29,30 @@ def gui_window(qtbot, monkeypatch: pytest.MonkeyPatch):
     qtbot.addWidget(window)
     window.show()
     qtbot.wait(50)
+    _grant_test_seat(window)
     return window
+
+
+def _grant_test_seat(window) -> None:
+    """Put the window in a licensed state so run-gated tests can reach their subject.
+
+    Licensing fails closed, so without a seat every start_* call stops at the
+    licence warning and tests of validation, training and export would silently
+    assert against the wrong message. This drives the real gate rather than
+    stubbing it, so a regression in _license_allows_new_runs still shows up here;
+    the gate's own behaviour is covered in tests/gui_license.
+    """
+    from dataclasses import replace
+
+    server_url = "http://license-test:27850"
+    window.license_server_url_edit.setText(server_url)
+    window.license_lease_state = replace(
+        window.license_lease_state,
+        phase="checked_out",
+        badge_text="Checked Out",
+        server_url=server_url,
+        lease_id="lease_test",
+    )
 
 
 def test_window_auto_detects_devices_and_selects_first(gui_window) -> None:
