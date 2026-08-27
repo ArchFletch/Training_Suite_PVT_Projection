@@ -19,7 +19,14 @@ from typing import Any
 import numpy as np
 import torch
 
-from .data import CACHE_PATH, DATA_ROOT, design_split_indices, ensure_cache, split_indices
+from .data import (
+    CACHE_PATH,
+    DATA_ROOT,
+    design_split_indices,
+    ensure_cache,
+    resolve_split_fractions,
+    split_indices,
+)
 from .progress import ProgressCallback, StopChecker, emit_progress, request_stop
 from .runner import TrainConfig
 
@@ -44,6 +51,10 @@ class SuggestConfig:
     split_design_columns: list[str] | None = None
     max_samples: int | None = None
     variance_threshold: float = 0.95
+    # Same meaning as ``TrainConfig.eval_dataset_path``. Only its presence matters
+    # here: it merges the internal test fold into training, which changes the train
+    # count that drives the epoch and capacity tiers below.
+    eval_dataset_path: str | None = None
 
 
 def suggest_initial_settings(
@@ -99,18 +110,21 @@ def suggest_initial_settings(
     # the information a real training pipeline should legitimately use. The split mode
     # must match the recommended run's, or the persisted diagnostics (split sizes,
     # train-count-driven epoch/capacity tiers) would describe a split it never uses.
+    train_frac, val_frac = resolve_split_fractions(
+        config.train_frac, config.val_frac, bool(config.eval_dataset_path)
+    )
     if config.split_corner_columns or config.split_design_columns:
         split = design_split_indices(
             features,
             input_feature_names,
             config.split_corner_columns,
-            config.train_frac,
-            config.val_frac,
+            train_frac,
+            val_frac,
             config.seed,
             config.split_design_columns,
         )
     else:
-        split = split_indices(len(features), config.train_frac, config.val_frac, config.seed)
+        split = split_indices(len(features), train_frac, val_frac, config.seed)
     train_features_raw = features[split["train"]]
     # Match the training pipeline's active-feature criterion (data.py / runner.py):
     # max != min keeps features with tiny but meaningful SI-unit values (e.g.
@@ -263,8 +277,8 @@ def _validate_suggest_config(config: SuggestConfig) -> None:
         raise ValueError("train_frac must be between 0 and 1.")
     if not 0.0 <= config.val_frac < 1.0:
         raise ValueError("val_frac must be between 0 and 1.")
-    if config.train_frac + config.val_frac >= 1.0:
-        raise ValueError("train_frac + val_frac must leave room for a test split.")
+    if config.train_frac + config.val_frac > 1.0:
+        raise ValueError("train_frac + val_frac must not exceed 1.0.")
     if not 0.5 < config.variance_threshold < 1.0:
         raise ValueError("variance_threshold must be between 0.5 and 1.0.")
 

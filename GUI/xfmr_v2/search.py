@@ -329,8 +329,8 @@ def _validate_search_config(config: SearchConfig, objective: str) -> None:
         raise ValueError("train_frac must be between 0 and 1.")
     if not 0.0 <= config.val_frac < 1.0:
         raise ValueError("val_frac must be between 0 and 1.")
-    if config.train_frac + config.val_frac >= 1.0:
-        raise ValueError("train_frac + val_frac must leave room for a test split.")
+    if config.train_frac + config.val_frac > 1.0:
+        raise ValueError("train_frac + val_frac must not exceed 1.0.")
     if objective not in {"balanced", "best_accuracy", "fastest_acceptable"}:
         raise ValueError(f"Unsupported objective: {config.objective}")
 

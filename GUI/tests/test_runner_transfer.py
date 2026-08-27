@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from time import perf_counter
 
+import pytest
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -510,7 +511,10 @@ def test_stop_during_external_eval_keeps_the_trained_run(tmp_path, monkeypatch) 
 
     def cancel_on_external(*args, **kwargs):
         calls["count"] += 1
-        if calls["count"] == 2:  # 1st call = internal test fold, 2nd = external set
+        # Setting eval_dataset_path merges the internal test fold into training, so
+        # the internal evaluation is skipped entirely and the external scoring is
+        # the ONLY _eval_metrics call this run makes.
+        if calls["count"] == 1:
             raise runner.RunCancelled()
         return real_eval_metrics(*args, **kwargs)
 
@@ -620,3 +624,155 @@ def test_design_columns_split_flows_through_baseline_and_transfer(tmp_path) -> N
     transfer_ready = next(e for e in transfer_events if e["event"] == "data_ready")
     assert transfer_ready["data"]["train_samples"] == 54
     assert transfer_ready["data"]["test_samples"] == 12
+
+
+def test_eval_dataset_path_merges_the_test_fold_into_training(tmp_path) -> None:
+    """An External Eval Set hands the internal test rows back to training.
+
+    The 72-row cache splits 57/7/8 at the default 0.8/0.1. With an eval set the
+    test share goes to train instead: 64/8/0, and every internal metric, plot and
+    summary key disappears because there is no fold left to measure.
+    """
+    from pathlib import Path
+
+    cache_path = tmp_path / "pvt_cache.npz"
+    _write_pvt_cache(cache_path)
+    eval_path = tmp_path / "holdout.npz"
+    _write_external_eval(eval_path)
+
+    events: list[dict[str, object]] = []
+    summary = runner.train_baseline(
+        runner.TrainConfig(
+            data_root=str(tmp_path),
+            cache_path=str(cache_path),
+            output_dir=str(tmp_path / "runs/merged"),
+            eval_dataset_path=str(eval_path),
+            width=8, depth=2, epochs=1, batch_size=16, use_amp=False, device="cpu",
+        ),
+        show_progress=False,
+        progress_callback=events.append,
+    )
+
+    data_ready = next(e for e in events if e["event"] == "data_ready")
+    assert data_ready["data"]["train_samples"] == 64
+    assert data_ready["data"]["val_samples"] == 8
+    assert data_ready["data"]["test_samples"] == 0
+    assert data_ready["data"]["test_fold_merged_into_train"] is True
+    assert data_ready["data"]["effective_train_frac"] == pytest.approx(0.9)
+    # The run has to SAY it merged, or summary.json's train_frac 0.8 misleads.
+    assert "merged" in str(data_ready["message"])
+
+    # The internal fold produced nothing.
+    assert "test_loss" not in summary
+    assert "average_test_mae" not in summary
+    assert "test_frequency_mae_plot_path" not in summary
+    assert not (Path(summary["run_dir"]) / "test_frequency_mae.png").exists()
+    assert not (Path(summary["run_dir"]) / "test_sample_plots").exists()
+    # The external one did.
+    assert summary["average_external_mae"] > 0
+    # And the audit trail records the split actually used, not the one requested.
+    assert summary["effective_train_frac"] == pytest.approx(0.9)
+    assert summary["test_fold_merged_into_train"] is True
+    assert (summary["train_samples"], summary["val_samples"], summary["test_samples"]) == (64, 8, 0)
+
+
+def test_no_eval_dataset_path_keeps_the_test_fold(tmp_path) -> None:
+    """Regression guard: without an eval set the split is untouched."""
+    cache_path = tmp_path / "pvt_cache.npz"
+    _write_pvt_cache(cache_path)
+
+    events: list[dict[str, object]] = []
+    summary = runner.train_baseline(
+        runner.TrainConfig(
+            data_root=str(tmp_path),
+            cache_path=str(cache_path),
+            output_dir=str(tmp_path / "runs/unmerged"),
+            width=8, depth=2, epochs=1, batch_size=16, use_amp=False, device="cpu",
+        ),
+        show_progress=False,
+        progress_callback=events.append,
+    )
+    data_ready = next(e for e in events if e["event"] == "data_ready")
+    assert (data_ready["data"]["train_samples"], data_ready["data"]["val_samples"],
+            data_ready["data"]["test_samples"]) == (57, 7, 8)
+    assert data_ready["data"]["test_fold_merged_into_train"] is False
+    assert "test_loss" in summary
+    assert summary["effective_train_frac"] == pytest.approx(0.8)
+
+
+def test_eval_dataset_path_skips_the_internal_evaluation_events(tmp_path) -> None:
+    """No test fold means evaluation_skipped, never evaluation_completed."""
+    cache_path = tmp_path / "pvt_cache.npz"
+    _write_pvt_cache(cache_path)
+    eval_path = tmp_path / "holdout.npz"
+    _write_external_eval(eval_path)
+
+    events: list[dict[str, object]] = []
+    runner.train_baseline(
+        runner.TrainConfig(
+            data_root=str(tmp_path), cache_path=str(cache_path),
+            output_dir=str(tmp_path / "runs/events"), eval_dataset_path=str(eval_path),
+            width=8, depth=2, epochs=1, batch_size=16, use_amp=False, device="cpu",
+        ),
+        show_progress=False, progress_callback=events.append,
+    )
+    names = [e["event"] for e in events]
+    assert "evaluation_skipped" in names
+    assert "evaluation_completed" not in names
+    assert "external_evaluation_completed" in names
+    skipped = next(e for e in events if e["event"] == "evaluation_skipped")
+    # The message must blame the eval set, not the user's fractions.
+    assert "External Eval Set" in str(skipped["message"])
+
+
+def test_eval_dataset_path_with_design_split_keeps_designs_whole(tmp_path) -> None:
+    """The merge moves whole designs, it does not break the design grouping."""
+    cache_path = tmp_path / "pvt_cache.npz"
+    _write_pvt_cache(cache_path)
+    eval_path = tmp_path / "holdout.npz"
+    _write_external_eval(eval_path)
+
+    events: list[dict[str, object]] = []
+    runner.train_baseline(
+        runner.TrainConfig(
+            data_root=str(tmp_path), cache_path=str(cache_path),
+            output_dir=str(tmp_path / "runs/merged_design"), eval_dataset_path=str(eval_path),
+            split_corner_columns=["Temp_C", "VDD"],
+            width=8, depth=2, epochs=1, batch_size=16, use_amp=False, device="cpu",
+        ),
+        show_progress=False, progress_callback=events.append,
+    )
+    data_ready = next(e for e in events if e["event"] == "data_ready")
+    # 12 designs: 9/1/2 becomes 10/2/0 - the 2 test designs move to train and
+    # validation grows, because 0.9/0.1 rounds differently than 0.8/0.1.
+    assert data_ready["data"]["design_counts"] == {"train": 10, "val": 2, "test": 0}
+    assert data_ready["data"]["test_samples"] == 0
+
+
+def test_self_transfer_rejects_an_empty_test_fold(tmp_path) -> None:
+    """Transfer scores only its internal fold, so it must refuse to lose it."""
+    cache_path = tmp_path / "pvt_cache.npz"
+    _write_pvt_cache(cache_path)
+    with pytest.raises(ValueError, match="internal test fold"):
+        runner.run_self_transfer(
+            runner.TransferConfig(
+                cache_path=str(cache_path),
+                output_dir=str(tmp_path / "runs/transfer_no_test"),
+                train_frac=0.9, val_frac=0.1,
+                width=8, depth=2, num_bands=2, iterations=1, transfer_epochs=1,
+                batch_size=16, use_amp=False, device="cpu",
+            ),
+            show_progress=False,
+        )
+
+
+def test_eval_loss_rejects_an_empty_validation_loader() -> None:
+    """An empty val fold must raise, not report a perfect 0.0 loss."""
+    import torch
+    from torch.utils.data import DataLoader, TensorDataset
+
+    loader = DataLoader(TensorDataset(torch.zeros((0, 3)), torch.zeros((0, 2, 4))), batch_size=4)
+    model = runner.build_model("SpectraNet", input_feature_dim=3, ground_truth_channels=2,
+                               num_frequencies=4, width=8, depth=2)
+    with pytest.raises(ValueError, match="validation split is empty"):
+        runner._eval_loss(model, loader, torch.device("cpu"), amp=False)

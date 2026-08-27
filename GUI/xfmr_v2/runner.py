@@ -28,7 +28,15 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from .data import CACHE_PATH, DATA_ROOT, design_split_indices, ensure_cache, load_split_bundle, split_indices
+from .data import (
+    CACHE_PATH,
+    DATA_ROOT,
+    design_split_indices,
+    ensure_cache,
+    load_split_bundle,
+    resolve_split_fractions,
+    split_indices,
+)
 from .model import SpectraHydra, SpectraHydraProj, SpectraNet
 from .progress import ProgressCallback, RunCancelled, StopChecker, emit_progress, request_stop
 
@@ -397,6 +405,14 @@ def run_baseline_trial(
             message="Loading cached arrays and building the train / validation / test split.",
             **_progress_data(event_context, cache_path=str(cache_path)),
         )
+        # An External Eval Set supplies the accuracy number, so the internal test
+        # fold is redundant and its rows go to training instead. Keyed on the field
+        # being set, not on the file loading, because the split is built here and
+        # the file is only read further down.
+        merge_test_into_train = bool(config.eval_dataset_path)
+        effective_train_frac, _ = resolve_split_fractions(
+            config.train_frac, config.val_frac, merge_test_into_train
+        )
         bundle = load_split_bundle(
             cache_path=cache_path,
             batch_size=config.batch_size,
@@ -407,6 +423,7 @@ def run_baseline_trial(
             pin_memory=device.type == "cuda",
             split_corner_columns=config.split_corner_columns,
             split_design_columns=config.split_design_columns,
+            merge_test_into_train=merge_test_into_train,
         )
         if bundle.design_counts is not None:
             data_ready_message = (
@@ -417,6 +434,14 @@ def run_baseline_trial(
             )
         else:
             data_ready_message = "Training data split and normalization are ready."
+        if merge_test_into_train:
+            # The recorded train_frac is the requested one, so the log has to name
+            # the fraction actually trained on or the run looks like a plain 0.8 run.
+            data_ready_message += (
+                f" External Eval Set configured, so the internal test fold was merged "
+                f"into training: train fraction {config.train_frac:g} -> "
+                f"{effective_train_frac:g}, no test fold."
+            )
         emit_progress(
             progress_callback,
             event="data_ready",
@@ -427,6 +452,8 @@ def run_baseline_trial(
                 train_samples=int(len(bundle.split_indices["train"])),
                 val_samples=int(len(bundle.split_indices["val"])),
                 test_samples=int(len(bundle.split_indices["test"])),
+                effective_train_frac=float(effective_train_frac),
+                test_fold_merged_into_train=bool(merge_test_into_train),
                 design_counts=bundle.design_counts,
                 active_input_feature_names=bundle.active_names,
                 dropped_input_feature_names=bundle.dropped_names,
@@ -578,40 +605,65 @@ def run_baseline_trial(
         model.load_state_dict(best_state)
         # Stage 5: evaluate the best checkpoint on the requested split.
         evaluation_loader = _select_loader(bundle, evaluation_split)
-        evaluation_loss, evaluation_mae, freq_mae, per_channel_mae = _eval_metrics(
-            model,
-            evaluation_loader,
-            device,
-            amp,
-            should_stop=should_stop,
-            target_mean=bundle.target_mean,
-            target_std=bundle.target_std,
-            channel_transforms=bundle.channel_transforms,
-            loss_fn=loss_fn,
-        )
-        # Build per-channel MAE strings with units for display.
-        # Only show per-channel breakdown when channel_units are defined (e.g. CTLE
-        # with "dB", "deg").  For touchstone data without units, show one combined
-        # average MAE to keep the display clean.
-        channel_mae_with_units = _channel_mae_labels(
-            bundle.channel_names, bundle.channel_units, per_channel_mae
-        )
-        emit_progress(
-            progress_callback,
-            event="evaluation_completed",
-            phase="baseline",
-            message=f"{evaluation_split.capitalize()} evaluation completed.",
-            **_progress_data(
-                event_context,
-                evaluation_split=evaluation_split,
-                evaluation_loss=float(evaluation_loss),
-                average_evaluation_mae=float(evaluation_mae),
-                frequency_ghz=bundle.frequency_ghz.tolist(),
-                frequency_mae=freq_mae,
-                per_channel_mae=per_channel_mae,
-                channel_mae_with_units=channel_mae_with_units,
-            ),
-        )
+        # train_frac + val_frac >= 1 leaves this fold empty on purpose: the run
+        # scores an External Eval Set instead, so there is nothing to evaluate here
+        # and every internal metric, plot and card is simply omitted.
+        has_evaluation_split = len(evaluation_loader.dataset) > 0
+        evaluation_loss = evaluation_mae = None
+        freq_mae: list[float] = []
+        per_channel_mae: list[float] = []
+        channel_mae_with_units: list[str] = []
+        if not has_evaluation_split:
+            emit_progress(
+                progress_callback,
+                event="evaluation_skipped",
+                phase="baseline",
+                message=(
+                    f"No {evaluation_split} rows ("
+                    + (
+                        "the External Eval Set merged the test fold into training"
+                        if merge_test_into_train
+                        else "train + validation fractions total 1.0"
+                    )
+                    + "); skipping the internal evaluation."
+                ),
+                **_progress_data(event_context, evaluation_split=evaluation_split),
+            )
+        else:
+            evaluation_loss, evaluation_mae, freq_mae, per_channel_mae = _eval_metrics(
+                model,
+                evaluation_loader,
+                device,
+                amp,
+                should_stop=should_stop,
+                target_mean=bundle.target_mean,
+                target_std=bundle.target_std,
+                channel_transforms=bundle.channel_transforms,
+                loss_fn=loss_fn,
+            )
+            # Build per-channel MAE strings with units for display.
+            # Only show per-channel breakdown when channel_units are defined (e.g. CTLE
+            # with "dB", "deg").  For touchstone data without units, show one combined
+            # average MAE to keep the display clean.
+            channel_mae_with_units = _channel_mae_labels(
+                bundle.channel_names, bundle.channel_units, per_channel_mae
+            )
+            emit_progress(
+                progress_callback,
+                event="evaluation_completed",
+                phase="baseline",
+                message=f"{evaluation_split.capitalize()} evaluation completed.",
+                **_progress_data(
+                    event_context,
+                    evaluation_split=evaluation_split,
+                    evaluation_loss=float(evaluation_loss),
+                    average_evaluation_mae=float(evaluation_mae),
+                    frequency_ghz=bundle.frequency_ghz.tolist(),
+                    frequency_mae=freq_mae,
+                    per_channel_mae=per_channel_mae,
+                    channel_mae_with_units=channel_mae_with_units,
+                ),
+            )
 
         # Score the same best checkpoint on the external evaluation set, through
         # the exact metric path the internal test evaluation uses. A Stop click
@@ -679,16 +731,30 @@ def run_baseline_trial(
             "epochs_completed": len(history),
             "runtime_seconds": float(runtime_seconds),
             "evaluation_split": evaluation_split,
-            "evaluation_loss": float(evaluation_loss),
-            "average_evaluation_mae": float(evaluation_mae),
-            "per_channel_mae": per_channel_mae,
-            "channel_mae_with_units": channel_mae_with_units,
-            "frequency_mae": freq_mae,
+            # The split actually used. config.train_frac records what was REQUESTED,
+            # which differs from this whenever the test fold was merged away, so both
+            # the effective fraction and the row counts are recorded to keep the run
+            # self-describing.
+            "effective_train_frac": float(effective_train_frac),
+            "test_fold_merged_into_train": bool(merge_test_into_train),
+            "train_samples": int(len(bundle.split_indices["train"])),
+            "val_samples": int(len(bundle.split_indices["val"])),
+            "test_samples": int(len(bundle.split_indices["test"])),
             "history": history,
             "config": asdict(config),
             "active_input_feature_names": bundle.active_names,
             "dropped_input_feature_names": bundle.dropped_names,
         }
+        if has_evaluation_split:
+            result.update(
+                {
+                    "evaluation_loss": float(evaluation_loss),
+                    "average_evaluation_mae": float(evaluation_mae),
+                    "per_channel_mae": per_channel_mae,
+                    "channel_mae_with_units": channel_mae_with_units,
+                    "frequency_mae": freq_mae,
+                }
+            )
         result.update(external_result)
         if not save_artifacts:
             # Search trials use this fast path because they only need the metrics, not
@@ -703,8 +769,8 @@ def run_baseline_trial(
                     evaluation_split=evaluation_split,
                     best_epoch=int(best_epoch),
                     best_val_loss=float(best_val),
-                    evaluation_loss=float(evaluation_loss),
-                    average_evaluation_mae=float(evaluation_mae),
+                    evaluation_loss=None if evaluation_loss is None else float(evaluation_loss),
+                    average_evaluation_mae=None if evaluation_mae is None else float(evaluation_mae),
                     runtime_seconds=float(runtime_seconds),
                 ),
             )
@@ -717,37 +783,43 @@ def run_baseline_trial(
         history_path = artifact_dir / "history.json"
         summary_path = artifact_dir / "summary.json"
         best_path = artifact_dir / "best_model.pt"
-        frequency_plot_path = artifact_dir / f"{evaluation_split}_frequency_mae.png"
-        average_mae_plot_path = artifact_dir / f"average_{evaluation_split}_mae.png"
         split_title = evaluation_split.capitalize()
 
-        _save_checkpoint(best_path, model, config, bundle, best_epoch, best_val)
+        _save_checkpoint(best_path, model, config, bundle, best_epoch, best_val, effective_train_frac)
         history_path.write_text(json.dumps(history, indent=2))
         _plot_loss(history, artifact_dir / "loss_curve.png")
-        _plot_frequency_mae(bundle.frequency_ghz, freq_mae, frequency_plot_path, f"{split_title} MAE by Frequency")
-        _plot_average_mae_bars(
-            labels=[f"Baseline {evaluation_split}"],
-            values=[float(evaluation_mae)],
-            path=average_mae_plot_path,
-            title=f"Average {split_title} MAE",
-            ylabel="Average MAE",
-        )
-
-        # Generate test sample prediction-vs-truth plots.
-        test_sample_plot_paths, test_sample_data = _generate_test_sample_plots(
-            model, bundle, device, amp, artifact_dir, num_samples=4,
-        )
 
         artifact_summary = {
             "run_dir": str(artifact_dir.resolve()),
             "loss_curve_path": str((artifact_dir / "loss_curve.png").resolve()),
-            f"{evaluation_split}_loss": float(evaluation_loss),
-            f"average_{evaluation_split}_mae": float(evaluation_mae),
-            f"{evaluation_split}_frequency_mae_plot_path": str(frequency_plot_path.resolve()),
-            f"average_{evaluation_split}_mae_plot_path": str(average_mae_plot_path.resolve()),
-            "test_sample_plot_paths": test_sample_plot_paths,
-            "test_sample_data": test_sample_data,
         }
+        # Every fold-specific artifact is skipped when that fold is empty; the loss
+        # curve and the checkpoint above are all a no-test-fold run produces.
+        if has_evaluation_split:
+            frequency_plot_path = artifact_dir / f"{evaluation_split}_frequency_mae.png"
+            average_mae_plot_path = artifact_dir / f"average_{evaluation_split}_mae.png"
+            _plot_frequency_mae(bundle.frequency_ghz, freq_mae, frequency_plot_path, f"{split_title} MAE by Frequency")
+            _plot_average_mae_bars(
+                labels=[f"Baseline {evaluation_split}"],
+                values=[float(evaluation_mae)],
+                path=average_mae_plot_path,
+                title=f"Average {split_title} MAE",
+                ylabel="Average MAE",
+            )
+            # Generate test sample prediction-vs-truth plots.
+            test_sample_plot_paths, test_sample_data = _generate_test_sample_plots(
+                model, bundle, device, amp, artifact_dir, num_samples=4,
+            )
+            artifact_summary.update(
+                {
+                    f"{evaluation_split}_loss": float(evaluation_loss),
+                    f"average_{evaluation_split}_mae": float(evaluation_mae),
+                    f"{evaluation_split}_frequency_mae_plot_path": str(frequency_plot_path.resolve()),
+                    f"average_{evaluation_split}_mae_plot_path": str(average_mae_plot_path.resolve()),
+                    "test_sample_plot_paths": test_sample_plot_paths,
+                    "test_sample_data": test_sample_data,
+                }
+            )
         result.update(artifact_summary)
         summary_path.write_text(json.dumps(result, indent=2))
         emit_progress(
@@ -761,7 +833,8 @@ def run_baseline_trial(
                 summary_path=str(summary_path.resolve()),
                 best_model_path=str(best_path.resolve()),
                 loss_curve_path=result["loss_curve_path"],
-                frequency_mae_plot_path=result[f"{evaluation_split}_frequency_mae_plot_path"],
+                # Absent when the run kept no test fold, so there is no fold plot.
+                frequency_mae_plot_path=result.get(f"{evaluation_split}_frequency_mae_plot_path"),
             ),
         )
         emit_progress(
@@ -775,8 +848,10 @@ def run_baseline_trial(
                 best_epoch=int(best_epoch),
                 best_val_loss=float(best_val),
                 evaluation_split=evaluation_split,
-                evaluation_loss=float(evaluation_loss),
-                average_evaluation_mae=float(evaluation_mae),
+                # None when the run kept no test fold; the External Eval Set numbers
+                # are then the only accuracy this event carries.
+                evaluation_loss=None if evaluation_loss is None else float(evaluation_loss),
+                average_evaluation_mae=None if evaluation_mae is None else float(evaluation_mae),
                 runtime_seconds=float(runtime_seconds),
             ),
         )
@@ -844,14 +919,25 @@ def train_baseline(
         "device": result["device"],
         "best_epoch": result["best_epoch"],
         "best_val_loss": result["best_val_loss"],
-        "test_loss": result["test_loss"],
-        "average_test_mae": result["average_test_mae"],
         "active_input_feature_names": result["active_input_feature_names"],
         "dropped_input_feature_names": result["dropped_input_feature_names"],
         "loss_curve_path": result["loss_curve_path"],
-        "test_frequency_mae_plot_path": result["test_frequency_mae_plot_path"],
-        "average_test_mae_plot_path": result["average_test_mae_plot_path"],
+        "effective_train_frac": result["effective_train_frac"],
+        "test_fold_merged_into_train": result["test_fold_merged_into_train"],
+        "train_samples": result["train_samples"],
+        "val_samples": result["val_samples"],
+        "test_samples": result["test_samples"],
     }
+    # Absent when train_frac + val_frac left no test rows: the External Eval Set
+    # is then the only accuracy number the run produces.
+    for key in (
+        "test_loss",
+        "average_test_mae",
+        "test_frequency_mae_plot_path",
+        "average_test_mae_plot_path",
+    ):
+        if key in result:
+            summary[key] = result[key]
     if "channel_mae_with_units" in result:
         summary["channel_mae_with_units"] = result["channel_mae_with_units"]
     if "per_channel_mae" in result:
@@ -949,6 +1035,14 @@ def run_self_transfer(
             )
         else:
             split = split_indices(len(features), config.train_frac, config.val_frac, config.seed)
+        if len(split["test"]) == 0:
+            # Self-transfer reports accuracy only on the internal test fold and has no
+            # External Eval Set option, so an empty fold would yield NaN metrics.
+            raise ValueError(
+                "Self-transfer reports accuracy on the internal test fold, so it needs "
+                "one, but train_frac + val_frac leaves no test rows. Lower the train or "
+                "validation fraction for the transfer run."
+            )
         # Drop constant input features using the training split only (matches baseline).
         train_feats = features[split["train"]]
         active_mask = train_feats.max(axis=0) != train_feats.min(axis=0)
@@ -1338,6 +1432,14 @@ def _eval_loss(
                 loss = loss_fn(model(x), y)
             total += loss.detach().float() * x.shape[0]
             count += x.shape[0]
+    if count == 0:
+        # Returning 0.0 here would look like a perfect epoch, so the first
+        # checkpoint would never be beaten and training would silently keep
+        # epoch-1 weights.
+        raise ValueError(
+            "The validation split is empty, so no validation loss can be computed. "
+            "Lower the train fraction so validation keeps at least one sample."
+        )
     return float(total) / max(count, 1)
 
 
@@ -1582,7 +1684,15 @@ def _select_loader(bundle: Any, split_name: str) -> DataLoader:
     raise ValueError(f"Unknown split name: {split_name}")
 
 
-def _save_checkpoint(path: Path, model: nn.Module, config: TrainConfig, bundle: Any, best_epoch: int, best_val: float) -> None:
+def _save_checkpoint(
+    path: Path,
+    model: nn.Module,
+    config: TrainConfig,
+    bundle: Any,
+    best_epoch: int,
+    best_val: float,
+    effective_train_frac: float,
+) -> None:
     # Save not only the model weights, but also the normalization statistics and
     # active feature list required to reuse the checkpoint later.
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1590,6 +1700,9 @@ def _save_checkpoint(path: Path, model: nn.Module, config: TrainConfig, bundle: 
         {
             "model_state": model.state_dict(),
             "config": asdict(config),
+            # Sibling of "config", never inside it: two call sites rebuild a
+            # TrainConfig from that dict with **kwargs and would raise on a new key.
+            "effective_train_frac": float(effective_train_frac),
             "best_epoch": best_epoch,
             "best_val_loss": best_val,
             "active_input_feature_names": bundle.active_names,
@@ -1999,6 +2112,9 @@ def _generate_test_sample_plots(
     from .data import _inverse_channel_transforms
 
     loader = bundle.test_loader
+    if len(loader.dataset) == 0:
+        # No test fold: nothing to plot, and torch.cat would raise on empty lists.
+        return [], {}
     preds_list: list[torch.Tensor] = []
     trues_list: list[torch.Tensor] = []
     with torch.no_grad():

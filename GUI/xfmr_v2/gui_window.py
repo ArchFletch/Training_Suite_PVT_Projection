@@ -649,11 +649,11 @@ class MlpTrainingStudio(QMainWindow):
             "dataset to list its input-feature columns."
         )
         self.baseline_design_columns_list.itemChanged.connect(self._on_design_column_toggled)
-        # Off by default: the common flow scores an External Eval Set, which is
-        # already design-disjoint, so the internal folds are only a checkpoint-
-        # selection device there. Tick this when the GUI's own MAE cards have to be
-        # trustworthy on their own.
-        self.baseline_design_split_checkbox = QCheckBox("Hold out whole designs")
+        # Off by default because the randomized campaigns this suite targets put
+        # each design at exactly one corner, where a row-level split is already
+        # design-disjoint and this checkbox is a no-op. It matters for datasets that
+        # re-simulate the same designs across corners, where a row split leaks.
+        self.baseline_design_split_checkbox = QCheckBox("Keep each design in one fold")
         self.baseline_design_split_checkbox.setChecked(False)
         self.baseline_design_split_checkbox.setToolTip(
             "Design-level split: rows that agree on every checked Design Identity "
@@ -663,12 +663,15 @@ class MlpTrainingStudio(QMainWindow):
             "which leaks design information and makes test error look too good. "
             "Works with every model type; requires at least one checked Design "
             "Identity column.\n\n"
-            "Leave this off when an External Eval Set supplies the honest number. "
-            "Tick it when the GUI's own MAE cards must be trustworthy without an "
-            "external file — and then raise Train Fraction (measured: 0.92 / 0.07 "
-            "works well), because holding out whole designs removes them from "
-            "training and it is design variety, not row count, that the model "
-            "needs to generalize to new designs."
+            "Leave this off when every design appears at only one corner — the "
+            "row-level split is already design-disjoint there and this changes "
+            "nothing. Tick it when designs repeat across corners, which is when a "
+            "row-level split leaks and the MAE cards read far better than the "
+            "model really is.\n\n"
+            "When you do tick it, raise Train Fraction (measured: 0.92 / 0.07 works "
+            "well), because holding whole designs out removes them from training and "
+            "it is design variety, not row count, that the model needs to generalize "
+            "to new designs."
         )
         self.baseline_design_split_checkbox.toggled.connect(self._refresh_projection_controls_enabled)
         self.baseline_epochs_spin_box = self._make_int_spin(1, 5000, 300)
@@ -684,22 +687,18 @@ class MlpTrainingStudio(QMainWindow):
         self.baseline_scheduler_combo_box.addItems(list(SCHEDULER_TYPES))
         self.baseline_scheduler_combo_box.setCurrentText("plateau")
         self.baseline_train_fraction_spin_box = self._make_float_spin(0.05, 0.95, 0.80, decimals=3, step=0.01)
+        self.baseline_train_fraction_spin_box.setToolTip(
+            "Fraction of the dataset used for training. Validation takes its own "
+            "fraction below and whatever is left over becomes the internal test "
+            "fold.\n\n"
+            "Setting Train + Validation to exactly 1.0 (e.g. 0.900 / 0.100) keeps no "
+            "test fold at all: those rows go into training instead, and the internal "
+            "MAE cards stay blank because there is nothing left to measure. Worth it "
+            "when you judge the model by other means — on one measured dataset it was "
+            "about 19% better."
+        )
         self.baseline_validation_fraction_spin_box = self._make_float_spin(0.0, 0.90, 0.10, decimals=3, step=0.01)
         self.baseline_seed_spin_box = self._make_int_spin(0, 1000000, 42)
-        self.baseline_eval_dataset_edit = QLineEdit()
-        self.baseline_eval_dataset_edit.setPlaceholderText("Optional: .npz scored after training (e.g. held-out designs)")
-        self.baseline_eval_dataset_edit.setToolTip(
-            "Optional external evaluation set: an .npz file holding features, "
-            "targets, and feature_names arrays (a dataset bundle.npz works). "
-            "After training, the best checkpoint is scored on it and shown as "
-            "the Holdout MAE cards. Point it at data this dataset does not "
-            "contain — e.g. designs kept out of the dataset entirely — for an "
-            "honest benchmark that does not move with the split seed. Feature "
-            "columns are matched by name; targets must share this dataset's "
-            "channels and frequency grid."
-        )
-        self.browse_eval_dataset_button = self._make_button("Browse...", secondary=True)
-        self.browse_eval_dataset_button.clicked.connect(self._browse_eval_dataset_path)
         self.restore_recommended_baseline_button = self._make_button("Restore Recommended", secondary=True)
         self.restore_recommended_baseline_button.clicked.connect(self._restore_recommended_baseline)
 
@@ -723,11 +722,7 @@ class MlpTrainingStudio(QMainWindow):
         ]
         for row, (label, widget) in enumerate(fields):
             self._add_form_row(grid, row, label, widget)
-        self._add_path_row(
-            grid, len(fields), "External Eval Set (.npz)",
-            self.baseline_eval_dataset_edit, self.browse_eval_dataset_button,
-        )
-        grid.addWidget(self.restore_recommended_baseline_button, len(fields) + 1, 1)
+        grid.addWidget(self.restore_recommended_baseline_button, len(fields), 1)
         self._refresh_projection_controls_enabled()
         return tab
 
@@ -815,27 +810,22 @@ class MlpTrainingStudio(QMainWindow):
         layout.addLayout(status_row)
         return card
 
-    def _update_channel_metric_cards(
-        self, labels: list[str], key_prefix: str = "", title_prefix: str = ""
-    ) -> None:
+    def _update_channel_metric_cards(self, labels: list[str]) -> None:
         """Show one MAE card per ground-truth channel, in the run's channel order.
 
         ``labels`` are the runner's ready-formatted "gain: 0.2671 dB" strings; the
         runner emits them only when the dataset declares channel units, so datasets
         without units keep the single averaged card and nothing is created here.
-        The prefixes keep a second card family apart from the internal test-fold
-        one: external evaluation-set results use ``key_prefix="holdout:"`` and
-        ``title_prefix="Holdout "`` so "gain" and "holdout gain" never share a card.
         """
         for label in labels:
             name, _, value = str(label).partition(":")
             name, value = name.strip(), value.strip()
             if not name or not value:
                 continue
-            card = self._channel_metric_cards.get(key_prefix + name)
+            card = self._channel_metric_cards.get(name)
             if card is None:
-                card = MetricCard(f"{title_prefix}MAE {name}")
-                self._channel_metric_cards[key_prefix + name] = card
+                card = MetricCard(f"MAE {name}")
+                self._channel_metric_cards[name] = card
                 position = len(self._channel_metric_cards) - 1
                 self._channel_metric_grid.addWidget(
                     card, self._channel_metric_row + position // 3, position % 3
@@ -1241,8 +1231,6 @@ class MlpTrainingStudio(QMainWindow):
             return
         if not self._validate_projection_settings():
             return
-        if not self._validate_eval_dataset_path():
-            return
 
         self._reset_baseline_plots()
         self._reset_transfer_plots()
@@ -1270,14 +1258,27 @@ class MlpTrainingStudio(QMainWindow):
             return
         if not self._validate_transfer_ready():
             return
+        if not self._validate_split_fractions():
+            return
+        if (
+            self.baseline_train_fraction_spin_box.value()
+            + self.baseline_validation_fraction_spin_box.value()
+            >= 1.0
+        ):
+            # Transfer reports only on the internal test fold and has no External
+            # Eval Set option, so it would otherwise fail part-way through the run.
+            self._show_warning(
+                "Self-transfer reports accuracy on the internal test fold, so the train "
+                "and validation fractions must leave room for one. Lower Train Fraction "
+                "or Validation Fraction on the Baseline tab."
+            )
+            return
         if not self._validate_projection_settings():
             return
 
         self._reset_transfer_plots()
-        # Transfer overwrites the internal per-channel cards as it iterates, but
-        # never the Holdout family (it does not support the external eval set) —
-        # without this reset a prior baseline's holdout numbers would sit next to
-        # this run's transfer metrics as if they belonged to it.
+        # A prior baseline's per-channel numbers would otherwise sit beside this
+        # run's transfer metrics as if they belonged to it.
         self._reset_channel_metric_cards()
         self.last_workflow_summary = None
 
@@ -1306,16 +1307,6 @@ class MlpTrainingStudio(QMainWindow):
         path = QFileDialog.getExistingDirectory(self, "Select Dataset Folder", self.dataset_folder_edit.text())
         if path:
             self.dataset_folder_edit.setText(path)
-
-    def _browse_eval_dataset_path(self) -> None:
-        path, _selected_filter = QFileDialog.getOpenFileName(
-            self,
-            "Select External Evaluation Set",
-            self.baseline_eval_dataset_edit.text().strip() or str(self._default_dialog_root()),
-            "NumPy archives (*.npz)",
-        )
-        if path:
-            self.baseline_eval_dataset_edit.setText(path)
 
     def browse_input_feature_path(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Select Input-Feature File", self.input_feature_path_edit.text(), "Text Files (*.txt);;All Files (*)")
@@ -1913,14 +1904,6 @@ class MlpTrainingStudio(QMainWindow):
             if average_mae is not None:
                 self.metric_cards["average_mae"].set_value(f"{average_mae:.6f}")
             self._update_channel_metric_cards(list(payload.get("channel_mae_with_units") or []))
-        elif event == "external_evaluation_completed":
-            # The digest-comparable numbers: same best checkpoint, scored on the
-            # user-supplied external evaluation set instead of the internal fold.
-            self._update_channel_metric_cards(
-                list(payload.get("external_channel_mae_with_units") or []),
-                key_prefix="holdout:",
-                title_prefix="Holdout ",
-            )
         elif event == "completed":
             self.run_progress_bar.setValue(100)
             self.run_state_badge.set_status("Completed")
@@ -2048,7 +2031,6 @@ class MlpTrainingStudio(QMainWindow):
             "train_frac": float(self.baseline_train_fraction_spin_box.value()),
             "val_frac": float(self.baseline_validation_fraction_spin_box.value()),
             "seed": self.baseline_seed_spin_box.value(),
-            "eval_dataset_path": self.baseline_eval_dataset_edit.text().strip(),
         }
 
     def _apply_baseline_form(self, payload: dict[str, Any]) -> None:
@@ -2105,12 +2087,20 @@ class MlpTrainingStudio(QMainWindow):
         self.baseline_train_fraction_spin_box.setValue(float(payload.get("train_frac", self.baseline_train_fraction_spin_box.value())))
         self.baseline_validation_fraction_spin_box.setValue(float(payload.get("val_frac", self.baseline_validation_fraction_spin_box.value())))
         self.baseline_seed_spin_box.setValue(int(payload.get("seed", self.baseline_seed_spin_box.value())))
-        # None means "payload carries the dataclass default" (suggest/search
-        # configs) and leaves the field untouched; a string — empty included —
-        # is an explicit value, so a session that cleared the field stays clear.
+        # The External Eval Set field was removed from the GUI. Configs written
+        # before that still carry the key; ignore it rather than fail the whole
+        # restore, but say something when it held a real path, because it used to
+        # change the split (it merged the test fold into training) and silently
+        # dropping it would quietly retrain on less data.
         eval_dataset_path = payload.get("eval_dataset_path")
-        if eval_dataset_path is not None:
-            self.baseline_eval_dataset_edit.setText(str(eval_dataset_path))
+        if eval_dataset_path:
+            self.append_log(
+                "This configuration set an External Eval Set "
+                f"({eval_dataset_path}). That field has been removed from the GUI; "
+                "the option is still available from the command line via "
+                "train_baseline.py --eval-dataset-path. To reproduce the split it "
+                "used, set Train Fraction 0.900 and Validation Fraction 0.100."
+            )
 
     def _collect_transfer_form(self) -> dict[str, Any]:
         return {
@@ -2320,7 +2310,7 @@ class MlpTrainingStudio(QMainWindow):
                     "The design-level split needs at least one Design Identity column "
                     "so it knows which rows are the same design at different corners. "
                     "Check the geometry/parameter columns in the Baseline tab's Design "
-                    "Identity Columns list, or untick 'Hold out whole designs'."
+                    "Identity Columns list, or untick 'Keep each design in one fold'."
                 )
                 return False
             unknown = [name for name in design_columns if name not in known]
@@ -2352,28 +2342,6 @@ class MlpTrainingStudio(QMainWindow):
                     "Check only the geometry/parameter columns."
                 )
                 return False
-        return True
-
-    def _validate_eval_dataset_path(self) -> bool:
-        """Cheap pre-flight check of the optional External Eval Set field.
-
-        Only existence and file type are checked here; the engine validates the
-        arrays themselves (feature coverage, channel count, frequency grid)
-        before any training epoch runs, so a mismatched file still fails fast.
-        """
-        path_text = self.baseline_eval_dataset_edit.text().strip()
-        if not path_text:
-            return True
-        path = Path(path_text)
-        if not path.is_file():
-            self._show_warning(f"The External Eval Set file does not exist: {path}")
-            return False
-        if path.suffix.lower() != ".npz":
-            self._show_warning(
-                "The External Eval Set must be an .npz file holding features, "
-                "targets, and feature_names arrays (a dataset bundle.npz works)."
-            )
-            return False
         return True
 
     def _build_baseline_train_config(self) -> TrainConfig:
@@ -2415,7 +2383,6 @@ class MlpTrainingStudio(QMainWindow):
             use_amp=form.get("use_amp", True),
             max_samples=None,
             device=self._current_device_id(),
-            eval_dataset_path=form["eval_dataset_path"] or None,
         )
 
     def _build_transfer_config(self) -> TransferConfig:
@@ -2544,6 +2511,10 @@ class MlpTrainingStudio(QMainWindow):
     # ------------------------------------------------------------------
     def _reset_baseline_plots(self) -> None:
         self._reset_channel_metric_cards()
+        # A run whose internal test fold was merged into training never emits an
+        # average MAE, so a stale value from the previous run would otherwise stay
+        # on the card and read as if it belonged to this one.
+        self.metric_cards["average_mae"].set_value("-")
         self._baseline_epochs.clear()
         self._baseline_train_losses.clear()
         self._baseline_val_losses.clear()
@@ -2765,8 +2736,8 @@ class MlpTrainingStudio(QMainWindow):
         if not 0.0 <= val_frac < 1.0:
             self._show_warning("Validation fraction must be between 0 and 1.")
             return False
-        if train_frac + val_frac >= 1.0:
-            self._show_warning("Train fraction plus validation fraction must leave room for a test split.")
+        if train_frac + val_frac > 1.0:
+            self._show_warning("Train fraction plus validation fraction cannot exceed 1.0.")
             return False
         return True
 
@@ -2944,11 +2915,6 @@ class MlpTrainingStudio(QMainWindow):
         if average_mae is not None:
             self.metric_cards["average_mae"].set_value(f"{float(average_mae):.6f}")
         self._update_channel_metric_cards(list(summary.get("channel_mae_with_units") or []))
-        self._update_channel_metric_cards(
-            list(summary.get("external_channel_mae_with_units") or []),
-            key_prefix="holdout:",
-            title_prefix="Holdout ",
-        )
         best_val_loss = summary.get("best_val_loss")
         if best_val_loss is not None:
             self.metric_cards["best_metric"].set_value(f"Best val {float(best_val_loss):.6f}")

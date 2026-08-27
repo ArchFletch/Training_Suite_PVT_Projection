@@ -43,7 +43,7 @@ trained embedding onto the inputs; the projection also trains live inside every 
 submodel during self-transfer).
 
 For PVT-style datasets where each design appears once per corner, the optional
-design-level split (the GUI's "Hold out whole designs" checkbox, any model type) keeps
+design-level split (the GUI's "Keep each design in one fold" checkbox, any model type) keeps
 every corner row of a design in the same train/validation/test fold. The default
 row-level split would place a design at one corner in train and the same design at
 another corner in test, which leaks design information and makes test error look better

@@ -40,6 +40,11 @@ from .progress import request_stop
 DATA_ROOT = Path(r"C:\Users\tc57\Box\Rice_AIDRFIC\XFMR\XFMR_1to1\XFMR_2503_1x1_SameXY")
 CACHE_PATH = Path("artifacts/cache/xfmr_1to1_v2.npz")
 
+# train_frac + val_frac at or above this counts as "no internal test fold": every
+# row that would have been held out for testing goes back into training instead.
+# Only meaningful when an external evaluation set supplies the accuracy number.
+_FRACTION_EPS = 1e-9
+
 # Touchstone channel names use the Sij pattern, for example S11 or S34.
 TOUCHSTONE_NAME = re.compile(r"^[Ss](\d+)(\d+)$")
 
@@ -804,6 +809,7 @@ def load_split_bundle(
     pin_memory: bool = False,
     split_corner_columns: Sequence[str] | None = None,
     split_design_columns: Sequence[str] | None = None,
+    merge_test_into_train: bool = False,
 ) -> SplitBundle:
     """Load cached arrays, drop constant inputs, normalize, and build loaders.
 
@@ -830,6 +836,9 @@ def load_split_bundle(
     if max_samples is not None:
         features = features[:max_samples]
         targets = targets[:max_samples]
+
+    # An external evaluation set folds the internal test rows back into training.
+    train_frac, val_frac = resolve_split_fractions(train_frac, val_frac, merge_test_into_train)
 
     # Compute the split first, then derive the active features and normalization
     # statistics from the training split only.
@@ -928,8 +937,35 @@ def _inverse_channel_transforms(values: np.ndarray, transforms: list[str]) -> np
     return out
 
 
+def resolve_split_fractions(
+    train_frac: float, val_frac: float, merge_test_into_train: bool
+) -> tuple[float, float]:
+    """The (train_frac, val_frac) a run actually splits with.
+
+    An external evaluation set makes the internal test fold redundant, so its
+    share goes back to training: validation keeps ``val_frac`` and training takes
+    everything else. Every caller that builds a split — training, the GUI scan
+    preview, the settings recommender — must route through this so they cannot
+    describe different splits for the same run.
+    """
+    if not merge_test_into_train:
+        return train_frac, val_frac
+    if val_frac <= 0.0:
+        raise ValueError(
+            "Merging the internal test fold into training needs a non-empty "
+            "validation fold to select the checkpoint, but val_frac is 0. "
+            "Raise the validation fraction above 0."
+        )
+    return 1.0 - val_frac, val_frac
+
+
 def split_indices(num_samples: int, train_frac: float, val_frac: float, seed: int) -> dict[str, np.ndarray]:
-    """Create one deterministic shuffled split."""
+    """Create one deterministic shuffled split.
+
+    ``train_frac + val_frac >= 1`` asks for no internal test fold: the rows that
+    would have been held out go into training, and ``test`` comes back empty.
+    Validation is never empty either way — it selects the checkpoint.
+    """
     if num_samples < 1:
         raise ValueError("Need at least one sample to create splits.")
 
@@ -939,6 +975,12 @@ def split_indices(num_samples: int, train_frac: float, val_frac: float, seed: in
         # single example in train and leave the others empty.
         empty = order[:0]
         return {"train": order, "val": empty, "test": empty}
+
+    if train_frac + val_frac >= 1.0 - _FRACTION_EPS:
+        # No internal test fold: the caller scores an external evaluation set, so
+        # holding rows back for an internal test would only shrink training.
+        train_end = min(max(int(num_samples * train_frac), 1), num_samples - 1)
+        return {"train": order[:train_end], "val": order[train_end:], "test": order[:0]}
 
     if num_samples == 2:
         # Two samples: one train, one val. Validation must never be empty —
@@ -1156,13 +1198,18 @@ def _design_split(
         # columns (physics anchors), which would make every row its own "corner"
         # and the check a false alarm.
         _warn_on_partial_design_crossing(features, group_ids, num_designs, corner_idx)
-    if num_designs < 3:
+    # With no test fold two designs are enough (one train, one val); otherwise all
+    # three folds must be non-empty.
+    no_test_fold = train_frac + val_frac >= 1.0 - _FRACTION_EPS
+    min_designs = 2 if no_test_fold else 3
+    if num_designs < min_designs:
+        folds = "train/validation" if no_test_fold else "train/validation/test"
         raise ValueError(
             f"The design-level split found only {num_designs} unique design(s) across "
             f"{len(group_ids)} rows (rows identical in every non-corner column are one "
-            "design), but at least 3 designs are needed for non-empty train/validation/"
-            "test folds. Check the corner-column selection, and note that max_samples "
-            "truncates rows before designs are grouped."
+            f"design), but at least {min_designs} designs are needed for non-empty "
+            f"{folds} folds. Check the corner-column selection, and note that "
+            "max_samples truncates rows before designs are grouped."
         )
     groups = split_indices(num_designs, train_frac, val_frac, seed)
     split = {name: np.flatnonzero(np.isin(group_ids, ids)) for name, ids in groups.items()}

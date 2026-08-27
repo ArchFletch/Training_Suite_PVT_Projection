@@ -778,35 +778,13 @@ def test_per_channel_mae_cards_appear_from_the_run(gui_window) -> None:
     assert cards["gain"].value_label.text() == "-"
 
 
-def test_holdout_mae_cards_stay_apart_from_test_fold_cards(gui_window) -> None:
-    """External eval-set MAE gets its own 'Holdout' card family: the honest
-    external number must never overwrite — or be mistaken for — the internal
-    test fold's, which moves with the split seed."""
-    gui_window._update_baseline_progress(
-        {"event": "evaluation_completed", "frequency_ghz": [1.0], "frequency_mae": [0.1],
-         "average_evaluation_mae": 0.2,
-         "channel_mae_with_units": ["gain: 0.2064 dB"]},
-    )
-    gui_window._update_baseline_progress(
-        {"event": "external_evaluation_completed",
-         "external_channel_mae_with_units": ["gain: 0.1291 dB"]},
-    )
-    cards = gui_window._channel_metric_cards
-    assert list(cards) == ["gain", "holdout:gain"]
-    assert cards["gain"].value_label.text() == "0.2064 dB"
-    assert cards["holdout:gain"].value_label.text() == "0.1291 dB"
-
-    # A new run clears the holdout family together with the internal one.
-    gui_window._reset_baseline_plots()
-    assert cards["holdout:gain"].value_label.text() == "-"
-
-
 def test_design_split_is_off_until_asked_for(gui_window) -> None:
     """A fresh form starts with the design-level split off, and asks for nothing.
 
-    The usual flow scores an External Eval Set, which is design-disjoint already, so
-    the split is opt-in. Pinning this keeps a stray setChecked(True) — or a widget
-    swap whose default differs — from silently changing every new run's protocol.
+    The randomized campaigns this suite targets put each design at one corner, where
+    a row-level split is already design-disjoint and the checkbox is a no-op, so it
+    is opt-in. Pinning this keeps a stray setChecked(True) — or a widget swap whose
+    default differs — from silently changing every new run's protocol.
     """
     assert gui_window.baseline_design_split_checkbox.isChecked() is False
     form = gui_window._collect_baseline_form()
@@ -814,67 +792,6 @@ def test_design_split_is_off_until_asked_for(gui_window) -> None:
     assert form["split_corner_columns"] == []
     assert gui_window._current_split_design_columns() is None
     assert gui_window._current_split_corner_columns() is None
-
-
-def test_transfer_start_clears_stale_holdout_cards(gui_window, monkeypatch) -> None:
-    """Self-transfer never scores the external eval set and only overwrites the
-    internal card family as it iterates — so a prior baseline's Holdout numbers
-    must be cleared at transfer start or they masquerade as this run's."""
-    gui_window._update_baseline_progress(
-        {"event": "external_evaluation_completed",
-         "external_channel_mae_with_units": ["gain: 0.1291 dB"]},
-    )
-    assert gui_window._channel_metric_cards["holdout:gain"].value_label.text() == "0.1291 dB"
-
-    monkeypatch.setattr(gui_window, "_ensure_license_ready_for_training", lambda: True)
-    monkeypatch.setattr(gui_window, "_require_data_paths", lambda: {})
-    monkeypatch.setattr(gui_window, "_validate_transfer_ready", lambda: True)
-    monkeypatch.setattr(gui_window, "_validate_projection_settings", lambda: True)
-    monkeypatch.setattr(gui_window, "_build_transfer_config", lambda: None)
-    monkeypatch.setattr(gui_window, "_start_task", lambda *args, **kwargs: None)
-    gui_window.last_scan_result = {"dataset_name": "x"}
-    gui_window.start_transfer_learning()
-
-    assert gui_window._channel_metric_cards["holdout:gain"].value_label.text() == "-"
-
-
-def test_eval_dataset_path_round_trips_and_none_does_not_clobber(gui_window, tmp_path) -> None:
-    """The External Eval Set path persists with the session; a dataclass-default
-    payload (None, from suggest/search) leaves it alone, an explicit empty
-    string clears it — same contract as the projection and split fields."""
-    eval_file = tmp_path / "holdout.npz"
-    eval_file.write_bytes(b"")
-    gui_window.baseline_eval_dataset_edit.setText(str(eval_file))
-
-    payload = gui_window.collect_config_payload()
-    assert payload["baseline"]["eval_dataset_path"] == str(eval_file)
-
-    gui_window.baseline_eval_dataset_edit.setText("")
-    gui_window.apply_config_payload(payload)
-    assert gui_window.baseline_eval_dataset_edit.text() == str(eval_file)
-
-    gui_window._apply_baseline_form({"eval_dataset_path": None})
-    assert gui_window.baseline_eval_dataset_edit.text() == str(eval_file)
-    gui_window._apply_baseline_form({"eval_dataset_path": ""})
-    assert gui_window.baseline_eval_dataset_edit.text() == ""
-
-
-def test_bad_eval_dataset_path_blocks_start(gui_window, tmp_path, monkeypatch) -> None:
-    """A typo'd eval path must be caught before training, not after 300 epochs."""
-    warnings: list[str] = []
-    monkeypatch.setattr(gui_window, "_show_warning", lambda message: warnings.append(message))
-
-    gui_window.baseline_eval_dataset_edit.setText(str(tmp_path / "nope.npz"))
-    assert gui_window._validate_eval_dataset_path() is False
-    assert any("does not exist" in message for message in warnings)
-
-    wrong_type = tmp_path / "holdout.txt"
-    wrong_type.write_text("not an npz")
-    gui_window.baseline_eval_dataset_edit.setText(str(wrong_type))
-    assert gui_window._validate_eval_dataset_path() is False
-
-    gui_window.baseline_eval_dataset_edit.setText("")
-    assert gui_window._validate_eval_dataset_path() is True
 
 
 def test_datasets_without_channel_units_keep_the_single_card(gui_window) -> None:

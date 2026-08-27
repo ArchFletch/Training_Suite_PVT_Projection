@@ -202,12 +202,14 @@ def main() -> None:
     if args.open_plots_in_vscode:
         # These two plots are the quickest way to judge whether training behaved well:
         # one shows the error curve across frequency and the other shows the average error.
-        open_in_vscode(
-            [
-                summary["test_frequency_mae_plot_path"],
-                summary["average_test_mae_plot_path"],
-            ]
-        )
+        # Absent when the run kept no test fold; then there is nothing to open.
+        plot_paths = [
+            summary[key]
+            for key in ("test_frequency_mae_plot_path", "average_test_mae_plot_path")
+            if key in summary
+        ]
+        if plot_paths:
+            open_in_vscode(plot_paths)
     print(json.dumps(summary, indent=2))
 
 

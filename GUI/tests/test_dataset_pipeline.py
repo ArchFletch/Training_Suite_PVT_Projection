@@ -714,3 +714,53 @@ def test_load_split_bundle_accepts_design_columns(tmp_path: Path) -> None:
         cache_path, batch_size=8, seed=3, split_design_columns=["geom_a", "geom_b"]
     )
     assert bundle.design_counts == {"train": 9, "val": 1, "test": 2}
+
+
+def test_resolve_split_fractions_gives_the_test_share_to_training() -> None:
+    """Validation is untouched; training absorbs whatever the test fold held."""
+    assert data.resolve_split_fractions(0.8, 0.1, False) == (0.8, 0.1)
+    assert data.resolve_split_fractions(0.8, 0.1, True) == pytest.approx((0.9, 0.1))
+    assert data.resolve_split_fractions(0.6, 0.2, True) == pytest.approx((0.8, 0.2))
+    # Already leaving no test fold: the merge is a no-op, not a doubling.
+    assert data.resolve_split_fractions(0.9, 0.1, True) == pytest.approx((0.9, 0.1))
+
+
+def test_resolve_split_fractions_refuses_to_empty_validation() -> None:
+    """val_frac 0 plus a merge would leave nothing to select the checkpoint with."""
+    with pytest.raises(ValueError, match="validation fold"):
+        data.resolve_split_fractions(1.0, 0.0, True)
+
+
+@pytest.mark.parametrize("num_samples", [2, 3, 10, 11, 72, 200, 5400])
+def test_split_indices_empty_test_fold_is_still_a_partition(num_samples: int) -> None:
+    """No test fold must still mean: every row used once, validation non-empty."""
+    split = data.split_indices(num_samples, 0.9, 0.1, seed=1)
+    assert len(split["test"]) == 0
+    assert len(split["val"]) >= 1
+    assert len(split["train"]) >= 1
+    assert len(split["train"]) + len(split["val"]) == num_samples
+    assert sorted(np.concatenate([split["train"], split["val"]]).tolist()) == list(range(num_samples))
+
+
+def test_design_split_accepts_two_designs_when_there_is_no_test_fold() -> None:
+    """Two designs cannot fill three folds, but they can fill two."""
+    features = np.array([[1.0, 0.0], [1.0, 1.0], [2.0, 0.0], [2.0, 1.0]], dtype=np.float32)
+    names = ["geom", "Temp_C"]
+    split = data.design_split_indices(features, names, ["Temp_C"], 0.5, 0.5, seed=1)
+    assert len(split["test"]) == 0
+    assert len(split["train"]) == 2 and len(split["val"]) == 2
+    # Still refused when a test fold is required.
+    with pytest.raises(ValueError, match="at least 3 designs"):
+        data.design_split_indices(features, names, ["Temp_C"], 0.5, 0.25, seed=1)
+
+
+def test_load_split_bundle_merge_flag_matches_hand_set_fractions(tmp_path: Path) -> None:
+    """merge_test_into_train=True must equal passing (1 - val_frac, val_frac)."""
+    cache_path = tmp_path / "merge_cache.npz"
+    _write_pvt_cache_npz(cache_path, num_designs=12)
+    merged = data.load_split_bundle(cache_path, batch_size=4, train_frac=0.8, val_frac=0.1,
+                                    merge_test_into_train=True)
+    by_hand = data.load_split_bundle(cache_path, batch_size=4, train_frac=0.9, val_frac=0.1)
+    for fold in ("train", "val", "test"):
+        assert np.array_equal(merged.split_indices[fold], by_hand.split_indices[fold])
+    assert len(merged.split_indices["test"]) == 0
