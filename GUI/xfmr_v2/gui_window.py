@@ -622,58 +622,11 @@ class MlpTrainingStudio(QMainWindow):
         self.baseline_projection_columns_list.setMaximumHeight(96)
         self.baseline_projection_columns_list.setToolTip(
             "Check the PVT corner/condition columns (e.g. temperature, supply, process "
-            "one-hots). They feed SpectraHydraProj's learned corner projection and, when "
-            "the design-level split is enabled, define which rows are corner copies of "
-            "one design. Scan the dataset to list its input-feature columns."
+            "one-hots). They feed SpectraHydraProj's learned corner projection. Scan "
+            "the dataset to list its input-feature columns."
         )
         self.baseline_projection_columns_list.itemChanged.connect(self._on_projection_column_toggled)
         self.baseline_projection_dim_spin_box = self._make_int_spin(1, 256, 16)
-        # Design-level split: uses the corner-column selection above to keep all
-        # corner rows of one design in the same train/val/test fold.
-        # The split is specified by the columns that IDENTIFY a design, not by the
-        # corner columns: forgetting one design column merges designs (a coarser,
-        # still leak-free split), while forgetting one corner column splinters each
-        # design into per-corner designs and silently restores the leakage. It is
-        # also the shorter list to tick — the geometry parameters, not every
-        # temperature/supply/process column plus everything derived from them.
-        self._design_column_selection: list[str] = []
-        # Corner-form split inherited from a loaded config; see _current_split_corner_columns.
-        self._config_split_corner_columns: list[str] = []
-        self.baseline_design_columns_list = QListWidget()
-        self.baseline_design_columns_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-        self.baseline_design_columns_list.setMaximumHeight(96)
-        self.baseline_design_columns_list.setToolTip(
-            "Check the columns that identify one design — the geometry/parameter "
-            "columns that stay the same as a design is re-simulated across PVT "
-            "corners. Every other column is treated as corner-varying. Scan the "
-            "dataset to list its input-feature columns."
-        )
-        self.baseline_design_columns_list.itemChanged.connect(self._on_design_column_toggled)
-        # Off by default because the randomized campaigns this suite targets put
-        # each design at exactly one corner, where a row-level split is already
-        # design-disjoint and this checkbox is a no-op. It matters for datasets that
-        # re-simulate the same designs across corners, where a row split leaks.
-        self.baseline_design_split_checkbox = QCheckBox("Keep each design in one fold")
-        self.baseline_design_split_checkbox.setChecked(False)
-        self.baseline_design_split_checkbox.setToolTip(
-            "Design-level split: rows that agree on every checked Design Identity "
-            "column are the same design measured at different PVT corners, and all "
-            "of them stay in the same train/validation/test fold. Without this, the "
-            "same design appears in train at one corner and in test at another, "
-            "which leaks design information and makes test error look too good. "
-            "Works with every model type; requires at least one checked Design "
-            "Identity column.\n\n"
-            "Leave this off when every design appears at only one corner — the "
-            "row-level split is already design-disjoint there and this changes "
-            "nothing. Tick it when designs repeat across corners, which is when a "
-            "row-level split leaks and the MAE cards read far better than the "
-            "model really is.\n\n"
-            "When you do tick it, raise Train Fraction (measured: 0.92 / 0.07 works "
-            "well), because holding whole designs out removes them from training and "
-            "it is design variety, not row count, that the model needs to generalize "
-            "to new designs."
-        )
-        self.baseline_design_split_checkbox.toggled.connect(self._refresh_projection_controls_enabled)
         self.baseline_epochs_spin_box = self._make_int_spin(1, 5000, 300)
         self.baseline_batch_size_spin_box = self._make_int_spin(1, 4096, 16)
         self.baseline_learning_rate_spin_box = self._make_float_spin(1e-6, 1.0, 1e-4, decimals=6, step=1e-5, scientific=True)
@@ -716,8 +669,6 @@ class MlpTrainingStudio(QMainWindow):
             ("LR Scheduler", self.baseline_scheduler_combo_box),
             ("Train Fraction", self.baseline_train_fraction_spin_box),
             ("Validation Fraction", self.baseline_validation_fraction_spin_box),
-            ("Design-Level Split", self.baseline_design_split_checkbox),
-            ("Design Identity Columns", self.baseline_design_columns_list),
             ("Random Seed", self.baseline_seed_spin_box),
         ]
         for row, (label, widget) in enumerate(fields):
@@ -1182,11 +1133,6 @@ class MlpTrainingStudio(QMainWindow):
                 "val_frac": self.baseline_validation_fraction_spin_box.value(),
                 "seed": self.baseline_seed_spin_box.value(),
                 "max_samples": None,
-                # Preview the same split mode a run would use (the backend falls
-                # back to row-level with a note if the selection does not fit
-                # this dataset, so a stale selection cannot break scanning).
-                "split_corner_columns": self._current_split_corner_columns(),
-                "split_design_columns": self._current_split_design_columns(),
                 # Auto-managed cache: rebuild from the folder. Manually-selected cache:
                 # reuse it if present (only build when missing).
                 "overwrite": not self._cache_path_manually_selected,
@@ -1210,8 +1156,6 @@ class MlpTrainingStudio(QMainWindow):
                 "train_frac": self.baseline_train_fraction_spin_box.value(),
                 "val_frac": self.baseline_validation_fraction_spin_box.value(),
                 "max_samples": None,
-                "split_corner_columns": self._current_split_corner_columns(),
-                "split_design_columns": self._current_split_design_columns(),
             },
             task_name="suggest",
             busy_state="Suggesting",
@@ -1569,7 +1513,6 @@ class MlpTrainingStudio(QMainWindow):
             self.append_log(f"[Split] {message}")
         scanned_columns = list(result.get("active_input_feature_names", []))
         self._populate_projection_columns(scanned_columns)
-        self._populate_design_columns(scanned_columns)
         self._fill_table(self.data_preview_table, result["preview_rows"])
         self._set_cache_path_value(result["cache_path"], manually_selected=self._cache_path_manually_selected)
         self.append_log(f"Dataset scan completed for {result['dataset_name']}.")
@@ -2006,20 +1949,6 @@ class MlpTrainingStudio(QMainWindow):
             "model_type": self.baseline_model_type_combo_box.currentText(),
             "projection_columns": self._selected_projection_columns(),
             "projection_dim": self.baseline_projection_dim_spin_box.value(),
-            # [] means "design-level split off" — the checkbox state is encoded in
-            # whether the list is empty, so one key round-trips both.
-            "split_design_columns": (
-                self._selected_design_columns()
-                if self.baseline_design_split_checkbox.isChecked()
-                else []
-            ),
-            # A split inherited from a CLI config is persisted too; without it a
-            # session restart would quietly drop back to the row-level split.
-            "split_corner_columns": (
-                list(self._config_split_corner_columns)
-                if self.baseline_design_split_checkbox.isChecked()
-                else []
-            ),
             "epochs": self.baseline_epochs_spin_box.value(),
             "batch_size": self.baseline_batch_size_spin_box.value(),
             "learning_rate": float(self.baseline_learning_rate_spin_box.value()),
@@ -2054,24 +1983,25 @@ class MlpTrainingStudio(QMainWindow):
             projection_dim = payload.get("projection_dim")
             if projection_dim is not None:
                 self.baseline_projection_dim_spin_box.setValue(int(projection_dim))
-        # Design-level split. Form dicts persist the design-column list ([] == off),
-        # so it round-trips exactly. Configs built from TrainConfig defaults (suggest,
-        # and search results that ran without the split) carry None, which must leave
-        # the user's split setup untouched — same guard as the projection fields above.
-        split_design_columns = payload.get("split_design_columns")
-        if split_design_columns is not None:
-            self.baseline_design_split_checkbox.setChecked(bool(split_design_columns))
-            if split_design_columns:
-                self._set_design_columns_selection([str(name) for name in split_design_columns])
-        # A config written by the CLI (or an older session) may specify the split the
-        # other way round, by corner columns. Carry that through untouched so loading
-        # it reproduces the run it describes; the picker above still wins once the
-        # user checks design columns of their own.
-        split_corner_columns = payload.get("split_corner_columns")
-        if split_corner_columns is not None:
-            self._config_split_corner_columns = [str(name) for name in split_corner_columns]
-            if split_corner_columns and not self._selected_design_columns():
-                self.baseline_design_split_checkbox.setChecked(True)
+        # The design-level split was removed from the GUI (the datasets this GUI
+        # targets put each design at one corner, where the row-level split is
+        # already design-disjoint). Configs written before that — or by the CLI,
+        # which still supports it — may carry the keys; ignore them rather than
+        # fail the restore, but say something when one is non-empty, because the
+        # split it asked for will not happen and silence would look like it did.
+        split_columns = [
+            str(name)
+            for key in ("split_design_columns", "split_corner_columns")
+            for name in (payload.get(key) or [])
+        ]
+        if split_columns:
+            self.append_log(
+                "This configuration set a design-level split "
+                f"(columns: {', '.join(split_columns)}). That option has been "
+                "removed from the GUI, so this run will use the row-level split. "
+                "It is still available from the command line via train_baseline.py "
+                "--split-design-columns / --split-corner-columns."
+            )
         self.baseline_epochs_spin_box.setValue(int(payload.get("epochs", self.baseline_epochs_spin_box.value())))
         self.baseline_batch_size_spin_box.setValue(int(payload.get("batch_size", self.baseline_batch_size_spin_box.value())))
         self.baseline_learning_rate_spin_box.setValue(float(payload.get("learning_rate", self.baseline_learning_rate_spin_box.value())))
@@ -2131,73 +2061,6 @@ class MlpTrainingStudio(QMainWindow):
     # ------------------------------------------------------------------
     def _selected_projection_columns(self) -> list[str]:
         return list(self._projection_column_selection)
-
-    def _selected_design_columns(self) -> list[str]:
-        return list(self._design_column_selection)
-
-    def _current_split_design_columns(self) -> list[str] | None:
-        """Design-identity columns for the split, or None when it is off."""
-        if not self.baseline_design_split_checkbox.isChecked():
-            return None
-        return self._selected_design_columns() or None
-
-    def _current_split_corner_columns(self) -> list[str] | None:
-        """Corner columns from a loaded config, used only when no design columns are picked.
-
-        The GUI itself always specifies the split by design identity; this keeps a
-        CLI-written config that used the corner form running as its author meant.
-        """
-        if not self.baseline_design_split_checkbox.isChecked() or self._selected_design_columns():
-            return None
-        return list(self._config_split_corner_columns) or None
-
-    def _on_design_column_toggled(self, _item: QListWidgetItem) -> None:
-        widget = self.baseline_design_columns_list
-        self._design_column_selection = [
-            widget.item(index).text()
-            for index in range(widget.count())
-            if widget.item(index).checkState() == Qt.CheckState.Checked
-        ]
-        # An explicit design-identity pick supersedes a corner list inherited from a
-        # loaded config, so the two can never both reach the run config.
-        if self._design_column_selection:
-            self._config_split_corner_columns = []
-
-    def _rebuild_design_column_items(self, names: list[str]) -> None:
-        widget = self.baseline_design_columns_list
-        widget.blockSignals(True)
-        widget.clear()
-        for name in names:
-            item = QListWidgetItem(name)
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(
-                Qt.CheckState.Checked
-                if name in self._design_column_selection
-                else Qt.CheckState.Unchecked
-            )
-            widget.addItem(item)
-        widget.blockSignals(False)
-
-    def _populate_design_columns(self, names: list[str]) -> None:
-        """Fill the design-identity picker from the scanned dataset's feature names."""
-        missing = [name for name in self._design_column_selection if name not in names]
-        if missing:
-            self.append_log(
-                "Design identity column(s) not present in the scanned dataset were "
-                "unselected: " + ", ".join(missing)
-            )
-        self._design_column_selection = [
-            name for name in self._design_column_selection if name in names
-        ]
-        self._rebuild_design_column_items(names)
-
-    def _set_design_columns_selection(self, names: list[str]) -> None:
-        """Programmatically select design columns (session restore / config load)."""
-        self._design_column_selection = [str(name) for name in names]
-        widget = self.baseline_design_columns_list
-        existing = [widget.item(index).text() for index in range(widget.count())]
-        items = existing + [name for name in self._design_column_selection if name not in existing]
-        self._rebuild_design_column_items(items)
 
     def _on_projection_column_toggled(self, _item: QListWidgetItem) -> None:
         # Recompute from widget state so the selection stays in dataset column
@@ -2259,89 +2122,38 @@ class MlpTrainingStudio(QMainWindow):
             canonical_model_type(self.baseline_model_type_combo_box.currentText())
             == "SpectraHydraProj"
         )
-        # The corner picker feeds the projection embedding only; the split is
-        # driven by the separate design-identity picker below.
-        design_split = self.baseline_design_split_checkbox.isChecked()
         self.baseline_projection_columns_list.setEnabled(is_projection)
         self.baseline_projection_dim_spin_box.setEnabled(is_projection)
-        self.baseline_design_columns_list.setEnabled(design_split)
 
     def _validate_projection_settings(self) -> bool:
         is_projection = (
             canonical_model_type(self.baseline_model_type_combo_box.currentText())
             == "SpectraHydraProj"
         )
-        design_split = self.baseline_design_split_checkbox.isChecked()
-        if not is_projection and not design_split:
+        if not is_projection:
             return True
         known: set[str] = set()
-        known_active: set[str] = set()
         if self.last_scan_result is not None:
-            known_active = set(self.last_scan_result.get("active_input_feature_names", []))
-            known = known_active | set(self.last_scan_result.get("dropped_input_feature_names", []))
+            known = set(self.last_scan_result.get("active_input_feature_names", [])) | set(
+                self.last_scan_result.get("dropped_input_feature_names", [])
+            )
 
-        if is_projection:
-            selected = self._selected_projection_columns()
-            if not selected:
-                self._show_warning(
-                    "SpectraHydraProj needs at least one PVT corner column. Check the "
-                    "corner/condition columns (e.g. temperature, supply, or process "
-                    "one-hots) in the Baseline tab's PVT Corner Columns list."
-                )
-                return False
-            unknown = [name for name in selected if name not in known]
-            if known and unknown:
-                self._show_warning(
-                    "These PVT corner columns are not input features of the scanned "
-                    "dataset: " + ", ".join(unknown) + ". Re-select the corner columns "
-                    "for this dataset."
-                )
-                return False
-
-        if design_split:
-            # A config loaded from the CLI may specify the split by corner columns
-            # instead; that form is validated by the engine, which now rejects a
-            # selection that leaves every row its own design.
-            design_columns = self._selected_design_columns()
-            if not design_columns:
-                if self._config_split_corner_columns:
-                    return True
-                self._show_warning(
-                    "The design-level split needs at least one Design Identity column "
-                    "so it knows which rows are the same design at different corners. "
-                    "Check the geometry/parameter columns in the Baseline tab's Design "
-                    "Identity Columns list, or untick 'Keep each design in one fold'."
-                )
-                return False
-            unknown = [name for name in design_columns if name not in known]
-            if known and unknown:
-                self._show_warning(
-                    "These design identity columns are not input features of the "
-                    "scanned dataset: " + ", ".join(unknown) + ". Re-select them for "
-                    "this dataset."
-                )
-                return False
-            overlap = [name for name in design_columns if name in set(self._selected_projection_columns())]
-            if overlap:
-                self._show_warning(
-                    "These columns are checked as PVT Corner Columns and as Design "
-                    "Identity columns: " + ", ".join(overlap) + ". A corner column "
-                    "used as design identity splits one design into a separate "
-                    "'design' per corner, which puts the same physical design in "
-                    "train and test again. Uncheck them from Design Identity Columns."
-                )
-                return False
-            # Every varying column marked as design identity leaves nothing that can
-            # vary across a design's corners, so each row becomes its own design and
-            # the split silently degrades to a row-level one.
-            if known_active and set(design_columns) >= known_active:
-                self._show_warning(
-                    "Every varying input column of the scanned dataset is checked as "
-                    "a Design Identity column, so no column is left to vary across a "
-                    "design's PVT corners and every row would be its own design. "
-                    "Check only the geometry/parameter columns."
-                )
-                return False
+        selected = self._selected_projection_columns()
+        if not selected:
+            self._show_warning(
+                "SpectraHydraProj needs at least one PVT corner column. Check the "
+                "corner/condition columns (e.g. temperature, supply, or process "
+                "one-hots) in the Baseline tab's PVT Corner Columns list."
+            )
+            return False
+        unknown = [name for name in selected if name not in known]
+        if known and unknown:
+            self._show_warning(
+                "These PVT corner columns are not input features of the scanned "
+                "dataset: " + ", ".join(unknown) + ". Re-select the corner columns "
+                "for this dataset."
+            )
+            return False
         return True
 
     def _build_baseline_train_config(self) -> TrainConfig:
@@ -2367,8 +2179,6 @@ class MlpTrainingStudio(QMainWindow):
             model_type=form["model_type"],
             projection_columns=form["projection_columns"] or None,
             projection_dim=form["projection_dim"],
-            split_corner_columns=self._current_split_corner_columns(),
-            split_design_columns=self._current_split_design_columns(),
             seed=form["seed"],
             batch_size=form["batch_size"],
             epochs=form["epochs"],
@@ -2398,8 +2208,6 @@ class MlpTrainingStudio(QMainWindow):
             depth=self.baseline_depth_spin_box.value(),
             projection_columns=self._selected_projection_columns() or None,
             projection_dim=self.baseline_projection_dim_spin_box.value(),
-            split_corner_columns=self._current_split_corner_columns(),
-            split_design_columns=self._current_split_design_columns(),
             seed=form["seed"],
             train_frac=float(self.baseline_train_fraction_spin_box.value()),
             val_frac=float(self.baseline_validation_fraction_spin_box.value()),

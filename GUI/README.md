@@ -42,15 +42,16 @@ such as temperature, supply, and process one-hots, and the model concatenates th
 trained embedding onto the inputs; the projection also trains live inside every band
 submodel during self-transfer).
 
-For PVT-style datasets where each design appears once per corner, the optional
-design-level split (the GUI's "Keep each design in one fold" checkbox, any model type) keeps
-every corner row of a design in the same train/validation/test fold. The default
-row-level split would place a design at one corner in train and the same design at
-another corner in test, which leaks design information and makes test error look better
-than it is.
+For PVT-style datasets where the same design is re-simulated across corners, the optional
+design-level split (command line only, any model type) keeps every corner row of a design
+in the same train/validation/test fold. The default row-level split would place a design
+at one corner in train and the same design at another corner in test, which leaks design
+information and makes test error look better than it is. (For randomized campaigns where
+each design appears at exactly one corner — the datasets the GUI targets — the row-level
+split is already design-disjoint, so the GUI does not offer this option.)
 
 Specify it by naming the columns that **identify a design** — the geometry parameters —
-via the GUI's "Design Identity Columns" list or `--split-design-columns`. Everything else
+via `train_baseline.py --split-design-columns` or `--config-json`. Everything else
 is then treated as corner-varying. The older `--split-corner-columns` form (name the
 corner columns instead) still works, but it must cover *every* column that moves with the
 corner, derived ones included: physics anchors, a frozen corner embedding (`e0`…`e15`),

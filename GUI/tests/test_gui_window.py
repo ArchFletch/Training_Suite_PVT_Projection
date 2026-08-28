@@ -525,141 +525,6 @@ def test_projection_form_roundtrip_and_suggestion_keeps_selection(gui_window) ->
     assert form["projection_dim"] == 8
 
 
-def _check_design_column(window, name: str) -> None:
-    from PySide6.QtCore import Qt
-
-    widget = window.baseline_design_columns_list
-    for index in range(widget.count()):
-        if widget.item(index).text() == name:
-            widget.item(index).setCheckState(Qt.CheckState.Checked)
-            return
-    raise AssertionError(f"column {name!r} not in design picker")
-
-
-def test_design_split_checkbox_gates_picker_and_flows_into_configs(
-    gui_window, synthetic_dataset, tmp_path
-) -> None:
-    # The design-identity picker serves the split for EVERY model type, so ticking
-    # the checkbox unlocks it while SpectraNet is selected. The corner picker and
-    # projection width stay SpectraHydraProj-only controls.
-    assert gui_window.baseline_model_type_combo_box.currentText() == "SpectraNet"
-    assert not gui_window.baseline_design_columns_list.isEnabled()
-    gui_window.baseline_design_split_checkbox.setChecked(True)
-    assert gui_window.baseline_design_columns_list.isEnabled()
-    assert not gui_window.baseline_projection_columns_list.isEnabled()
-    assert not gui_window.baseline_projection_dim_spin_box.isEnabled()
-
-    _configure_dataset_paths(gui_window, synthetic_dataset, tmp_path)
-    gui_window.scan_dataset()
-    _check_design_column(gui_window, "x")
-
-    assert gui_window._build_baseline_train_config().split_design_columns == ["x"]
-    assert gui_window._build_transfer_config().split_design_columns == ["x"]
-
-    # Unticking reverts to the row-level split and re-locks the picker.
-    gui_window.baseline_design_split_checkbox.setChecked(False)
-    assert gui_window._build_baseline_train_config().split_design_columns is None
-    assert gui_window._build_transfer_config().split_design_columns is None
-    assert not gui_window.baseline_design_columns_list.isEnabled()
-
-
-def test_design_split_start_blocked_without_design_columns(
-    gui_window, synthetic_dataset, tmp_path, monkeypatch
-) -> None:
-    _configure_dataset_paths(gui_window, synthetic_dataset, tmp_path)
-    gui_window.scan_dataset()
-    gui_window.baseline_design_split_checkbox.setChecked(True)
-
-    launched: list[dict] = []
-    monkeypatch.setattr(
-        gui_window_module,
-        "run_training_workflow",
-        lambda **kwargs: launched.append(kwargs) or {"status": "ok", "baseline": None, "transfer": None},
-    )
-    warnings: list[str] = []
-    monkeypatch.setattr(gui_window, "_show_warning", lambda message: warnings.append(message))
-
-    gui_window.start_baseline_training()
-    assert not launched, "training must not start while the split has no design columns"
-    assert any("Design Identity column" in message for message in warnings)
-    gui_window.start_transfer_learning()
-    assert not launched
-
-    _check_design_column(gui_window, "x")
-    gui_window.start_baseline_training()
-    assert len(launched) == 1
-    assert launched[0]["baseline_config"].split_design_columns == ["x"]
-
-
-def test_design_split_form_roundtrip_and_suggestion_keeps_it(gui_window) -> None:
-    # Session restore before any scan: the design columns become picker items,
-    # and the checkbox state rides on whether the persisted list is non-empty.
-    gui_window._apply_baseline_form(
-        {"model_type": "SpectraNet", "split_design_columns": ["CS_fF", "LD_pH"]}
-    )
-    assert gui_window.baseline_design_split_checkbox.isChecked()
-    form = gui_window._collect_baseline_form()
-    assert form["split_design_columns"] == ["CS_fF", "LD_pH"]
-
-    # Suggest/search payloads built from TrainConfig defaults carry
-    # split_design_columns=None and must not disturb the user's split setup
-    # (same guard as the projection fields).
-    gui_window._apply_baseline_form({"model_type": "SpectraHydra", "split_design_columns": None})
-    assert gui_window.baseline_design_split_checkbox.isChecked()
-    assert gui_window._collect_baseline_form()["split_design_columns"] == ["CS_fF", "LD_pH"]
-
-    # A form that saved the split as off ([]) restores it as off.
-    gui_window._apply_baseline_form({"split_design_columns": []})
-    assert not gui_window.baseline_design_split_checkbox.isChecked()
-    assert gui_window._collect_baseline_form()["split_design_columns"] == []
-
-
-def test_design_split_all_columns_guard_blocks_degenerate_selection(
-    gui_window, synthetic_dataset, tmp_path, monkeypatch
-) -> None:
-    """Checking every varying column as design identity leaves nothing to vary
-    across corners, so every row would be its own design — a row-level split
-    wearing a design-level label. The guard must compare against the ACTIVE
-    names only: the picker never offers dropped (constant) columns, so a guard
-    that unions dropped names in can never fire on a dataset with a constant
-    column (the fixture drops 'const', making it the regression case)."""
-    _configure_dataset_paths(gui_window, synthetic_dataset, tmp_path)
-    gui_window.scan_dataset()
-    assert gui_window.last_scan_result["dropped_input_feature_names"] == ["const"]
-
-    gui_window.baseline_design_split_checkbox.setChecked(True)
-    for name in ("x", "y"):  # every ACTIVE column
-        _check_design_column(gui_window, name)
-
-    launched: list[dict] = []
-    monkeypatch.setattr(
-        gui_window_module,
-        "run_training_workflow",
-        lambda **kwargs: launched.append(kwargs) or {"status": "ok", "baseline": None, "transfer": None},
-    )
-    warnings: list[str] = []
-    monkeypatch.setattr(gui_window, "_show_warning", lambda message: warnings.append(message))
-
-    gui_window.start_baseline_training()
-    assert not launched
-    assert any("every row would be its own design" in message for message in warnings)
-
-
-def test_corner_form_split_from_a_loaded_config_still_runs(gui_window) -> None:
-    """A CLI-written config specifies the split by corner columns. Loading it must
-    reproduce that run, and an explicit design-identity pick must supersede it so
-    the two forms can never both reach the engine."""
-    gui_window._apply_baseline_form({"split_corner_columns": ["Temp_C", "VDD"]})
-    assert gui_window.baseline_design_split_checkbox.isChecked()
-    assert gui_window._current_split_corner_columns() == ["Temp_C", "VDD"]
-    assert gui_window._current_split_design_columns() is None
-
-    gui_window._set_design_columns_selection(["CS_fF"])
-    gui_window._on_design_column_toggled(None)
-    assert gui_window._current_split_design_columns() == ["CS_fF"]
-    assert gui_window._current_split_corner_columns() is None
-
-
 def test_scan_split_warnings_reach_the_run_log(gui_window, monkeypatch) -> None:
     """warnings.warn goes to stderr, which a packaged GUI never shows — and the
     crossing warning is the only signal for splintering that auto-fold cannot
@@ -685,39 +550,6 @@ def test_scan_split_warnings_reach_the_run_log(gui_window, monkeypatch) -> None:
     )
     gui_window._on_scan_completed(gui_window_module.build_and_scan_dataset())
     assert "no design appears at more than 5" in gui_window.run_log_text_edit.toPlainText()
-
-
-def test_inherited_corner_split_survives_a_session_roundtrip(gui_window) -> None:
-    """A CLI config's corner-form split must persist across a restart; dropping it
-    would silently revert the run to the leaky row-level split."""
-    gui_window._apply_baseline_form({"split_corner_columns": ["Temp_C", "VDD"]})
-    saved = gui_window._collect_baseline_form()
-    assert saved["split_corner_columns"] == ["Temp_C", "VDD"]
-
-    gui_window.baseline_design_split_checkbox.setChecked(False)
-    gui_window._config_split_corner_columns = []
-    gui_window._apply_baseline_form(saved)
-    assert gui_window.baseline_design_split_checkbox.isChecked()
-    assert gui_window._current_split_corner_columns() == ["Temp_C", "VDD"]
-
-
-def test_column_checked_as_both_corner_and_design_identity_is_blocked(
-    gui_window, synthetic_dataset, tmp_path, monkeypatch
-) -> None:
-    """A corner column used as design identity splinters each design into one
-    'design' per corner — the exact leakage this feature removes."""
-    _configure_dataset_paths(gui_window, synthetic_dataset, tmp_path)
-    gui_window.scan_dataset()
-    gui_window.baseline_model_type_combo_box.setCurrentText("SpectraHydraProj")
-    _check_projection_column(gui_window, "y")
-    gui_window.baseline_design_split_checkbox.setChecked(True)
-    _check_design_column(gui_window, "x")
-    _check_design_column(gui_window, "y")  # also a corner column -> contradiction
-
-    warnings: list[str] = []
-    monkeypatch.setattr(gui_window, "_show_warning", lambda message: warnings.append(message))
-    assert gui_window._validate_projection_settings() is False
-    assert any("checked as PVT Corner Columns and as Design Identity" in m for m in warnings)
 
 
 def test_dataset_folder_survives_a_session_roundtrip(gui_window, tmp_path) -> None:
@@ -778,20 +610,27 @@ def test_per_channel_mae_cards_appear_from_the_run(gui_window) -> None:
     assert cards["gain"].value_label.text() == "-"
 
 
-def test_design_split_is_off_until_asked_for(gui_window) -> None:
-    """A fresh form starts with the design-level split off, and asks for nothing.
+def test_design_split_keys_in_old_configs_log_a_note_and_do_not_break(gui_window) -> None:
+    """The design-level split was removed from the GUI (CLI-only now). Sessions and
+    configs written before that still carry the keys; loading one must not fail,
+    must not silently pretend the split will happen, and must not put the columns
+    into the run config."""
+    gui_window._apply_baseline_form(
+        {"split_design_columns": ["CS_fF", "LD_pH"], "split_corner_columns": ["Temp_C"]}
+    )
+    log_text = gui_window.run_log_text_edit.toPlainText()
+    assert "removed from the GUI" in log_text
+    assert "CS_fF" in log_text and "Temp_C" in log_text
+    assert "--split-design-columns" in log_text
 
-    The randomized campaigns this suite targets put each design at one corner, where
-    a row-level split is already design-disjoint and the checkbox is a no-op, so it
-    is opt-in. Pinning this keeps a stray setChecked(True) — or a widget swap whose
-    default differs — from silently changing every new run's protocol.
-    """
-    assert gui_window.baseline_design_split_checkbox.isChecked() is False
-    form = gui_window._collect_baseline_form()
-    assert form["split_design_columns"] == []
-    assert form["split_corner_columns"] == []
-    assert gui_window._current_split_design_columns() is None
-    assert gui_window._current_split_corner_columns() is None
+    assert gui_window._build_baseline_train_config().split_design_columns is None
+    assert gui_window._build_baseline_train_config().split_corner_columns is None
+    assert gui_window._build_transfer_config().split_design_columns is None
+
+    # TrainConfig-default payloads (None) and split-off payloads ([]) stay silent.
+    gui_window.run_log_text_edit.clear()
+    gui_window._apply_baseline_form({"split_design_columns": None, "split_corner_columns": []})
+    assert "removed from the GUI" not in gui_window.run_log_text_edit.toPlainText()
 
 
 def test_datasets_without_channel_units_keep_the_single_card(gui_window) -> None:
