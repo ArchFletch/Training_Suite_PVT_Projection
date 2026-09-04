@@ -1162,6 +1162,150 @@ def _corner_derived_columns(
 
 
 
+# Column-name evidence that a feature is a PVT corner/condition rather than a
+# design knob. Matched case-insensitively against whole underscore-separated word
+# parts, so "Temp_C", "VDD", "proc_ss" and "pvt_corner" hit while "template",
+# "vddio_pad_width" (a geometry knob) and "processing_gain" do not.
+_CORNER_NAME_WORDS = frozenset(
+    {
+        "temp", "temperature", "tc", "tj", "ta",
+        "vdd", "vcc", "vss", "vsup", "vsupply", "supply", "volt", "voltage",
+        "proc", "process", "corner", "pvt", "skew", "sigma", "mc",
+    }
+)
+
+# A corner column is categorical: temperature, supply and process sweeps have a
+# handful of levels, never hundreds. Anything richer is treated as a design knob.
+MAX_CORNER_LEVELS = 16
+
+
+def _corner_name_words(name: str) -> set[str]:
+    """The lowercase word parts of a column name, with trailing digits stripped.
+
+    ``proc_ss`` -> {"proc", "ss"}; ``Temp_C`` -> {"temp", "c"}; ``VDD1`` -> {"vdd"}.
+    """
+    parts = re.split(r"[^0-9A-Za-z]+", name)
+    words: set[str] = set()
+    for part in parts:
+        if not part:
+            continue
+        lowered = part.lower()
+        words.add(lowered)
+        # "VDD1" / "proc2" name one level of a corner axis, so drop the index.
+        words.add(re.sub(r"\d+$", "", lowered))
+    return {w for w in words if w}
+
+
+def corner_column_name_matches(input_feature_names: Sequence[str]) -> list[str]:
+    """Column names whose wording says "PVT corner condition"."""
+    return [
+        name for name in input_feature_names if _corner_name_words(name) & _CORNER_NAME_WORDS
+    ]
+
+
+def detect_corner_columns(
+    features: np.ndarray,
+    input_feature_names: Sequence[str],
+    *,
+    max_levels: int = MAX_CORNER_LEVELS,
+) -> dict[str, Any]:
+    """Detect which input columns are PVT corner conditions, from the data alone.
+
+    A PVT dataset re-simulates the same design at each of several corners, so it
+    has a cross-product shape: a few low-cardinality columns (temperature,
+    supply, process one-hots) VARY while the design knobs stay fixed, and every
+    design appears once per corner. That structure is what this looks for, so it
+    works on datasets whose corner columns are named nothing like ``Temp_C``.
+
+    Low cardinality alone is not enough — a randomized design-of-experiments knob
+    may well have three levels. The distinguishing property is that a corner
+    column varies WITHIN a design while a design knob does not, so candidates are
+    refined to a fixed point: group the rows by everything outside the candidate
+    set, drop any candidate that never varies inside a group (it was a design
+    knob, and excluding it merged designs that differ), and regroup. Each pass
+    makes the design key finer, so this terminates.
+
+    Returns a dict that is always shaped the same; ``corner_columns`` is empty
+    when the dataset shows no corner structure. ``rows_per_design`` and
+    ``designs_at_multiple_corners`` are the evidence a caller should report:
+    corner conditioning only helps when designs really are repeated.
+    """
+    names = [str(name) for name in input_feature_names]
+    empty: dict[str, Any] = {
+        "corner_columns": [],
+        "name_matched_columns": corner_column_name_matches(names),
+        "design_count": 0,
+        "corner_count": 0,
+        "rows_per_design": 0.0,
+        "designs_at_multiple_corners": 0.0,
+    }
+    if features.ndim != 2 or features.shape[0] < 2 or features.shape[1] != len(names):
+        return empty
+
+    row_count = features.shape[0]
+    level_counts = [len(np.unique(features[:, i])) for i in range(features.shape[1])]
+    # A column that never repeats a value cannot be a corner axis, and one that
+    # is constant carries no information at all.
+    candidates = [
+        i
+        for i, levels in enumerate(level_counts)
+        if 2 <= levels <= max_levels and levels * 2 <= row_count
+    ]
+
+    # Refine to a fixed point: a candidate that is constant within every design
+    # group is a design knob, not a corner condition.
+    for _ in range(len(names) + 1):
+        if not candidates:
+            return empty
+        design_idx = [i for i in range(len(names)) if i not in set(candidates)]
+        if not design_idx:
+            # Every column looks like a corner, so there is no design key left to
+            # group by and no way to tell corners from knobs. Refuse to guess.
+            return empty
+        _, groups = np.unique(features[:, design_idx], axis=0, return_inverse=True)
+        varying = _columns_varying_within_groups(features, candidates, groups)
+        if len(varying) == len(candidates):
+            break
+        candidates = varying
+    else:  # pragma: no cover - the loop shrinks candidates, so it cannot spin
+        return empty
+
+    if not candidates:
+        return empty
+
+    group_labels, group_sizes = np.unique(groups, return_counts=True)
+    corner_tuples = len(np.unique(features[:, candidates], axis=0))
+    repeated = float(np.mean(group_sizes > 1))
+    # Corner conditioning is only meaningful when the same design is actually
+    # re-simulated across corners. One row per design means the columns vary
+    # freely per sample -- a randomized sweep, not a corner campaign.
+    if corner_tuples < 2 or repeated < 0.5:
+        return {**empty, "name_matched_columns": corner_column_name_matches(names)}
+
+    return {
+        "corner_columns": [names[i] for i in candidates],
+        "name_matched_columns": corner_column_name_matches(names),
+        "design_count": int(len(group_labels)),
+        "corner_count": int(corner_tuples),
+        "rows_per_design": float(row_count / max(len(group_labels), 1)),
+        "designs_at_multiple_corners": repeated,
+    }
+
+
+def _columns_varying_within_groups(
+    features: np.ndarray, candidate_idx: list[int], groups: np.ndarray
+) -> list[int]:
+    """Candidates that take more than one value inside at least one group."""
+    num_groups = int(groups.max()) + 1
+    values = features[:, candidate_idx]
+    highs = np.full((num_groups, values.shape[1]), -np.inf, dtype=np.float64)
+    lows = np.full((num_groups, values.shape[1]), np.inf, dtype=np.float64)
+    np.maximum.at(highs, groups, values)
+    np.minimum.at(lows, groups, values)
+    varies = np.any(highs != lows, axis=0)
+    return [candidate_idx[position] for position in np.flatnonzero(varies)]
+
+
 def design_split_indices(
     features: np.ndarray,
     input_feature_names: list[str],

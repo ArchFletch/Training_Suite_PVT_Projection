@@ -48,6 +48,18 @@ a smooth function of frequency rather than one output slot per point. Width sets
 trunk width, Depth the number of residual blocks; the study's reference recipe was
 width 512, depth 4, batch 32, AdamW ~1e-3 with the cosine scheduler).
 
+The scan-only recommender detects PVT corner structure on its own and will recommend
+`SpectraHydraProj` with the corner columns already selected. It looks for the shape a
+corner campaign has — a few low-cardinality columns that vary while the design knobs
+stay fixed, with each design appearing once per corner — rather than for particular
+column names, so it also works on datasets whose corner columns are not called
+`Temp_C` or `VDD`. A low-cardinality *design* knob is not mistaken for a corner,
+because a corner column must vary within a design and a design knob does not. Columns
+identified from structure alone but not recognizable by name are flagged in the
+warnings for review. Data-starved datasets (the conservative capacity tier) keep the
+smaller `SpectraNet`: there is no `SpectraNet` + projection model, and such a dataset
+cannot support a corner embedding.
+
 For PVT-style datasets where the same design is re-simulated across corners, the optional
 design-level split (command line only, any model type) keeps every corner row of a design
 in the same train/validation/test fold. The default row-level split would place a design
