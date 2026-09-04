@@ -63,7 +63,15 @@ def _is_packaged_runtime(*, env: Mapping[str, str]) -> bool:
         return True
     if mode_override == "source":
         return False
-    return bool(getattr(sys, "frozen", False))
+    # `sys.frozen` alone is not enough: PyInstaller and cx_Freeze set it, but
+    # Nuitka -- the freezer this project actually ships with -- does not. It marks
+    # every compiled module with `__compiled__` instead. Relying on sys.frozen
+    # alone made the packaged app fall through to source mode, where repo_root is
+    # derived from __file__, so an installed build wrote its config, cache, logs
+    # and default run outputs into its own install directory. That is writable
+    # under %LOCALAPPDATA%, so it looked fine and then lost user data on upgrade
+    # or uninstall.
+    return bool(getattr(sys, "frozen", False)) or "__compiled__" in globals()
 
 
 def _source_checkout_runtime_paths() -> RuntimePaths:

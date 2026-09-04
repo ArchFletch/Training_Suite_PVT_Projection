@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 from xfmr_v2.licensing import (
@@ -7,6 +8,7 @@ from xfmr_v2.licensing import (
     LicenseConnectionError,
     LicenseHeartbeatResult,
     LicenseLeaseController,
+    LicenseLeaseState,
     LicenseReleaseResult,
     LicenseStatus,
 )
@@ -116,3 +118,29 @@ def test_controller_releases_active_lease_cleanly() -> None:
     # heartbeat, so the controller has to send it. A fake that accepted lease_id
     # alone let the real client's signature drift out from under this caller.
     assert server.release_calls == [("lease_001", controller.identity.machine_id)]
+
+
+def test_licensing_fails_closed_when_no_server_is_configured() -> None:
+    """An untouched License Server field must not mean "unlimited use".
+
+    This is the state every customer sees on first launch. The gate previously
+    read `(not licensing_enabled) or phase == "checked_out"`, so a fresh install
+    that never configured a server could run everything forever -- the product was
+    ungated by default rather than by decision. Pin the closed default here: the
+    only state that permits a run is a seat actually checked out.
+    """
+    fresh = LicenseLeaseState()
+
+    assert fresh.server_url == ""
+    assert fresh.licensing_enabled is False
+    assert fresh.can_start_runs is False, "unconfigured must not permit runs"
+
+    # Every non-granted phase stays closed, including the grace window: an
+    # in-flight run may finish on a warning lease, but new work may not start on
+    # one the server has stopped confirming.
+    for phase in ("unconfigured", "checking", "error", "checkout_denied", "released", "heartbeat_warning"):
+        state = replace(fresh, phase=phase, server_url="http://license-host:27850")
+        assert state.can_start_runs is False, f"phase {phase!r} must not permit runs"
+
+    granted = replace(fresh, phase="checked_out", server_url="http://license-host:27850", lease_id="lease_001")
+    assert granted.can_start_runs is True

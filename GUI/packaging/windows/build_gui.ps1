@@ -64,6 +64,22 @@ $nuitkaArgs = @(
     "--include-package=numpy",
     "--include-package=pyqtgraph",
     "--include-package=torch",
+    # matplotlib is imported lazily inside runner.py's plot writers, so it is easy
+    # to miss here -- and it needs its mpl-data tree (matplotlibrc, fonts) on disk
+    # at runtime, which only --include-package-data copies. Without both, every
+    # training run fails when it tries to save a plot.
+    "--include-package=matplotlib",
+    # gui_backend probes `import onnx` to decide whether ONNX export is offered,
+    # and the MATLAB helpers under matlab/ consume exported models, so the export
+    # path is customer-facing rather than optional.
+    "--include-package=onnx",
+    "--include-package=onnxruntime",
+    "--include-package-data=onnxruntime",
+    # torch.onnx.export imports onnxscript internally on torch >= 2.6. Nuitka
+    # cannot see that from this project's imports, so without an explicit include
+    # the packaged Export to ONNX button dies on ModuleNotFoundError.
+    "--include-package=onnxscript",
+    "--include-package-data=onnxscript",
     "--standalone",
     "--noinclude-dlls=*.cpp.o",
     "--noinclude-dlls=*.qsb",
