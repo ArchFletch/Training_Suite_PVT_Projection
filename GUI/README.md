@@ -182,6 +182,25 @@ offer values with no control to apply them to. Loading a session that set up tra
 logs a note saying so, since the run now trains one model across the whole frequency
 range rather than one per band.
 
+#### Running without a license during development
+
+Licensing fails closed: a run needs a seat checked out from the server named in the
+License Server field, and an empty field is not an unlicensed free pass. To work on the
+GUI without standing up a server, set `MLP_DEV_UNLICENSED=1`:
+
+```bash
+MLP_DEV_UNLICENSED=1 python launch_gui.py
+```
+
+The switch is honored **only from a source checkout**. A packaged build ignores it
+whatever it is set to, which is what makes it safe to have in the tree: shipping
+fail-closed was a deliberate decision, and a bypass a customer could set would undo it.
+A bypassed session is labeled so it cannot be mistaken for a licensed one, in the window
+title, the seat badge (`Dev Bypass`), the license status line, and the run log.
+
+The automated tests do not need the variable. They grant a seat through the real gate,
+so a regression in the licensing logic still fails them.
+
 Start Baseline Training is disabled while a task is
 running and whenever no license seat is checked out. A disabled button carries the
 reason as its tooltip, because a disabled button cannot be clicked and so cannot raise

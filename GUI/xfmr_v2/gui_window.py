@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -42,6 +44,28 @@ from PySide6.QtWidgets import (
 )
 
 from .app_paths import current_runtime_paths
+
+# Development-only escape from the licence gate. Set MLP_DEV_UNLICENSED=1 to run
+# the GUI from a source checkout without a licence server.
+DEV_UNLICENSED_ENV = "MLP_DEV_UNLICENSED"
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def dev_unlicensed_mode(env: Mapping[str, str] | None = None) -> bool:
+    """Whether the licence gate is bypassed for local development.
+
+    Only ever true in a SOURCE checkout. A packaged build ignores the variable
+    entirely, so this cannot reach a customer: shipping fail-closed was a
+    deliberate decision, and a bypass a user could switch on would undo it.
+    Packaging smoke tests can prove that by setting MLP_APP_PATH_MODE=packaged.
+
+    A session running this way is labelled in the window title, the seat badge
+    and the run log, so a bypassed run is never mistaken for a licensed one.
+    """
+    active = dict(os.environ if env is None else env)
+    if str(active.get(DEV_UNLICENSED_ENV, "")).strip().lower() not in _TRUTHY:
+        return False
+    return current_runtime_paths(env=active).mode == "source"
 from .gui_backend import (
     build_and_scan_dataset,
     build_suggest_result,
@@ -220,7 +244,10 @@ class MlpTrainingStudio(QMainWindow):
         self._baseline_epochs: list[float] = []
         self._baseline_train_losses: list[float] = []
         self._baseline_val_losses: list[float] = []
-        self.setWindowTitle("Surrogate Model Training Suite")
+        title = "Surrogate Model Training Suite"
+        if dev_unlicensed_mode():
+            title += "  —  DEVELOPMENT BUILD (licence check disabled)"
+        self.setWindowTitle(title)
         self.resize(1440, 920)
         self.setMinimumSize(1280, 800)
 
@@ -809,6 +836,12 @@ class MlpTrainingStudio(QMainWindow):
         self._set_metric_defaults()
         self._refresh_license_display()
         self._update_topbar_run_name()
+        if dev_unlicensed_mode():
+            self.append_log(
+                f"{DEV_UNLICENSED_ENV} is set and this is a source checkout, so the licence "
+                "check is disabled for this session. Runs will start without a seat. This "
+                "switch is ignored in a packaged build."
+            )
         self.append_log("Ready. Select the .npz dataset file and scan the data to begin.")
 
     def _load_last_session_if_available(self) -> None:
@@ -973,12 +1006,19 @@ class MlpTrainingStudio(QMainWindow):
 
     def _refresh_license_display(self) -> None:
         effective_status = self.license_lease_state.last_status or self.license_server_status
-        self.license_seat_state_badge.set_status(self.license_lease_state.badge_text)
+        self.license_seat_state_badge.set_status(
+            "Dev Bypass" if dev_unlicensed_mode() else self.license_lease_state.badge_text
+        )
         self.license_company_value.setText(effective_status.company_name if effective_status and effective_status.company_name else "Not checked yet")
         self.license_window_value.setText(effective_status.window_summary if effective_status else "Not checked yet")
         self.license_seat_usage_value.setText(effective_status.seat_summary if effective_status else "Not checked yet")
         self.license_lease_expires_value.setText(format_utc_timestamp(self.license_lease_state.expires_at) or "No active seat")
-        self.license_status_text.setText(self._license_display_message())
+        self.license_status_text.setText(
+            f"{DEV_UNLICENSED_ENV} is set: the licence check is disabled for this "
+            "source-checkout session. Packaged builds ignore it."
+            if dev_unlicensed_mode()
+            else self._license_display_message()
+        )
         self._refresh_run_button_availability()
 
     def _license_display_message(self) -> str:
@@ -991,6 +1031,8 @@ class MlpTrainingStudio(QMainWindow):
         return self.license_connection_message
 
     def _license_allows_new_runs(self) -> bool:
+        if dev_unlicensed_mode():
+            return True
         # Fail closed. There is no "no server configured, so anything goes" branch:
         # that made an untouched License Server field equivalent to an unlimited
         # licence. A run requires a seat checked out from the server currently

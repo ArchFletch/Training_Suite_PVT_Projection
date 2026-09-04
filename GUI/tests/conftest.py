@@ -46,13 +46,29 @@ def isolated_app_state(tmp_path_factory, monkeypatch):
         license_client_path=gui_state / app_paths.LICENSE_CLIENT_FILENAME,
         last_session_path=gui_state / app_paths.LAST_SESSION_FILENAME,
     )
+    real_current_runtime_paths = app_paths.current_runtime_paths
+
+    def redirected_runtime_paths(*, platform=None, env=None):
+        """Temp-dir locations, but the REAL source/packaged decision.
+
+        The stub used to hard-code mode="source" and take no arguments, so a
+        test could not exercise behaviour that depends on the runtime mode, and
+        any caller passing ``env`` hit a TypeError.
+        """
+        from dataclasses import replace
+
+        mode = real_current_runtime_paths(platform=platform, env=env).mode
+        return replace(paths, mode=mode)
+
     for module in ("xfmr_v2.gui_backend", "xfmr_v2.gui_window", "xfmr_v2.licensing.client_config"):
         try:
             __import__(module)
         except ImportError:
             continue  # optional dependency (e.g. PySide6 absent)
         import sys
-        monkeypatch.setattr(sys.modules[module], "current_runtime_paths", lambda: paths, raising=False)
+        monkeypatch.setattr(
+            sys.modules[module], "current_runtime_paths", redirected_runtime_paths, raising=False
+        )
     return paths
 
 
