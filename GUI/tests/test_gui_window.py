@@ -71,11 +71,11 @@ def test_window_selected_device_flows_into_configs(gui_window, synthetic_dataset
 
 
 def _configure_dataset_paths(window, synthetic_dataset: dict[str, Path], tmp_path: Path) -> None:
-    window.input_feature_path_edit.setText(str(synthetic_dataset["input_file"]))
-    window.ground_truth_data_folder_path_edit.setText(str(synthetic_dataset["output_dir"]))
+    # The dataset is one .npz file. Selecting it rewrites the run name, so set the
+    # run name afterwards.
+    window.dataset_file_edit.setText(str(synthetic_dataset["cache_path"]))
     window.model_output_folder_path_edit.setText(str(tmp_path / "gui_runs"))
     window.run_name_edit.setText("synthetic_gui")
-    window._set_cache_path_value(str(synthetic_dataset["cache_path"]), manually_selected=True)
 
 
 def test_window_scan_and_suggest_populate_preview_and_forms(
@@ -105,9 +105,27 @@ def test_window_scan_and_suggest_populate_preview_and_forms(
 
 def test_data_source_browse_buttons_remain_visible(gui_window) -> None:
     assert gui_window.left_pane_container.minimumWidth() >= 560
-    assert gui_window.browse_input_feature_button.width() >= 90
-    assert gui_window.browse_ground_truth_data_folder_button.width() >= 90
+    assert gui_window.browse_dataset_file_button.width() >= 90
     assert gui_window.browse_model_output_folder_button.width() >= 90
+
+
+def test_data_sources_card_offers_only_the_npz_dataset_file(gui_window) -> None:
+    """The folder picker and the Advanced overrides are gone, not just hidden.
+
+    Leaving a disabled widget behind would keep the old two-ways-in ambiguity in
+    saved sessions and in the config payload.
+    """
+    for removed in (
+        "dataset_folder_edit",
+        "input_feature_path_edit",
+        "ground_truth_data_folder_path_edit",
+        "cache_path_edit",
+        "advanced_paths_section",
+    ):
+        assert not hasattr(gui_window, removed), f"{removed} should be gone"
+
+    assert gui_window.dataset_file_edit.text() == ""
+    assert "npz" in gui_window.dataset_file_edit.placeholderText()
 
 
 def test_window_exposes_separate_baseline_and_transfer_actions(gui_window) -> None:
@@ -141,7 +159,7 @@ def test_auto_managed_cache_path_tracks_run_name_changes(gui_window) -> None:
 
     gui_window.run_name_edit.setText("GUI_test_2")
 
-    assert gui_window.cache_path_edit.text().endswith("GUI_test_2.npz")
+    assert gui_window._cache_path_value.endswith("GUI_test_2.npz")
 
 
 def test_auto_managed_cache_path_tracks_output_folder_changes(gui_window, tmp_path: Path) -> None:
@@ -156,16 +174,34 @@ def test_auto_managed_cache_path_tracks_output_folder_changes(gui_window, tmp_pa
 
     gui_window.model_output_folder_path_edit.setText(str(tmp_path / "new_output"))
 
-    assert gui_window.cache_path_edit.text() == str((tmp_path / "new_output" / "cache" / "GUI_test_1.npz").resolve())
+    assert gui_window._cache_path_value == str((tmp_path / "new_output" / "cache" / "GUI_test_1.npz").resolve())
 
 
-def test_manual_cache_path_is_preserved_on_run_name_change(gui_window, tmp_path: Path) -> None:
+def test_a_saved_manual_cache_path_is_reported_not_restored(gui_window, tmp_path: Path) -> None:
+    """Choosing a cache file was removed; the cache always follows the run name.
+
+    An old session that pinned one must not silently keep training against it,
+    so the restore says what happened and points at the CLI flag.
+    """
     manual_cache_path = str(tmp_path / "manual_cache.npz")
-    gui_window._set_cache_path_value(manual_cache_path, manually_selected=True)
+    gui_window.apply_config_payload(
+        {
+            "data_sources": {
+                "output_dir": str(tmp_path / "out"),
+                "run_name": "GUI_test_1",
+                "cache_path": manual_cache_path,
+                "cache_path_manually_selected": True,
+            }
+        }
+    )
+
+    log = gui_window.run_log_text_edit.toPlainText()
+    assert manual_cache_path in log
+    assert "--cache-path" in log
+    assert gui_window._cache_path_value == str((tmp_path / "out" / "cache" / "GUI_test_1.npz").resolve())
 
     gui_window.run_name_edit.setText("GUI_test_2")
-
-    assert gui_window.cache_path_edit.text() == manual_cache_path
+    assert gui_window._cache_path_value.endswith("GUI_test_2.npz")
 
 
 def test_window_baseline_training_progress_updates_live_metrics_and_plots(
@@ -582,20 +618,42 @@ def test_scan_split_warnings_reach_the_run_log(gui_window, monkeypatch) -> None:
     assert "no design appears at more than 5" in gui_window.run_log_text_edit.toPlainText()
 
 
-def test_dataset_folder_survives_a_session_roundtrip(gui_window, tmp_path) -> None:
-    """The single-folder dataset field is the primary data source. When it was not
-    persisted, a restarted GUI forgot the dataset and kept only a stale cache path
-    -- which is how a run ended up pointed at a leftover pytest directory."""
-    folder = tmp_path / "my_dataset"
-    folder.mkdir()
-    gui_window.dataset_folder_edit.setText(str(folder))
+def test_dataset_file_survives_a_session_roundtrip(gui_window, tmp_path) -> None:
+    """The .npz file is the only data source. When it was not persisted, a
+    restarted GUI forgot the dataset and kept only a stale cache path -- which is
+    how a run ended up pointed at a leftover pytest directory."""
+    dataset = tmp_path / "my_dataset.npz"
+    dataset.write_bytes(b"")
+    gui_window.dataset_file_edit.setText(str(dataset))
 
     payload = gui_window.collect_config_payload()
-    assert payload["data_sources"]["dataset_folder"] == str(folder)
+    assert payload["data_sources"]["dataset_file"] == str(dataset)
 
-    gui_window.dataset_folder_edit.setText("")
+    gui_window.dataset_file_edit.setText("")
     gui_window.apply_config_payload(payload)
-    assert gui_window.dataset_folder_edit.text() == str(folder)
+    assert gui_window.dataset_file_edit.text() == str(dataset)
+
+
+def test_an_old_sessions_dataset_folder_is_reported_not_silently_dropped(gui_window, tmp_path) -> None:
+    """Restoring must not look like the old dataset loaded when nothing did."""
+    folder = tmp_path / "my_dataset"
+    folder.mkdir()
+    gui_window.apply_config_payload(
+        {
+            "data_sources": {
+                "dataset_folder": str(folder),
+                "input_feature_path": str(folder / "log.txt"),
+                "output_dir": str(tmp_path / "out"),
+                "run_name": "legacy_run",
+            }
+        }
+    )
+
+    log = gui_window.run_log_text_edit.toPlainText()
+    assert str(folder) in log
+    assert "--data-root" in log
+    assert "--input-feature-path" in log
+    assert gui_window.dataset_file_edit.text() == ""
 
 
 def test_tests_never_write_the_real_gui_state(isolated_app_state) -> None:

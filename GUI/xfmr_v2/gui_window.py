@@ -38,7 +38,6 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
-    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -47,7 +46,6 @@ from .app_paths import current_runtime_paths
 from .gui_backend import (
     build_and_scan_dataset,
     build_suggest_result,
-    default_run_name,
     export_model_to_onnx,
     list_available_devices,
     load_last_session,
@@ -189,27 +187,6 @@ class MetricCard(QFrame):
         self.value_label.setText(value)
 
 
-class CollapsibleSection(QWidget):
-    def __init__(self, title: str, content: QWidget) -> None:
-        super().__init__()
-        self.content = content
-        self.toggle_button = QToolButton(text=title, checkable=True, checked=False)
-        self.toggle_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        self.toggle_button.setArrowType(Qt.ArrowType.RightArrow)
-        self.toggle_button.toggled.connect(self._on_toggled)
-        self.content.setVisible(False)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
-        layout.addWidget(self.toggle_button)
-        layout.addWidget(self.content)
-
-    def _on_toggled(self, expanded: bool) -> None:
-        self.toggle_button.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
-        self.content.setVisible(expanded)
-
-
 class MlpTrainingStudio(QMainWindow):
     """Main application window."""
 
@@ -232,8 +209,9 @@ class MlpTrainingStudio(QMainWindow):
         self.selected_search_full_config: dict[str, Any] | None = None
         self.search_row_configs: list[dict[str, Any]] = []
         self.current_task_name = "idle"
-        self._cache_path_manually_selected = False
-        self._setting_cache_path = False
+        # Display-only: the cache path the engine last used. Always derived from
+        # the output folder and run name, never chosen by the user.
+        self._cache_path_value = ""
         self._search_max_samples_autofill_value: int | None = None
         self._setting_search_max_samples = False
         self._controls_locked = False
@@ -417,18 +395,25 @@ class MlpTrainingStudio(QMainWindow):
         layout = QVBoxLayout(card)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
-        layout.addWidget(self._section_header("Data Sources", "Select your dataset folder and output location"))
+        layout.addWidget(self._section_header("Data Sources", "Select your dataset file and output location"))
 
         grid = QGridLayout()
         grid.setHorizontalSpacing(10)
         grid.setVerticalSpacing(8)
 
-        self.dataset_folder_edit = QLineEdit()
-        self.dataset_folder_edit.setPlaceholderText("Select the root folder containing your entire dataset")
-        self.dataset_folder_edit.textChanged.connect(self._autofill_run_name_from_dataset_folder)
-        self.browse_dataset_folder_button = self._make_button("Browse...", secondary=True)
-        self.browse_dataset_folder_button.clicked.connect(self._browse_dataset_folder)
-        self._add_path_row(grid, 0, "Dataset Folder", self.dataset_folder_edit, self.browse_dataset_folder_button)
+        self.dataset_file_edit = QLineEdit()
+        self.dataset_file_edit.setPlaceholderText("Select the .npz dataset file")
+        self.dataset_file_edit.setToolTip(
+            "The dataset is one .npz file holding features, targets and frequency_hz.\n"
+            "Build one from raw simulation output with the dataset preparation tools, "
+            "or point at a bundle.npz produced by the PVT data-generation flow.\n\n"
+            "Raw folder layouts (log.txt + .sNp, Cadence CSV) are still supported from "
+            "the command line via train_baseline.py --data-root."
+        )
+        self.dataset_file_edit.textChanged.connect(self._autofill_run_name_from_dataset_file)
+        self.browse_dataset_file_button = self._make_button("Browse...", secondary=True)
+        self.browse_dataset_file_button.clicked.connect(self.browse_dataset_file)
+        self._add_path_row(grid, 0, "Dataset File", self.dataset_file_edit, self.browse_dataset_file_button)
 
         self.model_output_folder_path_edit = QLineEdit()
         self.model_output_folder_path_edit.setPlaceholderText("Select the output folder for runs, artifacts, and cache")
@@ -441,38 +426,14 @@ class MlpTrainingStudio(QMainWindow):
         self.run_name_edit.textChanged.connect(self._on_run_name_changed)
         self._add_form_row(grid, 2, "Run Name", self.run_name_edit)
 
-        # Advanced: legacy explicit path fields + cache control.
-        advanced = QWidget()
-        advanced_grid = QGridLayout(advanced)
-        advanced_grid.setContentsMargins(0, 0, 0, 0)
-        advanced_grid.setHorizontalSpacing(10)
-        advanced_grid.setVerticalSpacing(8)
-
-        self.input_feature_path_edit = QLineEdit()
-        self.input_feature_path_edit.setPlaceholderText("Override: explicit input-feature file (optional)")
-        self.input_feature_path_edit.textChanged.connect(self._autofill_run_name_and_cache)
-        self.browse_input_feature_button = self._make_button("Browse...", secondary=True)
-        self.browse_input_feature_button.clicked.connect(self.browse_input_feature_path)
-        self._add_path_row(advanced_grid, 0, "Input-Feature File", self.input_feature_path_edit, self.browse_input_feature_button)
-
-        self.ground_truth_data_folder_path_edit = QLineEdit()
-        self.ground_truth_data_folder_path_edit.setPlaceholderText("Override: explicit ground-truth data folder (optional)")
-        self.ground_truth_data_folder_path_edit.textChanged.connect(self._autofill_run_name_from_gt_dir)
-        self.browse_ground_truth_data_folder_button = self._make_button("Browse...", secondary=True)
-        self.browse_ground_truth_data_folder_button.clicked.connect(self.browse_ground_truth_data_dir)
-        self._add_path_row(advanced_grid, 1, "Ground-Truth Data Folder", self.ground_truth_data_folder_path_edit, self.browse_ground_truth_data_folder_button)
-
-        self.cache_path_edit = QLineEdit()
-        self.cache_path_edit.setPlaceholderText("Auto-managed inside the output folder if left blank")
-        self.cache_path_edit.textEdited.connect(self._on_cache_path_edited)
-        self.browse_cache_button = self._make_button("Browse...", secondary=True)
-        self.browse_cache_button.clicked.connect(self.browse_cache_path)
-        self._add_path_row(advanced_grid, 2, "Cache File", self.cache_path_edit, self.browse_cache_button)
-
-        self.advanced_paths_section = CollapsibleSection("Advanced", advanced)
+        # The explicit input-feature / ground-truth / cache overrides that used to
+        # live behind an "Advanced" disclosure are gone. One .npz names the whole
+        # dataset, so the two path overrides had nothing left to override, and the
+        # cache is derived from the output folder and run name. All three remain
+        # available from the command line (train_baseline.py --input-feature-path /
+        # --ground-truth-data-dir / --cache-path).
         layout.addLayout(grid)
 
-        # Schema status badge — right after the main fields, before Advanced.
         button_row = QHBoxLayout()
         self.dataset_schema_status_badge = StatusBadge("Not Scanned")
         button_row.addWidget(self.dataset_schema_status_badge)
@@ -481,8 +442,6 @@ class MlpTrainingStudio(QMainWindow):
         self.scan_dataset_button.clicked.connect(self.scan_dataset)
         button_row.addWidget(self.scan_dataset_button)
         layout.addLayout(button_row)
-
-        layout.addWidget(self.advanced_paths_section)
         return card
 
     def _build_dataset_preview_card(self) -> QWidget:
@@ -901,7 +860,7 @@ class MlpTrainingStudio(QMainWindow):
     # ------------------------------------------------------------------
     def _apply_default_values(self) -> None:
         self.model_output_folder_path_edit.setText(str(self._default_output_dir().resolve()))
-        self._set_cache_path_value("", manually_selected=False)
+        self._set_cache_path_value("")
         self.run_name_edit.setText("mlp_run")
         self.dataset_schema_status_badge.set_status("Not Scanned")
         self.initial_suggestion_confidence_badge.set_status("Not Scanned")
@@ -911,7 +870,7 @@ class MlpTrainingStudio(QMainWindow):
         self._refresh_transfer_controls_enabled()
         self._refresh_license_display()
         self._update_topbar_run_name()
-        self.append_log("Ready. Select dataset paths and scan the data to begin.")
+        self.append_log("Ready. Select the .npz dataset file and scan the data to begin.")
 
     def _load_last_session_if_available(self) -> None:
         payload = load_last_session()
@@ -926,16 +885,13 @@ class MlpTrainingStudio(QMainWindow):
         return {
             "device": self._current_device_id(),
             "data_sources": {
-                # The single-folder dataset field is the primary data source; without
-                # it a restored session silently forgets which dataset was loaded and
-                # falls back to whatever stale cache path it kept.
-                "dataset_folder": self.dataset_folder_edit.text().strip(),
-                "input_feature_path": self.input_feature_path_edit.text().strip(),
-                "ground_truth_data_dir": self.ground_truth_data_folder_path_edit.text().strip(),
+                # The .npz dataset file is the only data source; without it a
+                # restored session silently forgets which dataset was loaded. The
+                # cache path is not saved: it is derived from the output folder and
+                # run name, both of which are.
+                "dataset_file": self.dataset_file_edit.text().strip(),
                 "output_dir": self.model_output_folder_path_edit.text().strip(),
                 "run_name": self.run_name_edit.text().strip(),
-                "cache_path": self.cache_path_edit.text().strip(),
-                "cache_path_manually_selected": self._cache_path_manually_selected,
             },
             "baseline": self._collect_baseline_form(),
             "transfer": {
@@ -951,20 +907,13 @@ class MlpTrainingStudio(QMainWindow):
     def apply_config_payload(self, payload: dict[str, Any]) -> None:
         self._set_device_selection(payload.get("device"))
         data_sources = payload.get("data_sources", {})
-        self.dataset_folder_edit.setText(str(data_sources.get("dataset_folder", "")))
-        self.input_feature_path_edit.setText(str(data_sources.get("input_feature_path", "")))
-        self.ground_truth_data_folder_path_edit.setText(str(data_sources.get("ground_truth_data_dir", "")))
+        self.dataset_file_edit.setText(str(data_sources.get("dataset_file", "")))
         output_dir = data_sources.get("output_dir", data_sources.get("model_output_dir", self.model_output_folder_path_edit.text()))
         self.model_output_folder_path_edit.setText(str(output_dir))
         run_name = str(data_sources.get("run_name", self.run_name_edit.text()))
         self.run_name_edit.setText(run_name)
-        cache_path = str(data_sources.get("cache_path", self.cache_path_edit.text())).strip()
-        manually_selected = data_sources.get("cache_path_manually_selected")
-        if manually_selected is None:
-            manually_selected = self._infer_cache_path_manually_selected(cache_path, run_name=run_name)
-        self._set_cache_path_value(cache_path, manually_selected=bool(manually_selected))
-        if not self._cache_path_manually_selected:
-            self._sync_auto_cache_path()
+        self._note_removed_data_source_fields(data_sources)
+        self._sync_auto_cache_path()
 
         baseline = payload.get("baseline", {})
         self._apply_baseline_form(baseline)
@@ -1150,9 +1099,9 @@ class MlpTrainingStudio(QMainWindow):
                 "val_frac": self.baseline_validation_fraction_spin_box.value(),
                 "seed": self.baseline_seed_spin_box.value(),
                 "max_samples": None,
-                # Auto-managed cache: rebuild from the folder. Manually-selected cache:
-                # reuse it if present (only build when missing).
-                "overwrite": not self._cache_path_manually_selected,
+                # The cache is always auto-managed now, so a scan always rebuilds
+                # it from the selected dataset file rather than trusting a stale one.
+                "overwrite": True,
             },
             task_name="scan",
             busy_state="Scanning",
@@ -1264,30 +1213,18 @@ class MlpTrainingStudio(QMainWindow):
         self.append_log("Stop requested. Waiting for the current stage to exit cleanly...")
         self.run_state_badge.set_status("Stopped")
 
-    def _browse_dataset_folder(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Select Dataset Folder", self.dataset_folder_edit.text())
+    def browse_dataset_file(self) -> None:
+        start = self.dataset_file_edit.text().strip() or str(self._default_dialog_root())
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Dataset File", start, "Dataset Arrays (*.npz);;All Files (*)"
+        )
         if path:
-            self.dataset_folder_edit.setText(path)
-
-    def browse_input_feature_path(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Select Input-Feature File", self.input_feature_path_edit.text(), "Text Files (*.txt);;All Files (*)")
-        if path:
-            self.input_feature_path_edit.setText(path)
-
-    def browse_ground_truth_data_dir(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Select Ground-Truth Data Folder", self.ground_truth_data_folder_path_edit.text())
-        if path:
-            self.ground_truth_data_folder_path_edit.setText(path)
+            self.dataset_file_edit.setText(path)
 
     def browse_model_output_dir(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Select Output Folder", self.model_output_folder_path_edit.text())
         if path:
             self.model_output_folder_path_edit.setText(path)
-
-    def browse_cache_path(self) -> None:
-        path, _ = QFileDialog.getSaveFileName(self, "Select Cache File", self.cache_path_edit.text(), "NumPy Cache (*.npz)")
-        if path:
-            self._set_cache_path_value(path, manually_selected=True)
 
     def open_output_folder(self) -> None:
         candidate = self._preferred_output_path()
@@ -1531,7 +1468,7 @@ class MlpTrainingStudio(QMainWindow):
         scanned_columns = list(result.get("active_input_feature_names", []))
         self._populate_projection_columns(scanned_columns)
         self._fill_table(self.data_preview_table, result["preview_rows"])
-        self._set_cache_path_value(result["cache_path"], manually_selected=self._cache_path_manually_selected)
+        self._set_cache_path_value(result["cache_path"])
         self.append_log(f"Dataset scan completed for {result['dataset_name']}.")
         self._reset_baseline_plots()
         self._reset_transfer_plots()
@@ -2176,21 +2113,12 @@ class MlpTrainingStudio(QMainWindow):
     def _build_baseline_train_config(self) -> TrainConfig:
         roots = make_run_roots(self.model_output_folder_path_edit.text().strip(), self.run_name_edit.text().strip())
         form = self._collect_baseline_form()
-        dataset_folder = self.dataset_folder_edit.text().strip()
-        input_feat = self.input_feature_path_edit.text().strip()
-        gt_dir = self.ground_truth_data_folder_path_edit.text().strip()
-        # When the new single-folder field is set, use it as data_root.
-        # Otherwise fall back to legacy fields.
-        if dataset_folder:
-            data_root = dataset_folder
-            input_feat = ""
-            gt_dir = ""
-        else:
-            data_root = gt_dir if not input_feat else None
+        # One .npz names the whole dataset, so it IS the data root; the explicit
+        # input-feature / ground-truth overrides are command-line only now.
         return TrainConfig(
-            data_root=data_root,
-            input_feature_path=input_feat or None,
-            ground_truth_data_dir=gt_dir if input_feat else None,
+            data_root=self.dataset_file_edit.text().strip() or None,
+            input_feature_path=None,
+            ground_truth_data_dir=None,
             cache_path=self._ensure_cache_path(),
             output_dir=roots["baseline"],
             model_type=form["model_type"],
@@ -2311,15 +2239,11 @@ class MlpTrainingStudio(QMainWindow):
             self.export_onnx_button,
             self.apply_initial_settings_button,
             self.restore_recommended_baseline_button,
-            self.input_feature_path_edit,
-            self.browse_input_feature_button,
-            self.ground_truth_data_folder_path_edit,
-            self.browse_ground_truth_data_folder_button,
+            self.dataset_file_edit,
+            self.browse_dataset_file_button,
             self.model_output_folder_path_edit,
             self.browse_model_output_folder_button,
             self.run_name_edit,
-            self.cache_path_edit,
-            self.browse_cache_button,
             self.training_tabs,
             self.license_server_url_edit,
             self.test_license_connection_button,
@@ -2598,55 +2522,34 @@ class MlpTrainingStudio(QMainWindow):
         active_run_name = (run_name or self.run_name_edit.text().strip() or "mlp_run").strip() or "mlp_run"
         return str((self._output_root_path() / "cache" / f"{active_run_name}.npz").resolve())
 
-    def _legacy_default_cache_path(self, run_name: str) -> str:
-        return str((Path("artifacts/cache") / f"{run_name}.npz").resolve())
+    def _set_cache_path_value(self, cache_path: str) -> None:
+        """Record the cache file the engine reported, for display only.
 
-    def _infer_cache_path_manually_selected(self, cache_path: str, *, run_name: str) -> bool:
-        normalized_path = cache_path.strip()
-        if not normalized_path:
-            return False
-        auto_managed_paths = {self._default_cache_path(run_name)}
-        if current_runtime_paths().mode == "source":
-            auto_managed_paths.update(
-                {
-                    str(Path("artifacts/cache/gui_session_cache.npz").resolve()),
-                    self._legacy_default_cache_path(run_name),
-                }
-            )
-        return str(Path(normalized_path).resolve()) not in auto_managed_paths
-
-    def _set_cache_path_value(self, cache_path: str, *, manually_selected: bool) -> None:
-        self._setting_cache_path = True
-        try:
-            self.cache_path_edit.setText(cache_path)
-        finally:
-            self._setting_cache_path = False
-        self._cache_path_manually_selected = bool(cache_path.strip()) and manually_selected
+        The Cache File field is gone: the cache is always derived from the output
+        folder and run name, so there is nothing for a user to choose and nothing
+        to keep in sync with a widget.
+        """
+        self._cache_path_value = cache_path.strip()
 
     def _sync_auto_cache_path(self) -> None:
-        if self._cache_path_manually_selected:
-            return
-        self._set_cache_path_value(self._default_cache_path(), manually_selected=False)
+        self._set_cache_path_value(self._default_cache_path())
 
     def _ensure_cache_path(self) -> str:
-        if self._cache_path_manually_selected:
-            cache_path = self.cache_path_edit.text().strip()
-            if cache_path:
-                return cache_path
         cache_path = self._default_cache_path()
-        if self.cache_path_edit.text().strip() != cache_path:
-            self._set_cache_path_value(cache_path, manually_selected=False)
+        self._set_cache_path_value(cache_path)
         return cache_path
 
     def _require_data_paths(self) -> dict[str, str] | None:
-        dataset_folder = self.dataset_folder_edit.text().strip()
-        input_feature_path = self.input_feature_path_edit.text().strip()
-        ground_truth_data_dir = self.ground_truth_data_folder_path_edit.text().strip()
+        dataset_file = self.dataset_file_edit.text().strip()
         model_output_dir = self.model_output_folder_path_edit.text().strip()
 
-        # Need at least one data source: the new single-folder field OR the legacy fields.
-        if not dataset_folder and not input_feature_path and not ground_truth_data_dir:
-            self._show_warning("Select a dataset folder first.")
+        if not dataset_file:
+            self._show_warning("Select a .npz dataset file first.")
+            return None
+        # Catch a missing or mistyped path here rather than inside a worker
+        # thread, where it would surface as a task traceback.
+        if not Path(dataset_file).is_file():
+            self._show_warning(f"The dataset file does not exist:\n{dataset_file}")
             return None
         if not model_output_dir:
             self._show_warning("Select the output folder first.")
@@ -2656,44 +2559,61 @@ class MlpTrainingStudio(QMainWindow):
             return None
         Path(model_output_dir).mkdir(parents=True, exist_ok=True)
         return {
-            "dataset_root": dataset_folder,
-            "input_feature_path": input_feature_path,
-            "ground_truth_data_dir": ground_truth_data_dir,
+            "dataset_root": dataset_file,
+            "input_feature_path": "",
+            "ground_truth_data_dir": "",
             "cache_path": self._ensure_cache_path(),
         }
 
-    def _autofill_run_name_and_cache(self) -> None:
-        input_feature_path = self.input_feature_path_edit.text().strip()
-        if input_feature_path and not self.dataset_folder_edit.text().strip():
-            self.run_name_edit.setText(default_run_name(input_feature_path))
-        self._sync_auto_cache_path()
-        self._update_topbar_run_name()
+    def _autofill_run_name_from_dataset_file(self) -> None:
+        """Name the run after the dataset file and mark it unscanned.
 
-    def _autofill_run_name_from_dataset_folder(self) -> None:
-        """Auto-fill the run name and reset scan status when the dataset folder changes."""
-        dataset_dir = self.dataset_folder_edit.text().strip()
-        if dataset_dir:
-            folder_name = Path(dataset_dir).name or Path(dataset_dir).stem
-            self.run_name_edit.setText(folder_name.replace(" ", "_").lower())
-        # Clear legacy fields when a dataset folder is selected to avoid confusion.
-        if dataset_dir:
-            self.input_feature_path_edit.clear()
-            self.ground_truth_data_folder_path_edit.clear()
-        if dataset_dir:
+        A generic bundle name (cache.npz, bundle.npz) says nothing about which
+        dataset it is, so those fall back to the containing folder's name.
+        """
+        dataset_file = self.dataset_file_edit.text().strip()
+        if dataset_file:
+            path = Path(dataset_file)
+            stem = path.stem
+            if stem.lower() in ("cache", "bundle", "dataset", "data"):
+                stem = path.parent.name or stem
+            self.run_name_edit.setText(stem.replace(" ", "_").lower())
             self.dataset_schema_status_badge.set_status("Not Scanned")
         self._sync_auto_cache_path()
         self._update_topbar_run_name()
 
-    def _autofill_run_name_from_gt_dir(self) -> None:
-        # When the input-feature path is empty (cadence_csv), derive the run
-        # name from the ground-truth folder instead.
-        if not self.input_feature_path_edit.text().strip() and not self.dataset_folder_edit.text().strip():
-            gt_dir = self.ground_truth_data_folder_path_edit.text().strip()
-            if gt_dir:
-                folder_name = Path(gt_dir).name or Path(gt_dir).stem
-                self.run_name_edit.setText(folder_name.replace(" ", "_").lower())
-        self._sync_auto_cache_path()
-        self._update_topbar_run_name()
+    def _note_removed_data_source_fields(self, data_sources: dict[str, Any]) -> None:
+        """Report saved values for fields this GUI no longer has.
+
+        A session or config written before the .npz-only data loading may carry a
+        dataset folder or an explicit input-feature / ground-truth / cache path.
+        Restoring silently would look like the old dataset had loaded, when in
+        fact no dataset is selected at all.
+        """
+        folder = str(data_sources.get("dataset_folder", "")).strip()
+        if folder and not self.dataset_file_edit.text().strip():
+            self.append_log(
+                f"This session used the dataset folder {folder}. The GUI now loads one "
+                ".npz dataset file, so no dataset is selected — choose the .npz for this "
+                "dataset. Raw folder layouts are still supported by train_baseline.py "
+                "--data-root."
+            )
+        removed = {
+            "an explicit input-feature file": ("input_feature_path", "--input-feature-path"),
+            "an explicit ground-truth folder": ("ground_truth_data_dir", "--ground-truth-data-dir"),
+            "a custom cache file": ("cache_path", "--cache-path"),
+        }
+        for description, (key, flag) in removed.items():
+            value = str(data_sources.get(key, "")).strip()
+            # A saved auto-managed cache path is not a user choice, so restoring
+            # without it changes nothing worth reporting.
+            if key == "cache_path" and (not value or not data_sources.get("cache_path_manually_selected")):
+                continue
+            if value:
+                self.append_log(
+                    f"This session set {description} ({value}). That field has been removed "
+                    f"from the GUI; it is still available via train_baseline.py {flag}."
+                )
 
     def _on_run_name_changed(self, _text: str) -> None:
         self._sync_auto_cache_path()
@@ -2713,11 +2633,6 @@ class MlpTrainingStudio(QMainWindow):
     def _default_dialog_root(self) -> Path:
         output_dir = self.model_output_folder_path_edit.text().strip()
         return Path(output_dir) if output_dir else self._default_output_dir()
-
-    def _on_cache_path_edited(self, text: str) -> None:
-        if self._setting_cache_path:
-            return
-        self._cache_path_manually_selected = bool(text.strip())
 
     def _normalize_progress_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         nested = payload.get("data")

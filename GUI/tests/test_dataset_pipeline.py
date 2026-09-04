@@ -806,3 +806,80 @@ def test_load_split_bundle_merge_flag_matches_hand_set_fractions(tmp_path: Path)
     for fold in ("train", "val", "test"):
         assert np.array_equal(merged.split_indices[fold], by_hand.split_indices[fold])
     assert len(merged.split_indices["test"]) == 0
+
+
+# ---------------------------------------------------------------------------
+# Naming one .npz file directly (the GUI's standard way in)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("engine_cache", [True, False])
+def test_dataset_path_may_be_one_npz_file(tmp_path: Path, engine_cache: bool) -> None:
+    """A file path is a dataset, not just a folder to search.
+
+    Naming the file removes the ambiguity a folder carries: no preference order
+    between several bundles, and no raw source that can shadow the intended one.
+    """
+    source = tmp_path / "prepared" / "my_bundle.npz"
+    _write_array_npz(source, engine_cache=engine_cache, samples=8)
+
+    summary = data.build_cache_from_dataset(str(source), str(tmp_path / "from_file.npz"))
+
+    assert summary["num_samples"] == 8
+    assert summary["num_frequencies"] == 4
+    with np.load(tmp_path / "from_file.npz", allow_pickle=False) as cache:
+        assert cache["input_feature_names"].astype(str).tolist() == ["Temp_C", "VDD", "geom"]
+
+
+def test_named_npz_wins_over_a_raw_source_in_the_same_folder(tmp_path: Path) -> None:
+    """Folder detection prefers raw sources; naming the file overrides that."""
+    root = tmp_path / "mixed"
+    sp_dir = root / "SPData"
+    sp_dir.mkdir(parents=True)
+    (root / "log.txt").write_text("# [x, index]\n[1.0, 1]\n", encoding="utf-8")
+    (sp_dir / "1.s2p").write_text("# GHz S RI R 50\n1.0 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8\n", encoding="utf-8")
+    _write_array_npz(root / "bundle.npz", engine_cache=True, samples=6)
+
+    summary = data.build_cache_from_dataset(str(root / "bundle.npz"), str(tmp_path / "named.npz"))
+    assert summary["num_samples"] == 6
+
+
+def test_a_named_file_that_is_not_an_npz_is_refused(tmp_path: Path) -> None:
+    stray = tmp_path / "log.txt"
+    stray.write_text("[1.0, 2.0]\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="not a dataset"):
+        data.build_cache_from_dataset(str(stray), str(tmp_path / "out.npz"))
+
+
+def test_an_unreadable_npz_says_so_instead_of_auto_detecting(tmp_path: Path) -> None:
+    """An .npz missing the array keys (or truncated mid-copy) must not look empty."""
+    broken = tmp_path / "broken.npz"
+    np.savez_compressed(broken, something_else=np.zeros(3))
+
+    with pytest.raises(ValueError, match="could not be read as a prebuilt array dataset"):
+        data.build_cache_from_dataset(str(broken), str(tmp_path / "out.npz"))
+
+
+def test_a_missing_dataset_path_is_named_in_the_error(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError, match="does not exist"):
+        data.build_cache_from_dataset(str(tmp_path / "absent.npz"), str(tmp_path / "out.npz"))
+
+
+def test_a_named_npz_is_never_overwritten_by_its_own_cache(tmp_path: Path) -> None:
+    """The cache write must not destroy the dataset it is reading."""
+    source = tmp_path / "bundle.npz"
+    _write_array_npz(source, engine_cache=True)
+
+    with pytest.raises(ValueError, match="overwrite the source dataset file"):
+        data.build_cache_from_dataset(str(source), str(source))
+    # Still readable: the refusal happened before any write.
+    assert data._is_array_npz(source)
+
+
+def test_ensure_cache_builds_from_a_named_npz_file(tmp_path: Path) -> None:
+    """ensure_cache used to require a directory, which rejected a file path."""
+    source = tmp_path / "bundle.npz"
+    _write_array_npz(source, engine_cache=True)
+    cache_path = tmp_path / "built" / "cache.npz"
+
+    assert data.ensure_cache(data_root=str(source), cache_path=str(cache_path)) == cache_path
+    assert cache_path.is_file()

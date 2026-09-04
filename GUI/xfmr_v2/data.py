@@ -252,15 +252,54 @@ def build_cache_from_dataset(
       ``frequency_hz`` (this engine's cache layout, or a barer bundle written by an
       offline preparation script). Detected only when no raw source is present.
 
-    See ``_build_auto`` for the detection rules and defaults.
+    ``dataset_root`` may also name one ``.npz`` file directly, which is what the
+    GUI does. That is unambiguous where a folder is not: it needs no preference
+    order between several bundles, and no raw source can shadow it.
+
+    See ``_build_auto`` for the folder detection rules and defaults.
     """
     def emit(event: str, message: str, **payload: Any) -> None:
         if progress_callback is not None:
             progress_callback({"phase": "scan", "event": event, "message": message, **payload})
 
-    summary = _build_auto(Path(dataset_root), cache_path, max_samples, emit, should_stop)
+    summary = _build_from_dataset_path(Path(dataset_root), cache_path, max_samples, emit, should_stop)
     emit("cache_saved", f"Cache saved: {summary['num_samples']} samples.", cache_path=summary["cache_path"])
     return summary
+
+
+def _build_from_dataset_path(
+    dataset_path: Path, cache_path: str | Path, max_samples: int | None, emit, should_stop=None
+) -> dict[str, Any]:
+    """Build the cache from a dataset folder, or straight from one ``.npz`` file.
+
+    Naming the file is the GUI's standard way in, and it is unambiguous where
+    pointing at a folder is not: a folder holding several bundles has to pick
+    one, and a stray .csv beside a bundle can shadow it.
+    """
+    if dataset_path.is_dir():
+        return _build_auto(dataset_path, cache_path, max_samples, emit, should_stop)
+    if not dataset_path.exists():
+        raise FileNotFoundError(f"Dataset path does not exist: {dataset_path}")
+    if dataset_path.suffix.lower() != ".npz":
+        raise ValueError(
+            f"{dataset_path} is not a dataset. Select a prebuilt .npz holding "
+            "features/targets/frequency_hz, or a folder holding a raw dataset."
+        )
+    if not _is_array_npz(dataset_path):
+        raise ValueError(
+            f"{dataset_path} could not be read as a prebuilt array dataset. It must hold "
+            f"the keys {', '.join(_ARRAY_NPZ_KEYS)} and be saved without "
+            "pickled objects; an incomplete copy reads this way too."
+        )
+    # Writing the cache over the file being read would destroy the dataset.
+    write_target = _npz_write_target(cache_path)
+    if _is_same_file(write_target, dataset_path):
+        raise ValueError(
+            f"The cache path would overwrite the source dataset file {dataset_path}. "
+            "Choose a cache file path outside the dataset folder."
+        )
+    result = _build_array_npz_auto(dataset_path.parent, dataset_path, max_samples, emit, should_stop)
+    return _save_cache(cache_path, dataset_root=dataset_path.parent, readme_path="", **result)
 
 
 # ---------------------------------------------------------------------------
@@ -761,9 +800,9 @@ def ensure_cache(
 ) -> Path:
     """Return a ready-to-use cache path, building it when missing.
 
-    When the cache file does not exist, the dataset folder (``data_root``, or one
-    derived from the explicit paths) is built via ``build_cache_from_dataset``
-    format auto-detection.
+    When the cache file does not exist, the dataset (``data_root``: a prebuilt
+    ``.npz`` file or a folder to auto-detect, or one derived from the explicit
+    paths) is built via ``build_cache_from_dataset``.
     """
     p = Path(cache_path)
     if p.exists():
@@ -771,11 +810,11 @@ def ensure_cache(
     root = data_root or ground_truth_data_dir or (
         Path(input_feature_path).parent if input_feature_path else None
     )
-    if root is None or not Path(root).is_dir():
+    if root is None or not Path(root).exists():
         raise FileNotFoundError(
             f"Cache not found: {p}\n"
             "Build the cache first (scan the dataset), or pass an existing dataset "
-            "folder so it can be built."
+            "file or folder so it can be built."
         )
     build_cache_from_dataset(root, p, max_samples=max_samples, should_stop=should_stop)
     return p
