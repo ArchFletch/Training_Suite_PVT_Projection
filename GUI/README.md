@@ -174,6 +174,13 @@ python launch_gui.py
 
 The GUI can scan datasets, generate recommended settings, run baseline training, run self-transfer learning, and manage seat checkout against an on-prem license server. Quick search is currently not exposed in the GUI.
 
+The Baseline tab shows only the settings the selected model actually reads. The PVT
+Corner Columns and Corner Projection Width rows appear for `SpectraHydraProj` and are
+hidden for every other model, rather than being shown greyed out. Which model types
+carry the corner projection is defined once in the engine
+(`runner.PROJECTION_MODEL_TYPES`), so the form cannot drift from what the model builder
+accepts.
+
 Data loading is one field: **Dataset File**, a `.npz` holding `features` / `targets` /
 `frequency_hz`. The folder picker and the Advanced disclosure (explicit input-feature
 file, ground-truth folder, and cache file) have been removed — one file names the whole

@@ -155,6 +155,16 @@ class TransferConfig:
 
 MODEL_TYPES = ("SpectraNet", "SpectraHydra", "SpectraHydraProj", "SpectraTrunk")
 
+# Model types that embed PVT corner columns, and so are the only ones that read
+# ``projection_columns`` / ``projection_dim``. Naming the set once keeps the
+# engine's build path and the GUI's settings visibility from drifting apart.
+PROJECTION_MODEL_TYPES = ("SpectraHydraProj",)
+
+
+def uses_corner_projection(model_type: str) -> bool:
+    """True for the model types that carry the learned PVT corner projection."""
+    return canonical_model_type(model_type) in PROJECTION_MODEL_TYPES
+
 # Back-compat: runs saved under the old model-type names still load. Map the legacy
 # string to its current equivalent so old checkpoints, configs, and saved GUI forms
 # keep working after the rename.
@@ -246,7 +256,7 @@ def resolve_projection_kwargs(
     active_names: list[str],
     dropped_names: list[str] | tuple[str, ...] = (),
 ) -> dict[str, Any]:
-    """Build the extra :func:`build_model` kwargs for ``SpectraHydraProj``.
+    """Build the extra :func:`build_model` kwargs for the projection model types.
 
     Returns an empty dict for every other model type, so callers can splat the
     result unconditionally. Corner columns are configured by NAME and resolved
@@ -259,7 +269,7 @@ def resolve_projection_kwargs(
     empty configuration, and a configuration where every column was dropped all
     raise so the run fails loudly instead of training a degenerate projection.
     """
-    if canonical_model_type(model_type) != "SpectraHydraProj":
+    if not uses_corner_projection(model_type):
         return {}
     # Dedupe while preserving order (e.g. a repeated name in a CLI flag) so the
     # projection never embeds the same column twice.
