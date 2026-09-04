@@ -483,28 +483,89 @@ def _check_projection_column(window, name: str) -> None:
     raise AssertionError(f"column {name!r} not in picker")
 
 
+PROJECTION_ROW_CAPTIONS = ("PVT Corner Columns", "Corner Projection Width")
+
+
+def _row_is_hidden(window, caption: str) -> bool:
+    """Whether a baseline form row is explicitly hidden, label included.
+
+    isHidden() rather than isVisible(): the baseline tab may not be the current
+    tab, which would make every row read as invisible regardless of this
+    setting.
+    """
+    label, widget = window._baseline_form_rows[caption]
+    assert label.isHidden() == widget.isHidden(), (
+        f"{caption}: label and widget disagree, so a caption is left stranded"
+    )
+    return widget.isHidden()
+
+
 def test_projection_controls_gate_on_model_type(gui_window) -> None:
     combo = gui_window.baseline_model_type_combo_box
     assert combo.findText("SpectraHydraProj") >= 0
 
-    # Default SpectraNet: projection controls are disabled.
+    # Default SpectraNet: projection controls are hidden, not merely disabled.
     assert combo.currentText() == "SpectraNet"
+    for caption in PROJECTION_ROW_CAPTIONS:
+        assert _row_is_hidden(gui_window, caption)
     assert not gui_window.baseline_projection_columns_list.isEnabled()
     assert not gui_window.baseline_projection_dim_spin_box.isEnabled()
 
     combo.setCurrentText("SpectraHydraProj")
+    for caption in PROJECTION_ROW_CAPTIONS:
+        assert not _row_is_hidden(gui_window, caption)
     assert gui_window.baseline_projection_columns_list.isEnabled()
     assert gui_window.baseline_projection_dim_spin_box.isEnabled()
 
     combo.setCurrentText("SpectraHydra")
+    assert _row_is_hidden(gui_window, "PVT Corner Columns")
     assert not gui_window.baseline_projection_columns_list.isEnabled()
 
-    # SpectraTrunk is selectable and, like the non-projection models, keeps the
-    # corner-projection controls locked.
+    # SpectraTrunk is selectable and, like the non-projection models, hides the
+    # corner-projection rows.
     assert combo.findText("SpectraTrunk") >= 0
     combo.setCurrentText("SpectraTrunk")
+    for caption in PROJECTION_ROW_CAPTIONS:
+        assert _row_is_hidden(gui_window, caption)
     assert not gui_window.baseline_projection_columns_list.isEnabled()
     assert not gui_window.baseline_projection_dim_spin_box.isEnabled()
+
+
+def test_settings_shared_by_every_model_are_never_hidden(gui_window) -> None:
+    """Only genuinely model-specific rows disappear.
+
+    Hiding a shared setting would be worse than the problem being fixed: the
+    control still governs the run, it just cannot be reached.
+    """
+    shared = [
+        caption
+        for caption in gui_window._baseline_form_rows
+        if caption not in PROJECTION_ROW_CAPTIONS
+    ]
+    assert "Model Type" in shared and "Network Width" in shared and "Random Seed" in shared
+
+    for model_type in gui_window_module.MODEL_TYPES:
+        gui_window.baseline_model_type_combo_box.setCurrentText(model_type)
+        for caption in shared:
+            assert not _row_is_hidden(gui_window, caption), f"{caption} hidden for {model_type}"
+
+
+def test_every_model_type_shows_the_rows_the_engine_says_it_reads(gui_window) -> None:
+    """The form's visibility rule is the engine's, not a second copy of it.
+
+    A model added to runner.PROJECTION_MODEL_TYPES must light up the corner rows
+    without a matching GUI edit, or the two definitions drift.
+    """
+    from xfmr_v2.runner import PROJECTION_MODEL_TYPES, uses_corner_projection
+
+    assert "SpectraHydraProj" in PROJECTION_MODEL_TYPES
+    for model_type in gui_window_module.MODEL_TYPES:
+        gui_window.baseline_model_type_combo_box.setCurrentText(model_type)
+        expected_visible = uses_corner_projection(model_type)
+        for caption in PROJECTION_ROW_CAPTIONS:
+            assert _row_is_hidden(gui_window, caption) is not expected_visible, (
+                f"{caption} visibility disagrees with the engine for {model_type}"
+            )
 
 
 def test_projection_columns_flow_from_scan_into_configs(

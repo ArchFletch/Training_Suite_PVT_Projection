@@ -68,10 +68,12 @@ from .licensing import (
 from .runner import (
     LOSS_FUNCTIONS,
     MODEL_TYPES,
+    PROJECTION_MODEL_TYPES,
     SCHEDULER_TYPES,
     TrainConfig,
     TransferConfig,
     canonical_model_type,
+    uses_corner_projection,
 )
 from .search import SearchConfig
 
@@ -582,7 +584,7 @@ class MlpTrainingStudio(QMainWindow):
             "depth 4, batch 32, AdamW around 1e-3 with the cosine scheduler."
         )
         self.baseline_model_type_combo_box.currentTextChanged.connect(
-            self._refresh_projection_controls_enabled
+            self._refresh_model_settings_visibility
         )
         # SpectraHydraProj settings: which input-feature columns are PVT corner
         # conditions (fed to the learned projection) and the embedding width.
@@ -643,10 +645,13 @@ class MlpTrainingStudio(QMainWindow):
             ("Validation Fraction", self.baseline_validation_fraction_spin_box),
             ("Random Seed", self.baseline_seed_spin_box),
         ]
+        # Keep every row addressable by its caption so model-specific settings
+        # can be shown and hidden as label+widget pairs.
+        self._baseline_form_rows: dict[str, tuple[QLabel, QWidget]] = {}
         for row, (label, widget) in enumerate(fields):
-            self._add_form_row(grid, row, label, widget)
+            self._baseline_form_rows[label] = (self._add_form_row(grid, row, label, widget), widget)
         grid.addWidget(self.restore_recommended_baseline_button, len(fields), 1)
-        self._refresh_projection_controls_enabled()
+        self._refresh_model_settings_visibility()
         return tab
 
     def _build_transfer_tab(self) -> QWidget:
@@ -1930,7 +1935,7 @@ class MlpTrainingStudio(QMainWindow):
         # defaults (projection_columns=None, projection_dim=16) for the other
         # model types — applying those would silently clear or reset a user's
         # corner setup.
-        if model_type == "SpectraHydraProj":
+        if uses_corner_projection(model_type):
             projection_columns = payload.get("projection_columns")
             if projection_columns is not None:
                 self._set_projection_columns_selection([str(name) for name in projection_columns])
@@ -2071,20 +2076,38 @@ class MlpTrainingStudio(QMainWindow):
         items = existing + [name for name in self._projection_column_selection if name not in existing]
         self._rebuild_projection_column_items(items)
 
-    def _refresh_projection_controls_enabled(self) -> None:
-        is_projection = (
-            canonical_model_type(self.baseline_model_type_combo_box.currentText())
-            == "SpectraHydraProj"
-        )
-        self.baseline_projection_columns_list.setEnabled(is_projection)
-        self.baseline_projection_dim_spin_box.setEnabled(is_projection)
+    # Baseline settings that only some model types use, by row caption. A row
+    # absent from this map belongs to every model and is always shown. The model
+    # type sets come from the engine (runner.PROJECTION_MODEL_TYPES), so adding a
+    # model there cannot leave the form showing the wrong controls.
+    @property
+    def _model_specific_baseline_rows(self) -> dict[str, tuple[str, ...]]:
+        return {
+            "PVT Corner Columns": PROJECTION_MODEL_TYPES,
+            "Corner Projection Width": PROJECTION_MODEL_TYPES,
+        }
+
+    def _refresh_model_settings_visibility(self) -> None:
+        """Show only the settings the selected model actually reads.
+
+        The corner-projection rows used to be merely disabled, so every model
+        displayed two controls that did nothing for it. Rows are hidden as
+        label+widget pairs, and stay disabled as well as hidden so a hidden
+        control cannot be reached by keyboard focus or a stale programmatic
+        enable.
+        """
+        model_type = canonical_model_type(self.baseline_model_type_combo_box.currentText())
+        for caption, (label, widget) in self._baseline_form_rows.items():
+            applies_to = self._model_specific_baseline_rows.get(caption)
+            visible = applies_to is None or model_type in applies_to
+            label.setVisible(visible)
+            widget.setVisible(visible)
+            if applies_to is not None:
+                widget.setEnabled(visible)
 
     def _validate_projection_settings(self) -> bool:
-        is_projection = (
-            canonical_model_type(self.baseline_model_type_combo_box.currentText())
-            == "SpectraHydraProj"
-        )
-        if not is_projection:
+        model_type = canonical_model_type(self.baseline_model_type_combo_box.currentText())
+        if not uses_corner_projection(model_type):
             return True
         known: set[str] = set()
         if self.last_scan_result is not None:
@@ -2095,7 +2118,7 @@ class MlpTrainingStudio(QMainWindow):
         selected = self._selected_projection_columns()
         if not selected:
             self._show_warning(
-                "SpectraHydraProj needs at least one PVT corner column. Check the "
+                f"{model_type} needs at least one PVT corner column. Check the "
                 "corner/condition columns (e.g. temperature, supply, or process "
                 "one-hots) in the Baseline tab's PVT Corner Columns list."
             )
@@ -2388,9 +2411,16 @@ class MlpTrainingStudio(QMainWindow):
         table.verticalHeader().setVisible(False)
         return table
 
-    def _add_form_row(self, layout: QGridLayout, row: int, label_text: str, widget: QWidget) -> None:
-        layout.addWidget(QLabel(label_text), row, 0)
+    def _add_form_row(self, layout: QGridLayout, row: int, label_text: str, widget: QWidget) -> QLabel:
+        """Add a label/widget row and return the label.
+
+        Callers that may need to hide the row keep the label: hiding only the
+        widget would leave its caption behind, captioning the row below it.
+        """
+        label = QLabel(label_text)
+        layout.addWidget(label, row, 0)
         layout.addWidget(widget, row, 1, 1, 2)
+        return label
 
     def _add_path_row(self, layout: QGridLayout, row: int, label_text: str, edit: QLineEdit, button: QPushButton) -> None:
         row_widget = QWidget()
