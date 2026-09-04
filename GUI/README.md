@@ -3,7 +3,7 @@
 `MLP_modeling_v2` is the working repository for the current `Surrogate Model Training Suite` effort. The codebase now spans four connected areas:
 
 - a source-based MLP training workflow
-- a PySide6 desktop GUI for scan, suggestion, baseline, and self-transfer workflows
+- a PySide6 desktop GUI for scan, suggestion, and baseline training workflows
 - an on-prem floating license server plus internal vendor-license tooling
 - packaging and release-validation assets for Windows and Linux delivery
 
@@ -88,8 +88,8 @@ The GUI provides a technical desktop workflow for:
 
 - environment detection
 - dataset scan and preview
-- suggested baseline and transfer settings
-- editable baseline and self-transfer controls
+- suggested baseline settings
+- editable baseline training controls
 - live metrics, plots, and run logs
 - on-prem license checkout, heartbeat, and release
 
@@ -172,9 +172,17 @@ Start the GUI from the source checkout with:
 python launch_gui.py
 ```
 
-The GUI can scan datasets, generate recommended settings, run baseline training, run self-transfer learning, and manage seat checkout against an on-prem license server. Quick search is currently not exposed in the GUI.
+The GUI can scan datasets, generate recommended settings, run baseline training, and manage seat checkout against an on-prem license server.
 
-Start Baseline Training and Start Self-Transfer Learning are disabled while a task is
+Frequency-domain self-transfer learning is not exposed in the GUI, and neither is quick
+search. The engine still implements self-transfer in full, including the per-band
+corner projection; drive it from the command line with `run_self_transfer.py`. The GUI's
+suggestion table lists baseline settings only, because listing transfer settings would
+offer values with no control to apply them to. Loading a session that set up transfer
+logs a note saying so, since the run now trains one model across the whole frequency
+range rather than one per band.
+
+Start Baseline Training is disabled while a task is
 running and whenever no license seat is checked out. A disabled button carries the
 reason as its tooltip, because a disabled button cannot be clicked and so cannot raise
 the dialog that would otherwise explain itself. The remaining prerequisites (a dataset

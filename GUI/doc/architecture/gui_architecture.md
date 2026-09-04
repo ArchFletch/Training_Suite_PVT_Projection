@@ -74,8 +74,8 @@ grow vertically.
 - `Baseline Monitor`
   - training loss vs epoch
   - MAE over frequency
-- `Transfer Results`
-  - MAE over frequency by transfer iteration
+- `Test Samples`
+  - predicted vs true curves for test-fold samples
 
 ## Runtime Flow
 
@@ -97,7 +97,6 @@ Supported long-running task categories:
 - dataset scan
 - suggestion generation
 - baseline training
-- self-transfer training
 
 Only one active task is allowed at a time. The current task owns the stop handle
 and temporarily locks conflicting controls.
@@ -111,14 +110,15 @@ Progress is phase-based and event-based.
 - `scan`
 - `suggest`
 - `baseline`
-- `transfer`
+
+The engine also emits a `transfer` phase. The GUI does not run that workflow and
+ignores those events; `run_self_transfer.py` consumes them instead.
 
 ### Event Handling Expectations
 
 - scan events update schema status, preview readiness, progress bar state, and scan log lines
 - suggestion events update confidence, diagnostics, warnings, and suggested settings tables
 - baseline events update metrics, loss curves, evaluation MAE, and run status
-- transfer events update metrics, transfer progress context, elapsed and ETA, and frequency-MAE overlays by iteration
 
 The GUI must tolerate payloads where fields arrive nested under a `data` object
 or flattened at the top level.
@@ -130,8 +130,7 @@ or flattened at the top level.
 - selected paths
 - output folder
 - run name
-- cache override state
-- baseline and transfer form values
+- baseline form values
 - saved config files
 - last session
 - license server URL
@@ -143,14 +142,12 @@ or flattened at the top level.
 - latest suggestion result
 - latest workflow summary
 - latest baseline summary
-- latest transfer-base compatibility summary
 - current lease state
 - plot-series data for the active window session
 
 ## Plot Ownership
 
 - baseline plots are rebuilt from live progress and can also be rehydrated from final history
-- transfer results are frequency-domain overlays keyed by completed transfer iteration
 - plot styling lives in `gui_theme.py`
 - live plotting remains optional from the perspective of the backend, which only emits structured progress
 
