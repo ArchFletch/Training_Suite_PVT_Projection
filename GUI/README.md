@@ -144,13 +144,23 @@ python train_baseline.py
 python run_self_transfer.py --base-run-dir <path-to-compatible-baseline-run>
 ```
 
-`prepare_cache.py` auto-detects the dataset format from the folder contents:
-SPData/Touchstone (`log.txt` + a folder of `.sNp` files), Cadence CSV (`*.csv`), or a
-prebuilt `.npz` already holding `features` / `targets` / `frequency_hz` arrays — either
-this engine's own cache layout or a barer bundle from an offline preparation script.
-The prebuilt-array case is checked last, so a raw source always wins when a folder
-holds both. The other entrypoints build the cache on demand when it is missing — point
-them at the dataset with `--data-root <path-to-dataset-folder>` (or the explicit
+A dataset is either one `.npz` file or a folder to auto-detect. Naming the `.npz`
+directly is unambiguous, so it is the standard input format and the only one the GUI
+offers; the folder forms remain available from the command line.
+
+Pointing at a **folder** auto-detects the format from its contents: SPData/Touchstone
+(`log.txt` + a folder of `.sNp` files), Cadence CSV (`*.csv`), or a prebuilt `.npz`
+already holding `features` / `targets` / `frequency_hz` arrays — either this engine's
+own cache layout or a barer bundle from an offline preparation script. The
+prebuilt-array case is checked last, so a raw source always wins when a folder holds
+both, and a folder holding several bundles has to pick one.
+
+Pointing at an **`.npz` file** skips all of that and adopts that file, so no raw
+source can shadow it and no preference order applies. The cache is never written over
+the file being read.
+
+The other entrypoints build the cache on demand when it is missing — point them at the
+dataset with `--data-root <path-to-.npz-or-folder>` (or the explicit
 `--input-feature-path` / `--ground-truth-data-dir` paths, which are used to locate the
 dataset folder).
 
@@ -163,6 +173,16 @@ python launch_gui.py
 ```
 
 The GUI can scan datasets, generate recommended settings, run baseline training, run self-transfer learning, and manage seat checkout against an on-prem license server. Quick search is currently not exposed in the GUI.
+
+Data loading is one field: **Dataset File**, a `.npz` holding `features` / `targets` /
+`frequency_hz`. The folder picker and the Advanced disclosure (explicit input-feature
+file, ground-truth folder, and cache file) have been removed — one file names the whole
+dataset, so the two path overrides had nothing left to override, and the cache is
+derived from the Output Folder and Run Name rather than chosen. All three remain
+available from the command line via `train_baseline.py --input-feature-path`,
+`--ground-truth-data-dir` and `--cache-path`, and raw folder layouts via `--data-root`.
+Loading a session or config that set any of them logs a note saying so instead of
+silently ignoring it.
 
 ### License-Server Admin CLI
 
