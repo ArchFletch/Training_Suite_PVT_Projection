@@ -19,13 +19,12 @@ validation, licensing state, and scientific outputs they care about.
 ## In Scope
 
 - manual environment detection and readiness reporting
-- dataset, output-folder, and cache-path selection
-- auto-managed cache path with manual override
+- dataset file (.npz), output-folder, and run-name selection
+- cache path derived from the output folder and run name
 - dataset scan, schema validation, and preview
 - scan-only suggestion flow
 - editable baseline settings
-- editable self-transfer settings
-- separate baseline and self-transfer launch actions
+- a single baseline launch action
 - load/save config and last-session restore
 - on-prem license server URL persistence
 - connection testing, startup checkout gating, heartbeat state, and shutdown release
@@ -93,13 +92,11 @@ Ordered sections:
 8. User clicks `Start Baseline Training`.
 9. GUI shows live metrics, seat state, baseline plots, and run-log updates.
 
-### Workflow B: Licensed Self-Transfer Training
+### Workflow B: Frequency-Domain Self-Transfer (command line only)
 
-1. User completes dataset scan and holds a valid seat.
-2. User either trains a baseline in the current session or selects an existing compatible baseline run.
-3. User reviews transfer parameters such as band count, iterations, and epochs per stage.
-4. User clicks `Start Self-Transfer Learning`.
-5. GUI shows transfer progress in the metrics area and plots MAE over frequency by transfer iteration.
+Self-transfer is not a GUI workflow. The engine implements it in full, including the
+per-band corner projection, and `run_self_transfer.py` drives it. It was removed from
+the GUI so the desktop app presents one training path.
 
 ## Product Requirements
 
@@ -138,22 +135,15 @@ Ordered sections:
   - confidence level
   - diagnostics
   - suggested baseline settings
-  - suggested transfer settings
   - warnings and rationale
 - Users must be able to apply suggested settings into the editable forms without locking those forms.
 
 ### Training Settings
 
 - Baseline settings must expose optimization, split, and architecture parameters.
-- Transfer settings must expose:
-  - base model source
-  - compatibility state
-  - number of bands
-  - iterations
-  - epochs per stage
-  - optimization controls
-- Existing baseline runs must be compatibility-checked before transfer can start.
-- Transfer notes must explain band trimming when the frequency count does not divide evenly by the selected number of bands.
+- Only the settings the selected model type reads may be shown; the rest are hidden.
+- Self-transfer settings are not exposed. Loading a config that carries them must say so
+  rather than dropping them silently.
 
 ### Run Controls
 

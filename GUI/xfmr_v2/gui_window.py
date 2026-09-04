@@ -13,7 +13,6 @@ from PySide6.QtGui import QCloseEvent, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
-    QCheckBox,
     QComboBox,
     QDialog,
     QDoubleSpinBox,
@@ -71,7 +70,6 @@ from .runner import (
     PROJECTION_MODEL_TYPES,
     SCHEDULER_TYPES,
     TrainConfig,
-    TransferConfig,
     canonical_model_type,
     uses_corner_projection,
 )
@@ -222,11 +220,6 @@ class MlpTrainingStudio(QMainWindow):
         self._baseline_epochs: list[float] = []
         self._baseline_train_losses: list[float] = []
         self._baseline_val_losses: list[float] = []
-        # Per-iteration MAE history for the transfer plot: x = iteration index,
-        # channel_mae[channel name] = list of that channel's average MAE per iteration.
-        self._transfer_iteration_mae_x: list[float] = []
-        self._transfer_channel_mae: dict[str, list[float]] = {}
-
         self.setWindowTitle("Surrogate Model Training Suite")
         self.resize(1440, 920)
         self.setMinimumSize(1280, 800)
@@ -465,7 +458,7 @@ class MlpTrainingStudio(QMainWindow):
         layout = QVBoxLayout(card)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
-        layout.addWidget(self._section_header("Suggest Initial Settings", "Scan-only starter values for baseline and transfer"))
+        layout.addWidget(self._section_header("Suggest Initial Settings", "Scan-only starter values for baseline training"))
 
         header = QHBoxLayout()
         self.suggest_initial_settings_button = self._make_button("Suggest Initial Settings")
@@ -511,14 +504,14 @@ class MlpTrainingStudio(QMainWindow):
         layout = QVBoxLayout(card)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
-        layout.addWidget(self._section_header("Training Settings", "Editable baseline and transfer hyperparameters"))
+        layout.addWidget(self._section_header("Training Settings", "Editable baseline hyperparameters"))
 
         device_grid = QGridLayout()
         device_grid.setHorizontalSpacing(10)
         device_grid.setVerticalSpacing(8)
         self.training_device_combo_box = _NoScrollComboBox()
         self.training_device_combo_box.setToolTip(
-            "Compute unit used for baseline and transfer training. Detected automatically when the app starts."
+            "Compute unit used for training. Detected automatically when the app starts."
         )
         self._populate_device_choices()
         self._add_form_row(device_grid, 0, "Training Device", self.training_device_combo_box)
@@ -528,7 +521,6 @@ class MlpTrainingStudio(QMainWindow):
         layout.addWidget(self.training_tabs)
 
         self.training_tabs.addTab(self._build_baseline_tab(), "Baseline Training")
-        self.training_tabs.addTab(self._build_transfer_tab(), "Self-Transfer Learning")
         return card
 
     def _populate_device_choices(self) -> None:
@@ -654,73 +646,26 @@ class MlpTrainingStudio(QMainWindow):
         self._refresh_model_settings_visibility()
         return tab
 
-    def _build_transfer_tab(self) -> QWidget:
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(10)
-
-        self.enable_transfer_learning_checkbox = QCheckBox("Enable Frequency-Domain Transfer Learning")
-        self.enable_transfer_learning_checkbox.setChecked(True)
-        self.enable_transfer_learning_checkbox.hide()
-        self.enable_transfer_learning_checkbox.toggled.connect(self._refresh_transfer_controls_enabled)
-
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(10)
-        grid.setVerticalSpacing(8)
-
-        self.transfer_notes_label = QLabel(
-            "Self-transfer trains per-band models from scratch on the scanned dataset "
-            "(no baseline run required). It uses the Model Type, Network Width, "
-            "Network Depth, and (for SpectraHydraProj) the PVT corner projection "
-            "settings from the Baseline tab."
-        )
-        self.transfer_notes_label.setWordWrap(True)
-
-        self.transfer_num_bands_spin_box = self._make_int_spin(1, 512, 10)
-        self.transfer_num_bands_spin_box.valueChanged.connect(self._refresh_transfer_note_text)
-        self.transfer_iterations_spin_box = self._make_int_spin(1, 100, 10)
-        self.transfer_epochs_spin_box = self._make_int_spin(1, 5000, 100)
-        self.transfer_batch_size_spin_box = self._make_int_spin(1, 4096, 64)
-        self.transfer_learning_rate_spin_box = self._make_float_spin(1e-6, 1.0, 5e-5, decimals=6, step=1e-5, scientific=True)
-        self.transfer_weight_decay_spin_box = self._make_float_spin(0.0, 1.0, 0.0, decimals=6, step=1e-5, scientific=True)
-        self.transfer_weight_decay_spin_box.setSpecialValueText("Default")
-        self.transfer_seed_spin_box = self._make_int_spin(0, 1000000, 42)
-
-        self._add_form_row(grid, 0, "Number of Frequency Bands", self.transfer_num_bands_spin_box)
-        self._add_form_row(grid, 1, "Transfer Iterations", self.transfer_iterations_spin_box)
-        self._add_form_row(grid, 2, "Epochs per Transfer Stage", self.transfer_epochs_spin_box)
-        self._add_form_row(grid, 3, "Batch Size", self.transfer_batch_size_spin_box)
-        self._add_form_row(grid, 4, "Learning Rate", self.transfer_learning_rate_spin_box)
-        self._add_form_row(grid, 5, "Weight Decay", self.transfer_weight_decay_spin_box)
-        self._add_form_row(grid, 6, "Random Seed", self.transfer_seed_spin_box)
-        layout.addLayout(grid)
-        layout.addWidget(self.transfer_notes_label)
-        return tab
-
     def _build_run_controls_card(self) -> QWidget:
         card = CardFrame()
         layout = QVBoxLayout(card)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
-        layout.addWidget(self._section_header("Run Controls", "Launch baseline or self-transfer runs, stop gracefully, or export summaries"))
+        layout.addWidget(self._section_header("Run Controls", "Launch a baseline run, stop gracefully, or export summaries"))
 
         buttons = QHBoxLayout()
         self.start_baseline_button = self._make_button("Start Baseline Training")
-        self.start_transfer_button = self._make_button("Start Self-Transfer Learning")
         self.stop_training_button = self._make_button("Stop", secondary=True)
         self.stop_training_button.setEnabled(False)
         self.open_output_folder_button = self._make_button("Open Output Folder", secondary=True)
         self.export_run_summary_button = self._make_button("Export Summary", secondary=True)
         self.export_onnx_button = self._make_button("Export to ONNX", secondary=True)
         self.start_baseline_button.clicked.connect(self.start_baseline_training)
-        self.start_transfer_button.clicked.connect(self.start_transfer_learning)
         self.stop_training_button.clicked.connect(self.stop_current_task)
         self.open_output_folder_button.clicked.connect(self.open_output_folder)
         self.export_run_summary_button.clicked.connect(self.export_run_summary)
         self.export_onnx_button.clicked.connect(self.export_baseline_to_onnx)
         buttons.addWidget(self.start_baseline_button)
-        buttons.addWidget(self.start_transfer_button)
         buttons.addWidget(self.stop_training_button)
         buttons.addWidget(self.open_output_folder_button)
         buttons.addWidget(self.export_run_summary_button)
@@ -775,7 +720,7 @@ class MlpTrainingStudio(QMainWindow):
         layout = QVBoxLayout(card)
         layout.setContentsMargins(14, 12, 14, 12)
         layout.setSpacing(10)
-        layout.addWidget(self._section_header("Current Metrics", "Phase-aware live progress across scan, suggestion, baseline, and self-transfer"))
+        layout.addWidget(self._section_header("Current Metrics", "Phase-aware live progress across scan, suggestion, and baseline training"))
 
         grid = QGridLayout()
         grid.setHorizontalSpacing(8)
@@ -826,15 +771,6 @@ class MlpTrainingStudio(QMainWindow):
         baseline_layout.setRowStretch(0, 1)
         tabs.addTab(baseline_tab, "Baseline Monitor")
 
-        transfer_tab = QWidget()
-        transfer_layout = QVBoxLayout(transfer_tab)
-        transfer_layout.setContentsMargins(12, 12, 12, 12)
-        transfer_layout.setSpacing(10)
-        self.transfer_average_mae_plot = pg.PlotWidget(transfer_tab)
-        self.transfer_average_mae_plot.setMinimumHeight(200)
-        transfer_layout.addWidget(self.transfer_average_mae_plot, 1)
-        tabs.addTab(transfer_tab, "Transfer Results")
-
         # Test Samples tab — shows prediction vs ground truth for test samples.
         test_samples_scroll = QScrollArea()
         test_samples_scroll.setWidgetResizable(True)
@@ -857,7 +793,6 @@ class MlpTrainingStudio(QMainWindow):
 
         self.monitor_tabs = tabs
         self._reset_baseline_plots()
-        self._reset_transfer_plots()
         return tabs
 
     # ------------------------------------------------------------------
@@ -872,7 +807,6 @@ class MlpTrainingStudio(QMainWindow):
         self.license_server_status_badge.set_status("Unconfigured")
         self.license_seat_state_badge.set_status(self.license_lease_state.badge_text)
         self._set_metric_defaults()
-        self._refresh_transfer_controls_enabled()
         self._refresh_license_display()
         self._update_topbar_run_name()
         self.append_log("Ready. Select the .npz dataset file and scan the data to begin.")
@@ -899,10 +833,6 @@ class MlpTrainingStudio(QMainWindow):
                 "run_name": self.run_name_edit.text().strip(),
             },
             "baseline": self._collect_baseline_form(),
-            "transfer": {
-                "enabled": True,
-                **self._collect_transfer_form(),
-            },
             "licensing": {
                 "server_url": self.license_server_url_edit.text().strip(),
                 "last_status": self._current_license_status_summary(),
@@ -923,10 +853,7 @@ class MlpTrainingStudio(QMainWindow):
         baseline = payload.get("baseline", {})
         self._apply_baseline_form(baseline)
 
-        transfer = payload.get("transfer", {})
-        self.enable_transfer_learning_checkbox.setChecked(True)
-        self._apply_transfer_form(transfer)
-        self._refresh_transfer_controls_enabled()
+        self._note_removed_transfer_settings(payload.get("transfer"))
         self._apply_license_payload(payload.get("licensing", {}))
         self._update_topbar_run_name()
 
@@ -1148,63 +1075,19 @@ class MlpTrainingStudio(QMainWindow):
             return
 
         self._reset_baseline_plots()
-        self._reset_transfer_plots()
         self.last_workflow_summary = None
 
         self._start_task(
             run_training_workflow,
             kwargs={
                 "baseline_config": self._build_baseline_train_config(),
+                # The engine still runs baseline-only, transfer-only, or both.
+                # The GUI only ever asks for baseline; self-transfer moved to
+                # run_self_transfer.py.
                 "transfer_config": None,
             },
             task_name="training",
             busy_state="Training",
-            on_result=self._on_training_workflow_completed,
-        )
-
-    def start_transfer_learning(self) -> None:
-        if not self._ensure_license_ready_for_training():
-            return
-        payload = self._require_data_paths()
-        if payload is None:
-            return
-        if self.last_scan_result is None:
-            self._show_warning("Please scan the dataset before starting self-transfer learning.")
-            return
-        if not self._validate_transfer_ready():
-            return
-        if not self._validate_split_fractions():
-            return
-        if (
-            self.baseline_train_fraction_spin_box.value()
-            + self.baseline_validation_fraction_spin_box.value()
-            >= 1.0
-        ):
-            # Transfer reports only on the internal test fold and has no External
-            # Eval Set option, so it would otherwise fail part-way through the run.
-            self._show_warning(
-                "Self-transfer reports accuracy on the internal test fold, so the train "
-                "and validation fractions must leave room for one. Lower Train Fraction "
-                "or Validation Fraction on the Baseline tab."
-            )
-            return
-        if not self._validate_projection_settings():
-            return
-
-        self._reset_transfer_plots()
-        # A prior baseline's per-channel numbers would otherwise sit beside this
-        # run's transfer metrics as if they belonged to it.
-        self._reset_channel_metric_cards()
-        self.last_workflow_summary = None
-
-        self._start_task(
-            run_training_workflow,
-            kwargs={
-                "baseline_config": None,
-                "transfer_config": self._build_transfer_config(),
-            },
-            task_name="training",
-            busy_state="Transfer",
             on_result=self._on_training_workflow_completed,
         )
 
@@ -1329,7 +1212,6 @@ class MlpTrainingStudio(QMainWindow):
             self._show_warning("No suggestion is available yet.")
             return
         self._apply_baseline_form(self.last_suggest_result["suggested_baseline_config"])
-        self._apply_transfer_form(self.last_suggest_result["suggested_transfer_config"])
         self.append_log("Applied the scan-only suggested settings to the editable forms.")
 
     def prepare_quick_search_from_suggestion(self) -> None:
@@ -1431,7 +1313,7 @@ class MlpTrainingStudio(QMainWindow):
         self.current_task_name = "idle"
         self._set_action_controls_enabled(True)
         self.stop_training_button.setEnabled(False)
-        if self.run_state_badge.text() in {"Training", "Transfer", "Searching", "Scanning", "Suggesting", "Checking", "Exporting"}:
+        if self.run_state_badge.text() in {"Training", "Searching", "Scanning", "Suggesting", "Checking", "Exporting"}:
             self.run_state_badge.set_status("Idle")
 
     # ------------------------------------------------------------------
@@ -1455,9 +1337,6 @@ class MlpTrainingStudio(QMainWindow):
             return
         if phase == "baseline":
             self._update_baseline_progress(payload)
-            return
-        if phase == "transfer":
-            self._update_transfer_progress(payload)
 
     def _on_scan_completed(self, result: dict[str, Any]) -> None:
         if result.get("status") == "stopped":
@@ -1477,8 +1356,6 @@ class MlpTrainingStudio(QMainWindow):
         self._set_cache_path_value(result["cache_path"])
         self.append_log(f"Dataset scan completed for {result['dataset_name']}.")
         self._reset_baseline_plots()
-        self._reset_transfer_plots()
-        self._refresh_transfer_note_text()
         self.run_progress_bar.setValue(100)
         self.run_state_badge.set_status("Completed")
         self._refresh_run_button_availability()
@@ -1541,28 +1418,15 @@ class MlpTrainingStudio(QMainWindow):
         self.run_state_badge.set_status("Completed")
         self.run_progress_bar.setValue(100)
         baseline = result.get("baseline")
-        transfer = result.get("transfer")
         if baseline:
             self.last_baseline_summary = baseline
             self._apply_baseline_summary(baseline)
             self.append_log(f"Baseline run saved to {baseline['run_dir']}")
             if baseline.get("test_sample_data"):
                 self._populate_test_sample_plots(baseline)
-        if transfer:
-            self.append_log(f"Self-transfer run saved to {transfer['run_dir']}")
-        if baseline and transfer:
-            self.append_log("Baseline training and self-transfer learning completed.")
-        elif baseline:
             self.append_log("Baseline training completed.")
-        elif transfer:
-            self.append_log("Self-transfer learning completed.")
-        # Switch to Test Samples tab if we have test plots, otherwise show the training monitor.
-        if baseline and baseline.get("test_sample_data"):
-            self.monitor_tabs.setCurrentIndex(2)  # Test Samples tab
-        elif transfer is not None:
-            self.monitor_tabs.setCurrentIndex(1)
-        else:
-            self.monitor_tabs.setCurrentIndex(0)
+        # Show the test samples when the run produced any, else the training monitor.
+        self.monitor_tabs.setCurrentIndex(1 if baseline and baseline.get("test_sample_data") else 0)
 
     def _update_scan_progress(self, payload: dict[str, Any]) -> None:
         event = payload.get("event")
@@ -1814,94 +1678,6 @@ class MlpTrainingStudio(QMainWindow):
         elif event == "stopped":
             self.run_state_badge.set_status("Stopped")
 
-    def _update_transfer_progress(self, payload: dict[str, Any]) -> None:
-        event = payload.get("event")
-        self.run_state_badge.set_status("Transfer")
-        self.metric_cards["current_phase"].set_value("Transfer")
-        if event == "data_ready":
-            self.metric_cards["current_progress"].set_value("Preparing")
-            train_samples = payload.get("train_samples")
-            test_samples = payload.get("test_samples")
-            effective_frequency_count = payload.get("effective_frequency_count", payload.get("frequency_count"))
-            trimmed_frequency_count = int(payload.get("trimmed_frequency_count", 0) or 0)
-            if None not in (train_samples, test_samples):
-                progress_text = f"{train_samples} train / {test_samples} test"
-                if effective_frequency_count is not None:
-                    progress_text += f" | {effective_frequency_count} freq"
-                    if trimmed_frequency_count > 0:
-                        progress_text += f" ({trimmed_frequency_count} trimmed)"
-                self.metric_cards["secondary_progress"].set_value(progress_text)
-            else:
-                self.metric_cards["secondary_progress"].set_value("Transfer data ready")
-        elif event == "iteration_started":
-            if payload.get("transfer_iteration") is not None and payload.get("total_iterations") is not None:
-                self.metric_cards["current_progress"].set_value(f"Iteration {payload['transfer_iteration']}/{payload['total_iterations']}")
-            else:
-                self.metric_cards["current_progress"].set_value("Iteration started")
-        elif event == "band_started":
-            self.metric_cards["secondary_progress"].set_value(self._transfer_band_context(payload))
-        elif event == "band_epoch_end":
-            if None in (payload.get("epoch"), payload.get("total_epochs"), payload.get("train_loss")):
-                self.metric_cards["current_progress"].set_value("Band epoch completed")
-                return
-            epoch = int(payload["epoch"])
-            total_epochs = int(payload["total_epochs"])
-            self.metric_cards["current_progress"].set_value(f"T={payload.get('transfer_iteration', 0)} | Band epoch {epoch}/{total_epochs}")
-            self.metric_cards["secondary_progress"].set_value(self._transfer_band_context(payload))
-            self.metric_cards["train_loss"].set_value(f"{payload['train_loss']:.6f}")
-            if payload.get("elapsed_seconds") is not None:
-                self.metric_cards["elapsed"].set_value(self._format_seconds(payload.get("elapsed_seconds")))
-            if payload.get("eta_seconds") is not None:
-                self.metric_cards["eta"].set_value(self._format_seconds(payload.get("eta_seconds")))
-            total_band_runs = int(payload.get("total_band_runs", 0))
-            band_run_index = int(payload.get("band_run_index", 0))
-            if total_band_runs:
-                base_progress = (band_run_index - 1) / max(total_band_runs, 1)
-                within_band = epoch / max(total_epochs, 1) / max(total_band_runs, 1)
-                self.run_progress_bar.setValue(int(100.0 * min(base_progress + within_band, 1.0)))
-        elif event == "iteration_completed":
-            if None in (payload.get("transfer_iteration"), payload.get("average_mae"), payload.get("total_iterations")):
-                self.metric_cards["current_progress"].set_value("Iteration completed")
-                return
-            transfer_iteration = int(payload["transfer_iteration"])
-            self._transfer_iteration_mae_x.append(transfer_iteration)
-            # Record per-channel MAE (e.g. gain, phase) so the plot can show them separately.
-            channel_names = list(payload.get("channel_names") or [])
-            per_channel = list(payload.get("per_channel_mae") or [])
-            for name, value in zip(channel_names, per_channel):
-                self._transfer_channel_mae.setdefault(name, []).append(float(value))
-            # Transfer emits names and values separately; format them into the same
-            # "name: value" shape the baseline path already produces.
-            self._update_channel_metric_cards(
-                [f"{name}: {float(value):.4f}" for name, value in zip(channel_names, per_channel)]
-            )
-            self._plot_transfer_average()
-            # The card shows a single MAE averaged over all ground-truth channels; the
-            # per-channel breakdown remains in the plot above.
-            self.metric_cards["average_mae"].set_value(f"{payload['average_mae']:.6f}")
-            self.metric_cards["current_progress"].set_value(f"Iteration {transfer_iteration}/{payload['total_iterations']} complete")
-            if payload.get("elapsed_seconds") is not None:
-                self.metric_cards["elapsed"].set_value(self._format_seconds(payload.get("elapsed_seconds")))
-            if payload.get("eta_seconds") is not None:
-                self.metric_cards["eta"].set_value(self._format_seconds(payload.get("eta_seconds")))
-            self.run_progress_bar.setValue(int(100.0 * transfer_iteration / max(int(payload["total_iterations"]), 1)))
-        elif event == "completed":
-            self.run_progress_bar.setValue(100)
-            final_average = payload.get("final_average_mae", payload.get("average_mae"))
-            if final_average is not None:
-                self.metric_cards["best_metric"].set_value(f"Final MAE {final_average:.6f}")
-            if payload.get("elapsed_seconds") is not None:
-                self.metric_cards["elapsed"].set_value(self._format_seconds(payload.get("elapsed_seconds")))
-            if payload.get("eta_seconds") is not None:
-                self.metric_cards["eta"].set_value(self._format_seconds(payload.get("eta_seconds")))
-            self.run_state_badge.set_status("Completed")
-        elif event == "stopped":
-            if payload.get("elapsed_seconds") is not None:
-                self.metric_cards["elapsed"].set_value(self._format_seconds(payload.get("elapsed_seconds")))
-            if payload.get("eta_seconds") is not None:
-                self.metric_cards["eta"].set_value(self._format_seconds(payload.get("eta_seconds")))
-            self.run_state_badge.set_status("Stopped")
-
     # ------------------------------------------------------------------
     # Form helpers
     # ------------------------------------------------------------------
@@ -1992,30 +1768,6 @@ class MlpTrainingStudio(QMainWindow):
                 "train_baseline.py --eval-dataset-path. To reproduce the split it "
                 "used, set Train Fraction 0.900 and Validation Fraction 0.100."
             )
-
-    def _collect_transfer_form(self) -> dict[str, Any]:
-        return {
-            "num_bands": self.transfer_num_bands_spin_box.value(),
-            "iterations": self.transfer_iterations_spin_box.value(),
-            "transfer_epochs": self.transfer_epochs_spin_box.value(),
-            "batch_size": self.transfer_batch_size_spin_box.value(),
-            "learning_rate": float(self.transfer_learning_rate_spin_box.value()),
-            "weight_decay": None if self.transfer_weight_decay_spin_box.value() <= 0.0 else float(self.transfer_weight_decay_spin_box.value()),
-            "seed": self.transfer_seed_spin_box.value(),
-        }
-
-    def _apply_transfer_form(self, payload: dict[str, Any]) -> None:
-        if not payload:
-            return
-        self.transfer_num_bands_spin_box.setValue(int(payload.get("num_bands", self.transfer_num_bands_spin_box.value())))
-        self.transfer_iterations_spin_box.setValue(int(payload.get("iterations", self.transfer_iterations_spin_box.value())))
-        self.transfer_epochs_spin_box.setValue(int(payload.get("transfer_epochs", self.transfer_epochs_spin_box.value())))
-        self.transfer_batch_size_spin_box.setValue(int(payload.get("batch_size", self.transfer_batch_size_spin_box.value())))
-        self.transfer_learning_rate_spin_box.setValue(float(payload.get("learning_rate", self.transfer_learning_rate_spin_box.value())))
-        weight_decay = payload.get("weight_decay", None)
-        self.transfer_weight_decay_spin_box.setValue(0.0 if weight_decay in (None, "") else float(weight_decay))
-        self.transfer_seed_spin_box.setValue(int(payload.get("seed", self.transfer_seed_spin_box.value())))
-        self._refresh_transfer_note_text()
 
     # ------------------------------------------------------------------
     # PVT corner-column picker (SpectraHydraProj)
@@ -2165,32 +1917,6 @@ class MlpTrainingStudio(QMainWindow):
             device=self._current_device_id(),
         )
 
-    def _build_transfer_config(self) -> TransferConfig:
-        roots = make_run_roots(self.model_output_folder_path_edit.text().strip(), self.run_name_edit.text().strip())
-        form = self._collect_transfer_form()
-        # Standalone transfer trains from scratch, so it needs the model architecture and
-        # data split itself. Source those from the Baseline tab (the model-settings home).
-        return TransferConfig(
-            cache_path=self._ensure_cache_path(),
-            output_dir=roots["transfer"],
-            model_type=self.baseline_model_type_combo_box.currentText(),
-            width=self.baseline_width_spin_box.value(),
-            depth=self.baseline_depth_spin_box.value(),
-            projection_columns=self._selected_projection_columns() or None,
-            projection_dim=self.baseline_projection_dim_spin_box.value(),
-            seed=form["seed"],
-            train_frac=float(self.baseline_train_fraction_spin_box.value()),
-            val_frac=float(self.baseline_validation_fraction_spin_box.value()),
-            num_bands=form["num_bands"],
-            iterations=form["iterations"],
-            transfer_epochs=form["transfer_epochs"],
-            batch_size=form["batch_size"],
-            learning_rate=form["learning_rate"],
-            weight_decay=form["weight_decay"],
-            use_amp=True,
-            device=self._current_device_id(),
-        )
-
     def _build_search_config(self) -> SearchConfig:
         raise RuntimeError("Quick search has been removed from the GUI.")
 
@@ -2208,42 +1934,6 @@ class MlpTrainingStudio(QMainWindow):
     # ------------------------------------------------------------------
     def _refresh_search_controls_enabled(self) -> None:
         return
-
-    def _refresh_transfer_controls_enabled(self) -> None:
-        enabled = self.enable_transfer_learning_checkbox.isChecked() and not self._controls_locked
-        for widget in (
-            self.transfer_num_bands_spin_box,
-            self.transfer_iterations_spin_box,
-            self.transfer_epochs_spin_box,
-            self.transfer_batch_size_spin_box,
-            self.transfer_learning_rate_spin_box,
-            self.transfer_weight_decay_spin_box,
-            self.transfer_seed_spin_box,
-        ):
-            widget.setEnabled(enabled)
-
-    def _refresh_transfer_note_text(self) -> None:
-        if self.last_scan_result is None:
-            return
-        frequency_count = int(self.last_scan_result["frequency_count"])
-        num_bands = self.transfer_num_bands_spin_box.value()
-        if num_bands <= 0:
-            return
-        if num_bands > frequency_count:
-            points_per_band = 0
-            suffix = "This band count is not valid because it exceeds the detected frequency count."
-        elif frequency_count % num_bands == 0:
-            points_per_band = frequency_count // num_bands
-            suffix = "Compatible split. No frequency points will be trimmed."
-        else:
-            trimmed_frequency_count = frequency_count % num_bands
-            points_per_band = (frequency_count - trimmed_frequency_count) // num_bands
-            suffix = (
-                f"The last {trimmed_frequency_count} frequency point(s) will be discarded during "
-                f"transfer so each band uses {points_per_band} points."
-            )
-        prefix = "Self-transfer trains per-band models from scratch on the scanned dataset."
-        self.transfer_notes_label.setText(f"{prefix} {frequency_count} frequency points detected, about {points_per_band:.1f} per band. {suffix}")
 
     def _update_start_button_text(self) -> None:
         return
@@ -2270,18 +1960,16 @@ class MlpTrainingStudio(QMainWindow):
     def _refresh_run_button_availability(self) -> None:
         blocked_reason = self._start_blocked_reason()
         start_enabled = blocked_reason is None
-        for button in (self.start_baseline_button, self.start_transfer_button):
-            button.setEnabled(start_enabled)
-            # Qt shows a tooltip on a disabled widget, which is the only channel
-            # left for telling the user what to fix.
-            button.setToolTip("" if start_enabled else blocked_reason)
+        self.start_baseline_button.setEnabled(start_enabled)
+        # Qt shows a tooltip on a disabled widget, which is the only channel left
+        # for telling the user what to fix.
+        self.start_baseline_button.setToolTip("" if start_enabled else blocked_reason)
 
     def _set_action_controls_enabled(self, enabled: bool) -> None:
         widgets = [
             self.training_device_combo_box,
             self.suggest_initial_settings_button,
             self.start_baseline_button,
-            self.start_transfer_button,
             self.open_output_folder_button,
             self.export_run_summary_button,
             self.export_onnx_button,
@@ -2300,7 +1988,6 @@ class MlpTrainingStudio(QMainWindow):
         self._controls_locked = not enabled
         for widget in widgets:
             widget.setEnabled(enabled)
-        self._refresh_transfer_controls_enabled()
         self._refresh_run_button_availability()
 
     # ------------------------------------------------------------------
@@ -2330,17 +2017,6 @@ class MlpTrainingStudio(QMainWindow):
         configure_plot_widget(self.search_tradeoff_plot, title="Accuracy vs Runtime", x_label="Runtime (s)", y_label="Average Validation MAE")
         self._search_text_items.clear()
 
-    def _reset_transfer_plots(self) -> None:
-        self._transfer_iteration_mae_x.clear()
-        self._transfer_channel_mae.clear()
-        self.transfer_average_mae_plot.clear()
-        configure_plot_widget(
-            self.transfer_average_mae_plot,
-            title="MAE by Transfer Iteration (per channel)",
-            x_label="Transfer Iteration",
-            y_label="MAE",
-        )
-
     def _plot_search_tradeoff(self, trials: list[dict[str, Any]]) -> None:
         self._reset_search_plot()
         colors = plot_color_cycle()
@@ -2352,25 +2028,6 @@ class MlpTrainingStudio(QMainWindow):
             label.setPos(trial["runtime_seconds"], trial["average_val_mae"])
             self.search_tradeoff_plot.addItem(label)
             self._search_text_items.append(label)
-
-    def _plot_transfer_average(self) -> None:
-        """Show each output channel's MAE per transfer iteration (e.g. gain and phase
-        as separate lines), matching the baseline's per-channel MAE calculation."""
-        self.transfer_average_mae_plot.clear()
-        colors = plot_color_cycle()
-        if not self._transfer_iteration_mae_x:
-            return
-        for index, (name, values) in enumerate(self._transfer_channel_mae.items()):
-            color = colors[index % len(colors)]
-            self.transfer_average_mae_plot.plot(
-                self._transfer_iteration_mae_x,
-                values,
-                pen=pg.mkPen(color, width=2.2),
-                symbol="o",
-                symbolSize=8,
-                symbolBrush=color,
-                name=name,
-            )
 
     # ------------------------------------------------------------------
     # Misc helpers
@@ -2490,12 +2147,6 @@ class MlpTrainingStudio(QMainWindow):
         for name in ["model_type", "width", "depth", "batch_size", "learning_rate", "weight_decay", "epochs"]:
             range_info = baseline_ranges.get(name, {})
             rows.append((f"Baseline: {self._prettify_key(name)}", self._stringify(baseline[name]), self._stringify(range_info.get("candidates", [])), baseline_rationale.get(name, "")))
-        transfer = result["suggested_transfer_config"]
-        transfer_ranges = result["suggested_transfer_ranges"]
-        transfer_rationale = result["transfer_rationale"]
-        for name in ["num_bands", "iterations", "transfer_epochs", "batch_size", "learning_rate"]:
-            range_info = transfer_ranges.get(name, {})
-            rows.append((f"Transfer: {self._prettify_key(name)}", self._stringify(transfer[name]), self._stringify(range_info.get("candidates", [])), transfer_rationale.get(name, "")))
         return rows
 
     def _search_row(self, trial: dict[str, Any]) -> tuple[str, ...]:
@@ -2545,23 +2196,8 @@ class MlpTrainingStudio(QMainWindow):
             return False
         return True
 
-    def _validate_transfer_ready(self) -> bool:
-        if self.last_scan_result is None:
-            self._show_warning("Scan the dataset before starting self-transfer learning.")
-            return False
-        frequency_count = int(self.last_scan_result["frequency_count"])
-        num_bands = self.transfer_num_bands_spin_box.value()
-        if num_bands > frequency_count:
-            self._show_warning(
-                f"The selected number of frequency bands ({num_bands}) exceeds the detected frequency count ({frequency_count})."
-            )
-            return False
-        return True
-
     def _preferred_output_path(self) -> str | None:
         if self.last_workflow_summary:
-            if self.last_workflow_summary.get("transfer"):
-                return self.last_workflow_summary["transfer"]["run_dir"]
             if self.last_workflow_summary.get("baseline"):
                 return self.last_workflow_summary["baseline"]["run_dir"]
         return self.model_output_folder_path_edit.text().strip() or None
@@ -2641,6 +2277,26 @@ class MlpTrainingStudio(QMainWindow):
         self._sync_auto_cache_path()
         self._update_topbar_run_name()
         self._refresh_run_button_availability()
+
+    def _note_removed_transfer_settings(self, transfer: Any) -> None:
+        """Report a saved self-transfer setup that this GUI no longer runs.
+
+        Frequency-domain self-transfer was removed from the GUI; the engine still
+        implements it and run_self_transfer.py still drives it. A restored session
+        may carry a tuned band setup, and dropping it silently would look like the
+        run still trains per-band when it now trains one model over the whole
+        frequency range.
+        """
+        if not isinstance(transfer, dict) or not transfer:
+            return
+        bands = transfer.get("num_bands")
+        detail = f" ({bands} frequency bands)" if bands else ""
+        self.append_log(
+            f"This configuration set up frequency-domain self-transfer learning{detail}. "
+            "That workflow has been removed from the GUI, so this run will train a single "
+            "baseline model across the whole frequency range. Self-transfer is still "
+            "available from the command line via run_self_transfer.py."
+        )
 
     def _note_removed_data_source_fields(self, data_sources: dict[str, Any]) -> None:
         """Report saved values for fields this GUI no longer has.
@@ -2806,13 +2462,6 @@ class MlpTrainingStudio(QMainWindow):
         }.items():
             self.metric_cards[key].set_value(value)
 
-    def _transfer_band_context(self, payload: dict[str, Any]) -> str:
-        return (
-            f"T={int(payload.get('transfer_iteration', 0))} | "
-            f"{str(payload.get('direction', 'transfer')).title()} band "
-            f"{int(payload.get('band_index', 0)) + 1}/{int(payload.get('num_bands', 0))}"
-        )
-
     def _format_progress_line(self, payload: dict[str, Any]) -> str:
         event = payload.get("event", "")
         message = str(payload.get("message", "")).strip()
@@ -2832,13 +2481,6 @@ class MlpTrainingStudio(QMainWindow):
             if None not in (epoch, total_epochs, train_loss, val_loss, best_val):
                 return f"[{phase}] Epoch {epoch}/{total_epochs} train_loss={train_loss:.6f} val_loss={val_loss:.6f} best_val={best_val:.6f}"
             return f"[{phase}] {message or 'Epoch completed.'}"
-        if event == "band_epoch_end":
-            epoch = payload.get("epoch")
-            total_epochs = payload.get("total_epochs")
-            train_loss = payload.get("train_loss")
-            if None not in (epoch, total_epochs, train_loss):
-                return f"[Transfer] {self._transfer_band_context(payload)} epoch {epoch}/{total_epochs} train_loss={train_loss:.6f}"
-            return f"[Transfer] {message or 'Band epoch completed.'}"
         if event == "trial_completed":
             if None not in (
                 payload.get("trial_index"),
@@ -2849,10 +2491,6 @@ class MlpTrainingStudio(QMainWindow):
             ):
                 return f"[Search] Trial {payload['trial_index']}/{payload['trial_count']} ({payload['trial_label']}) avg_val_mae={payload['average_val_mae']:.6f} runtime={self._format_seconds(payload['runtime_seconds'])}"
             return f"[Search] {message or 'Trial completed.'}"
-        if event == "iteration_completed":
-            if payload.get("transfer_iteration") is not None and payload.get("average_mae") is not None:
-                return f"[Transfer] Iteration {payload['transfer_iteration']} completed with average_mae={payload['average_mae']:.6f}"
-            return f"[Transfer] {message or 'Iteration completed.'}"
         return f"[{phase}] {message}" if message else ""
 
     def append_log(self, text: str) -> None:

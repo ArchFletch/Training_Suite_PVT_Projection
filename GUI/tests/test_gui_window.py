@@ -67,7 +67,6 @@ def test_window_selected_device_flows_into_configs(gui_window, synthetic_dataset
     gui_window._set_device_selection("cuda:1")
     assert gui_window._current_device_id() == "cuda:1"
     assert gui_window._build_baseline_train_config().device == "cuda:1"
-    assert gui_window._build_transfer_config().device == "cuda:1"
 
 
 def _configure_dataset_paths(window, synthetic_dataset: dict[str, Path], tmp_path: Path) -> None:
@@ -94,13 +93,17 @@ def test_window_scan_and_suggest_populate_preview_and_forms(
 
     gui_window.run_suggest_initial_settings()
     assert gui_window.initial_suggestion_confidence_badge.text() in {"High", "Medium", "Low"}
-    assert gui_window.initial_settings_table.rowCount() >= 10
+    # Baseline rows only. The engine still returns transfer suggestions, but the
+    # GUI cannot run that workflow, so listing them would offer settings with no
+    # control to apply them to.
+    table = gui_window.initial_settings_table
+    assert table.rowCount() >= 7
+    shown = [table.item(row, 0).text() for row in range(table.rowCount())]
+    assert not [name for name in shown if name.startswith("Transfer:")], shown
 
     gui_window.apply_suggested_settings()
     baseline_config = gui_window.last_suggest_result["suggested_baseline_config"]
-    transfer_config = gui_window.last_suggest_result["suggested_transfer_config"]
     assert gui_window.baseline_width_spin_box.value() == baseline_config["width"]
-    assert gui_window.transfer_num_bands_spin_box.value() == transfer_config["num_bands"]
 
 
 def test_data_source_browse_buttons_remain_visible(gui_window) -> None:
@@ -128,20 +131,26 @@ def test_data_sources_card_offers_only_the_npz_dataset_file(gui_window) -> None:
     assert "npz" in gui_window.dataset_file_edit.placeholderText()
 
 
-def test_window_exposes_separate_baseline_and_transfer_actions(gui_window) -> None:
+def test_window_exposes_only_the_baseline_run_action(gui_window) -> None:
+    """Frequency-domain self-transfer is gone from the GUI.
+
+    Removed rather than hidden: a leftover button or monitor tab would still
+    round-trip through the saved session and still offer a workflow the GUI no
+    longer runs.
+    """
     assert gui_window.start_baseline_button.text() == "Start Baseline Training"
-    assert gui_window.start_transfer_button.text() == "Start Self-Transfer Learning"
-    assert [gui_window.monitor_tabs.tabText(index) for index in range(gui_window.monitor_tabs.count())] == [
+    assert not hasattr(gui_window, "start_transfer_button")
+    assert not hasattr(gui_window, "transfer_average_mae_plot")
+    assert not hasattr(gui_window, "enable_transfer_learning_checkbox")
+    assert not hasattr(gui_window, "transfer_num_bands_spin_box")
+
+    assert [gui_window.monitor_tabs.tabText(i) for i in range(gui_window.monitor_tabs.count())] == [
         "Baseline Monitor",
-        "Transfer Results",
         "Test Samples",
     ]
-    transfer_tab = gui_window.monitor_tabs.widget(1)
-    assert transfer_tab.layout().count() == 1
-    assert not hasattr(gui_window, "transfer_training_loss_plot")
-    # The average-MAE-per-iteration plot was reintroduced with the avg-MAE display.
-    assert hasattr(gui_window, "transfer_average_mae_plot")
-    assert not hasattr(gui_window, "transfer_band_mae_plot")
+    assert [
+        gui_window.training_tabs.tabText(i) for i in range(gui_window.training_tabs.count())
+    ] == ["Baseline Training"]
 
 
 def test_auto_managed_cache_path_tracks_run_name_changes(gui_window) -> None:
@@ -302,71 +311,6 @@ def test_window_baseline_training_progress_updates_live_metrics_and_plots(
     assert gui_window.last_baseline_summary["run_dir"].endswith("baseline_run")
     # Elapsed shows the real runtime (runtime_seconds=2.0) once baseline training completes.
     assert gui_window.metric_cards["elapsed"].value_label.text() == "2s"
-
-
-def test_window_transfer_training_standalone_reports_per_channel_mae(
-    gui_window,
-    synthetic_dataset: dict[str, Path],
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _configure_dataset_paths(gui_window, synthetic_dataset, tmp_path)
-    gui_window.scan_dataset()
-    gui_window.transfer_num_bands_spin_box.setValue(3)
-
-    def fake_run_training_workflow(
-        *,
-        baseline_config,
-        transfer_config,
-        progress_callback=None,
-        should_stop=None,
-    ):
-        # Standalone transfer: no baseline involved.
-        assert baseline_config is None
-        assert transfer_config is not None
-        emit_progress(
-            progress_callback,
-            event="iteration_completed",
-            phase="transfer",
-            transfer_iteration=1,
-            total_iterations=1,
-            average_mae=0.025,
-            per_channel_mae=[0.03, 0.02],
-            channel_names=["gain", "phase"],
-            frequency_ghz=[2.0, 3.0, 4.0],
-            frequency_mae=[0.03, 0.02, 0.01],
-            band_mae=[0.03, 0.02, 0.01],
-            elapsed_seconds=9.0,
-            eta_seconds=0.0,
-            message="Iteration completed.",
-        )
-        emit_progress(
-            progress_callback,
-            event="completed",
-            phase="transfer",
-            final_average_mae=0.025,
-            elapsed_seconds=9.0,
-            eta_seconds=0.0,
-            message="Transfer complete.",
-        )
-        return {
-            "status": "ok",
-            "baseline": None,
-            "transfer": {"run_dir": str(tmp_path / "transfer_run")},
-        }
-
-    monkeypatch.setattr(gui_window_module, "run_training_workflow", fake_run_training_workflow)
-    gui_window.start_transfer_learning()
-
-    assert gui_window.last_workflow_summary["status"] == "ok"
-    assert gui_window.run_state_badge.text() == "Completed"
-    assert gui_window._transfer_iteration_mae_x == [1]
-    # Gain and phase are tracked separately for the per-channel transfer plot.
-    assert gui_window._transfer_channel_mae == {"gain": [0.03], "phase": [0.02]}
-    # The card itself shows the single MAE averaged over all channels (not per-channel).
-    assert gui_window.metric_cards["average_mae"].value_label.text() == "0.025000"
-    assert gui_window.metric_cards["elapsed"].value_label.text() == "9s"
-    assert gui_window.metric_cards["eta"].value_label.text() == "0s"
 
 
 def _write_minimal_baseline_checkpoint(run_dir: Path) -> None:
@@ -588,10 +532,6 @@ def test_projection_columns_flow_from_scan_into_configs(
     assert baseline_config.projection_columns == ["y"]
     assert baseline_config.projection_dim == 4
 
-    transfer_config = gui_window._build_transfer_config()
-    assert transfer_config.model_type == "SpectraHydraProj"
-    assert transfer_config.projection_columns == ["y"]
-    assert transfer_config.projection_dim == 4
 
 
 def test_projection_start_blocked_without_corner_columns(
@@ -613,9 +553,6 @@ def test_projection_start_blocked_without_corner_columns(
     gui_window.start_baseline_training()
     assert not launched, "training must not start without corner columns selected"
     assert any("corner column" in message for message in warnings)
-
-    gui_window.start_transfer_learning()
-    assert not launched
 
     # Selecting a corner column unblocks the run.
     _check_projection_column(gui_window, "y")
@@ -774,7 +711,6 @@ def test_design_split_keys_in_old_configs_log_a_note_and_do_not_break(gui_window
 
     assert gui_window._build_baseline_train_config().split_design_columns is None
     assert gui_window._build_baseline_train_config().split_corner_columns is None
-    assert gui_window._build_transfer_config().split_design_columns is None
 
     # TrainConfig-default payloads (None) and split-off payloads ([]) stay silent.
     gui_window.run_log_text_edit.clear()
@@ -852,11 +788,10 @@ def test_a_disabled_start_button_says_why_it_is_disabled(gui_window) -> None:
 
     expected = gui_window._start_blocked_reason()
     assert expected == gui_window._license_display_message()
-    for button in (gui_window.start_baseline_button, gui_window.start_transfer_button):
-        reason = button.toolTip()
-        assert reason, "a disabled start button must carry its reason as a tooltip"
-        assert reason == expected
-        assert "Acquire Seat" in reason
+    reason = gui_window.start_baseline_button.toolTip()
+    assert reason, "a disabled start button must carry its reason as a tooltip"
+    assert reason == expected
+    assert "Acquire Seat" in reason
 
 
 def test_the_start_button_tooltip_clears_once_a_seat_is_held(gui_window) -> None:
@@ -923,3 +858,29 @@ def test_starting_without_a_scan_explains_itself_instead_of_running(gui_window, 
     gui_window.start_baseline_training()
 
     assert not started, "training must not start before the dataset is scanned"
+
+
+def test_a_saved_transfer_setup_is_reported_not_silently_dropped(gui_window, tmp_path) -> None:
+    """A session tuned for per-band transfer must not look like it still applies.
+
+    The run now trains one model across the whole frequency range, which is a
+    different model from the one the saved band count describes.
+    """
+    gui_window.apply_config_payload(
+        {
+            "data_sources": {"output_dir": str(tmp_path / "out"), "run_name": "legacy"},
+            "transfer": {"enabled": True, "num_bands": 10, "iterations": 10},
+        }
+    )
+
+    log = gui_window.run_log_text_edit.toPlainText()
+    assert "self-transfer" in log
+    assert "10 frequency bands" in log
+    assert "run_self_transfer.py" in log
+
+
+def test_a_config_without_transfer_settings_stays_quiet(gui_window, tmp_path) -> None:
+    gui_window.apply_config_payload(
+        {"data_sources": {"output_dir": str(tmp_path / "out"), "run_name": "clean"}}
+    )
+    assert "self-transfer" not in gui_window.run_log_text_edit.toPlainText()

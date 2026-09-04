@@ -106,7 +106,6 @@ def test_saved_license_url_checkout_denial_blocks_training(qtbot, monkeypatch: p
     assert window.license_seat_state_badge.text() == "Denied"
     assert "currently in use" in window.license_status_text.text()
     assert not window.start_baseline_button.isEnabled()
-    assert not window.start_transfer_button.isEnabled()
 
 
 def test_saved_license_url_checkout_success_keeps_training_enabled(qtbot, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -129,7 +128,6 @@ def test_saved_license_url_checkout_success_keeps_training_enabled(qtbot, monkey
     assert window.license_seat_state_badge.text() == "Checked Out"
     assert window.license_company_value.text() == "Acme"
     assert window.start_baseline_button.isEnabled()
-    assert window.start_transfer_button.isEnabled()
 
 
 def test_license_connection_test_updates_summary_without_checkout(qtbot, monkeypatch: pytest.MonkeyPatch) -> None:
