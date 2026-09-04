@@ -672,3 +672,33 @@ def test_datasets_without_channel_units_keep_the_single_card(gui_window) -> None
     )
     assert gui_window._channel_metric_cards == {}
     assert gui_window.metric_cards["average_mae"].value_label.text() == "0.500000"
+
+
+def test_applying_a_corner_projection_suggestion_fills_the_picker(gui_window, tmp_path) -> None:
+    """Accepting a PVT suggestion must leave the baseline form ready to train.
+
+    The recommender now picks SpectraHydraProj for corner datasets, and that
+    model refuses to start without corner columns. A recommendation that flipped
+    the combo box but left the boxes unchecked would hand the user a form that
+    only fails at Start Training.
+    """
+    from tests.test_suggest_corner_projection import _pvt_features, _write_cache
+    from xfmr_v2.suggest import SuggestConfig, suggest_initial_settings
+
+    features, names = _pvt_features()
+    cache_path = _write_cache(tmp_path / "pvt_cache.npz", features, names)
+    result = suggest_initial_settings(SuggestConfig(data_root=None, cache_path=str(cache_path)))
+
+    gui_window.last_scan_result = {
+        "active_input_feature_names": result["active_input_feature_names"],
+        "dropped_input_feature_names": result["dropped_input_feature_names"],
+        "frequency_count": result["diagnostics"]["frequency_point_count"],
+    }
+    gui_window._populate_projection_columns(result["active_input_feature_names"])
+    gui_window.last_suggest_result = result
+    gui_window.apply_suggested_settings()
+
+    assert gui_window.baseline_model_type_combo_box.currentText() == "SpectraHydraProj"
+    assert gui_window._selected_projection_columns() == ["Temp_C", "VDD"]
+    assert gui_window.baseline_projection_columns_list.isEnabled()
+    assert gui_window._validate_projection_settings()

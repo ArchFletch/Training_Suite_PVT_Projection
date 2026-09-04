@@ -23,6 +23,7 @@ from .data import (
     CACHE_PATH,
     DATA_ROOT,
     design_split_indices,
+    detect_corner_columns,
     ensure_cache,
     resolve_split_fractions,
     split_indices,
@@ -156,6 +157,10 @@ def suggest_initial_settings(
         phase="suggest",
         message="Computing dataset diagnostics from the training split.",
     )
+    # PVT corner structure, detected from the training split's ACTIVE columns —
+    # the same list projection column names are resolved against at model-build
+    # time, so a name recommended here cannot be one the model would reject.
+    corner_detection = detect_corner_columns(train_features_raw[:, active_mask], active_names)
     input_rank = _effective_rank(train_features, config.variance_threshold)
     ground_truth_rank = _effective_rank(ground_truth_matrix, config.variance_threshold)
     spectral_stats = _spectral_complexity(train_targets)
@@ -183,6 +188,7 @@ def suggest_initial_settings(
         spectral_tier=spectral_stats["tier"],
         capacity_tier=capacity_tier,
         gpu_info=gpu_info,
+        corner_detection=corner_detection,
     )
     # The overfit estimate is now derived from the *chosen* model size relative to the
     # supervised signal available, so it is read back from the baseline result.
@@ -224,6 +230,13 @@ def suggest_initial_settings(
         "spectral_curvature_ratio": float(spectral_stats["curvature_ratio"]),
         "sample_to_ground_truth_rank_ratio": sample_to_ground_truth_rank_ratio,
         "capacity_tier": capacity_tier,
+        # PVT corner structure. Empty detected_corner_columns means the dataset
+        # showed no corner cross-product, so no corner conditioning was offered.
+        "detected_corner_columns": list(corner_detection["corner_columns"]),
+        "corner_named_columns": list(corner_detection["name_matched_columns"]),
+        "detected_design_count": int(corner_detection["design_count"]),
+        "detected_corner_count": int(corner_detection["corner_count"]),
+        "rows_per_design": float(corner_detection["rows_per_design"]),
         "estimated_param_count": int(param_count),
         "supervised_signal_per_param": float(signal_per_param),
         "estimated_overfit_risk": overfit_risk,
@@ -476,6 +489,7 @@ def _suggest_baseline(
     spectral_tier: str,
     capacity_tier: str,
     gpu_info: dict[str, Any],
+    corner_detection: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     # These ordered tiers make the heuristic easier to reason about than a fully
     # continuous formula because the output lands on familiar, hand-checked values.
@@ -525,12 +539,22 @@ def _suggest_baseline(
     # channel) is substantially more accurate than the flat SpectraNet whenever there is
     # enough data to support it. SpectraNet is reserved for data-starved (conservative)
     # cases where the larger model would mostly add overfitting risk.
+    #
+    # A dataset with PVT corner structure upgrades that choice again: the same
+    # design re-simulated across corners is what SpectraHydraProj is for, and the
+    # study this port came from measured one corner-conditioned model beating
+    # per-corner models. It is a SpectraHydra plus Linear(corners -> 16), so the
+    # extra capacity is negligible and the recipe below is unchanged. The upgrade
+    # is deliberately NOT applied in the conservative tier: there is no
+    # SpectraNet+projection model, and a data-starved dataset gets the smaller
+    # architecture instead of a corner embedding it cannot support.
+    corners = list((corner_detection or {}).get("corner_columns", []))
     if capacity_tier == "conservative":
         model_type = "SpectraNet"
         loss_function = "rmse"
         scheduler = "plateau"
     else:
-        model_type = "SpectraHydra"
+        model_type = "SpectraHydraProj" if corners else "SpectraHydra"
         depth = 5  # yields the validated [w, 2w, 4w, 2w, w] encoder
         loss_function = "mse"
         scheduler = "cosine"
@@ -550,7 +574,10 @@ def _suggest_baseline(
     signal_per_param = (train_count * ground_truth_channels * frequency_point_count) / max(param_count, 1)
     overfit_risk = _overfit_risk_from_signal(signal_per_param)
 
-    if model_type == "SpectraHydra":
+    # SpectraHydraProj is a SpectraHydra plus a corner projection, so every
+    # recipe choice validated for the shared encoder applies to it unchanged.
+    is_shared_encoder = model_type in ("SpectraHydra", "SpectraHydraProj")
+    if is_shared_encoder:
         # Notebook-validated AdamW recipe for the shared-encoder model (with cosine LR).
         learning_rate = 1e-3
         weight_decay = 1e-4
@@ -585,7 +612,7 @@ def _suggest_baseline(
         epochs = 300
     else:
         epochs = 200
-    if model_type == "SpectraHydra":
+    if is_shared_encoder:
         # The larger encoder under a cosine schedule needs a longer budget to converge;
         # with early stopping removed, the validated recipe trains the full 500 epochs.
         epochs = max(epochs, 500)
@@ -611,6 +638,11 @@ def _suggest_baseline(
         split_corner_columns=request.split_corner_columns,
         split_design_columns=request.split_design_columns,
         model_type=model_type,
+        # Only the projection model reads these. Leaving the dataclass defaults
+        # (None / 16) for every other model type is what lets a consumer apply a
+        # suggested config without clobbering a corner setup it never chose.
+        projection_columns=(corners if model_type == "SpectraHydraProj" else None),
+        projection_dim=(16 if model_type == "SpectraHydraProj" else defaults.projection_dim),
         width=width,
         depth=depth,
         loss_function=loss_function,
@@ -629,22 +661,42 @@ def _suggest_baseline(
         "weight_decay": _neighbor_range(weight_decay_tiers, weight_decay),
         "epochs": _neighbor_range(epoch_tiers, epochs),
     }
-    rationale = {
-        "model_type": (
+    detection = corner_detection or {}
+    if model_type == "SpectraHydraProj":
+        model_rationale = (
+            f"{model_type} chosen for {capacity_tier} capacity: the dataset re-simulates "
+            f"{detection.get('design_count', 0)} design(s) across "
+            f"{detection.get('corner_count', 0)} PVT corner(s) "
+            f"({detection.get('rows_per_design', 0.0):.1f} rows per design), so the "
+            f"corner column(s) {', '.join(corners)} are fed to a learned corner "
+            "projection on top of the shared-encoder SpectraHydra."
+        )
+    elif detection.get("corner_columns"):
+        model_rationale = (
+            f"{model_type} chosen for {capacity_tier} capacity. PVT corner column(s) "
+            f"{', '.join(detection['corner_columns'])} were detected, but the corner "
+            "projection is only recommended on top of SpectraHydra, and this train "
+            "split is too small for the shared encoder."
+        )
+    else:
+        model_rationale = (
             f"{model_type} chosen for {capacity_tier} capacity: the shared-encoder SpectraHydra "
             "(with MSE loss + cosine LR) is used whenever the data supports it, and the flat "
-            "SpectraNet only for data-starved cases."
-        ),
+            "SpectraNet only for data-starved cases. No PVT corner structure was detected, so "
+            "no corner projection was recommended."
+        )
+    rationale = {
+        "model_type": model_rationale,
         "width": f"Width is anchored to the ground-truth effective rank ({ground_truth_rank}) and adjusted for {capacity_tier} capacity with {spectral_tier} spectral complexity.",
         "depth": (
             f"Depth {depth} gives the validated expand-then-contract SpectraHydra encoder."
-            if model_type == "SpectraHydra"
+            if is_shared_encoder
             else f"Depth {depth} balances train-set size {train_count} with {spectral_tier} spectral complexity."
         ),
         "batch_size": _batch_rationale(batch_size, gpu_info, width, frequency_point_count),
         "learning_rate": (
             f"Learning rate {learning_rate:.1e} is the notebook-validated AdamW rate for the SpectraHydra encoder."
-            if model_type == "SpectraHydra"
+            if is_shared_encoder
             else f"Learning rate {learning_rate:.1e} is a safe AdamW default; it cannot be inferred from a static scan, so refine it with a quick search."
         ),
         "weight_decay": f"Weight decay {weight_decay:.1e} reflects a {overfit_risk} overfit estimate ({signal_per_param:.1f} supervised values per parameter).",
@@ -763,6 +815,26 @@ def _build_warnings(diagnostics: dict[str, Any], confidence: str, transfer: dict
         warnings.append(
             "Frequency-band transfer suggestions are limited because the frequency count is too small for multiple equal-width bands."
         )
+    detected = list(diagnostics.get("detected_corner_columns", []))
+    if detected:
+        # Every corner row of a design is a near-duplicate of its siblings, so a
+        # row-level split puts the same design in train AND test and the reported
+        # accuracy is optimistic. Say so: the fix is a design-level split, which
+        # this GUI does not offer, so point at the command line that does.
+        warnings.append(
+            f"PVT corner structure was detected ({', '.join(detected)}); each design is "
+            f"re-simulated across about {diagnostics.get('rows_per_design', 0.0):.1f} rows. "
+            "The row-level split therefore puts corner rows of the same design in both "
+            "training and test, so the internal accuracy will read better than it is. "
+            "Use train_baseline.py --split-corner-columns for a design-level split."
+        )
+        unnamed = [name for name in detected if name not in set(diagnostics.get("corner_named_columns", []))]
+        if unnamed:
+            warnings.append(
+                f"Corner column(s) {', '.join(unnamed)} were identified from the data's "
+                "cross-product structure alone, not from their names. Confirm they really "
+                "are PVT conditions before training with the corner projection."
+            )
     return warnings
 
 
