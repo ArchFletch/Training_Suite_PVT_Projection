@@ -35,12 +35,18 @@ The training core turns a README-described dataset into reproducible modeling ru
 - optional self-transfer learning
 - saved checkpoints, JSON summaries, and plots
 
-Three architectures are available: `SpectraNet` (flat dense net), `SpectraHydra`
-(shared encoder with per-channel heads), and `SpectraHydraProj` (SpectraHydra plus a
+Four architectures are available: `SpectraNet` (flat dense net), `SpectraHydra`
+(shared encoder with per-channel heads), `SpectraHydraProj` (SpectraHydra plus a
 learned projection of PVT corner columns — pick the corner/condition feature columns
 such as temperature, supply, and process one-hots, and the model concatenates their
 trained embedding onto the inputs; the projection also trains live inside every band
-submodel during self-transfer).
+submodel during self-transfer), and `SpectraTrunk` (a frequency-trunk model from the
+M:N transformer study: a context MLP compresses the inputs to a frequency-flat
+context, and one weight-shared residual trunk is evaluated per frequency point with a
+33-dim Fourier embedding of the frequency coordinate, so the spectrum is predicted as
+a smooth function of frequency rather than one output slot per point. Width sets the
+trunk width, Depth the number of residual blocks; the study's reference recipe was
+width 512, depth 4, batch 32, AdamW ~1e-3 with the cosine scheduler).
 
 For PVT-style datasets where the same design is re-simulated across corners, the optional
 design-level split (command line only, any model type) keeps every corner row of a design

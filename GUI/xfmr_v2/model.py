@@ -6,10 +6,14 @@ output curve in one shot:
 - :class:`SpectraHydra` shares an encoder and uses one linear head per channel.
 - :class:`SpectraHydraProj` adds a learned projection of PVT corner columns on
   top of :class:`SpectraHydra`.
+- :class:`SpectraTrunk` runs one weight-shared residual trunk per frequency
+  point (context MLP + Fourier frequency embedding) instead of a single
+  spectrum-sized output layer.
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 
 import torch
@@ -150,6 +154,110 @@ class SpectraHydra(nn.Module):
         latent = self.encoder(input_features)
         # Stack per-channel predictions into (batch, channels, frequency).
         return torch.stack([head(latent) for head in self.heads], dim=1)
+
+
+class SpectraTrunk(nn.Module):
+    """Frequency-trunk surrogate: one shared network evaluated at every frequency.
+
+    Architecture from the M:N transformer study's "knobs -> trunk" model. The
+    other models in this module emit the whole spectrum from one output layer;
+    here a context MLP compresses the input features into a frequency-flat
+    context vector, that context is broadcast into one row per frequency point,
+    each row appends a Fourier embedding of its frequency coordinate, and a
+    single weight-shared trunk of pre-LayerNorm residual blocks maps every row
+    to that frequency's channel values::
+
+        ctx    = GELU(Linear(GELU(Linear(features -> 256)) -> 256))
+        row(f) = [ ctx | fn, sin(pi k fn), cos(pi k fn) for k=1..16 ]
+        h      = Linear(row -> width)
+        h      = h + Linear(Dropout(GELU(Linear(LayerNorm(h)))))   # x depth
+        out(f) = Linear(LayerNorm(h) -> channels)
+
+    The trunk cannot memorize one output slot per frequency point — its outputs
+    are forced to be a function of the Fourier embedding — which is the study's
+    measured advantage over spectrum-sized heads on knob-style tabular inputs.
+
+    ``fn`` is the frequency INDEX normalized to [0, 1] (a persistent buffer),
+    not the physical GHz value: every instance built with the same
+    ``num_frequencies`` is byte-identical in architecture AND buffers, which the
+    self-transfer band warm start relies on (band submodels strictly load each
+    other's state dicts and never see the physical grid). On a uniform grid the
+    two normalizations are affinely equivalent; on a log-spaced grid the index
+    form keeps the embedding uniformly sampled.
+
+    Unlike the sibling models, weight shapes do not depend on
+    ``num_frequencies`` — only the Fourier buffer does.
+    """
+
+    # Fixed sub-architecture (not exposed through TrainConfig): checkpoints and
+    # ONNX export rebuild the model from (model_type, width, depth) alone, so
+    # anything else that changes shapes must be a constant.
+    CONTEXT_DIM = 256
+    NUM_HARMONICS = 16
+    DROPOUT = 0.05
+
+    def __init__(
+        self,
+        input_feature_dim: int,
+        ground_truth_channels: int,
+        num_frequencies: int,
+        width: int = 512,
+        depth: int = 4,
+    ) -> None:
+        super().__init__()
+        if num_frequencies < 1:
+            raise ValueError("num_frequencies must be a positive integer.")
+        if depth < 1:
+            raise ValueError("depth must be at least 1 (number of residual blocks).")
+        self.ground_truth_channels = ground_truth_channels
+        self.num_frequencies = num_frequencies
+
+        self.context = nn.Sequential(
+            nn.Linear(input_feature_dim, self.CONTEXT_DIM),
+            nn.GELU(),
+            nn.Linear(self.CONTEXT_DIM, self.CONTEXT_DIM),
+            nn.GELU(),
+        )
+        fourier_dim = 1 + 2 * self.NUM_HARMONICS
+        self.entry = nn.Linear(self.CONTEXT_DIM + fourier_dim, width)
+        self.blocks = nn.ModuleList(
+            nn.Sequential(
+                nn.LayerNorm(width),
+                nn.Linear(width, width),
+                nn.GELU(),
+                nn.Dropout(self.DROPOUT),
+                nn.Linear(width, width),
+            )
+            for _ in range(depth)
+        )
+        self.head_norm = nn.LayerNorm(width)
+        self.head = nn.Linear(width, ground_truth_channels)
+
+        # One frequency point degenerates to fn = 0 rather than a 0/0 division.
+        if num_frequencies == 1:
+            coords = torch.zeros(1)
+        else:
+            coords = torch.linspace(0.0, 1.0, num_frequencies)
+        harmonics = torch.arange(1, self.NUM_HARMONICS + 1, dtype=coords.dtype)
+        angles = math.pi * coords[:, None] * harmonics[None, :]
+        fourier = torch.cat([coords[:, None], torch.sin(angles), torch.cos(angles)], dim=1)
+        self.register_buffer("fourier_features", fourier)  # (num_frequencies, 33)
+
+    def forward(self, input_features: torch.Tensor) -> torch.Tensor:
+        context = self.context(input_features)  # (batch, CONTEXT_DIM)
+        batch = context.shape[0]
+        rows = torch.cat(
+            [
+                context.unsqueeze(1).expand(-1, self.num_frequencies, -1),
+                self.fourier_features.unsqueeze(0).expand(batch, -1, -1),
+            ],
+            dim=-1,
+        )  # (batch, frequency, CONTEXT_DIM + 33)
+        hidden = self.entry(rows)
+        for block in self.blocks:
+            hidden = hidden + block(hidden)
+        out = self.head(self.head_norm(hidden))  # (batch, frequency, channels)
+        return out.transpose(1, 2)  # (batch, channels, frequency)
 
 
 class SpectraHydraProj(SpectraHydra):

@@ -609,6 +609,18 @@ class MlpTrainingStudio(QMainWindow):
         self.baseline_model_type_combo_box = _NoScrollComboBox()
         self.baseline_model_type_combo_box.addItems(list(MODEL_TYPES))
         self.baseline_model_type_combo_box.setCurrentText("SpectraNet")
+        self.baseline_model_type_combo_box.setToolTip(
+            "SpectraNet: one dense network from inputs to the whole spectrum.\n"
+            "SpectraHydra: shared encoder with one output head per channel.\n"
+            "SpectraHydraProj: SpectraHydra plus a learned projection of the "
+            "checked PVT Corner Columns.\n"
+            "SpectraTrunk: one weight-shared residual trunk evaluated per "
+            "frequency point (context MLP + Fourier frequency embedding), so "
+            "outputs are forced to be smooth functions of frequency instead of "
+            "independent output slots. Width is the trunk width and Depth the "
+            "number of residual blocks; its reference recipe used width 512, "
+            "depth 4, batch 32, AdamW around 1e-3 with the cosine scheduler."
+        )
         self.baseline_model_type_combo_box.currentTextChanged.connect(
             self._refresh_projection_controls_enabled
         )

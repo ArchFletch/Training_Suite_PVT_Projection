@@ -37,7 +37,7 @@ from .data import (
     resolve_split_fractions,
     split_indices,
 )
-from .model import SpectraHydra, SpectraHydraProj, SpectraNet
+from .model import SpectraHydra, SpectraHydraProj, SpectraNet, SpectraTrunk
 from .progress import ProgressCallback, RunCancelled, StopChecker, emit_progress, request_stop
 
 
@@ -82,7 +82,7 @@ class TrainConfig:
     split_design_columns: list[str] | None = None
 
     # Model architecture settings.
-    model_type: str = "SpectraNet"  # "SpectraNet", "SpectraHydra", or "SpectraHydraProj"
+    model_type: str = "SpectraNet"  # one of MODEL_TYPES
     width: int = 512
     depth: int = 5
     # SpectraHydraProj only: names of the PVT corner/condition feature columns
@@ -153,7 +153,7 @@ class TransferConfig:
     device: str | None = None
 
 
-MODEL_TYPES = ("SpectraNet", "SpectraHydra", "SpectraHydraProj")
+MODEL_TYPES = ("SpectraNet", "SpectraHydra", "SpectraHydraProj", "SpectraTrunk")
 
 # Back-compat: runs saved under the old model-type names still load. Map the legacy
 # string to its current equivalent so old checkpoints, configs, and saved GUI forms
@@ -234,6 +234,8 @@ def build_model(model_type: str, *, num_frequencies: int, **kwargs: Any) -> nn.M
         return SpectraHydra(num_frequencies=num_frequencies, **kwargs)
     if model_type == "SpectraHydraProj":
         return SpectraHydraProj(num_frequencies=num_frequencies, **kwargs)
+    if model_type == "SpectraTrunk":
+        return SpectraTrunk(num_frequencies=num_frequencies, **kwargs)
     raise ValueError(f"Unknown model_type {model_type!r}. Choose from {MODEL_TYPES}.")
 
 

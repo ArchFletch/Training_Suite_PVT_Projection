@@ -440,6 +440,13 @@ def test_projection_controls_gate_on_model_type(gui_window) -> None:
     combo.setCurrentText("SpectraHydra")
     assert not gui_window.baseline_projection_columns_list.isEnabled()
 
+    # SpectraTrunk is selectable and, like the non-projection models, keeps the
+    # corner-projection controls locked.
+    assert combo.findText("SpectraTrunk") >= 0
+    combo.setCurrentText("SpectraTrunk")
+    assert not gui_window.baseline_projection_columns_list.isEnabled()
+    assert not gui_window.baseline_projection_dim_spin_box.isEnabled()
+
 
 def test_projection_columns_flow_from_scan_into_configs(
     gui_window, synthetic_dataset, tmp_path
