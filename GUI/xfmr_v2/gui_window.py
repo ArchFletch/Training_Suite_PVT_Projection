@@ -1464,6 +1464,7 @@ class MlpTrainingStudio(QMainWindow):
             self.dataset_schema_status_badge.set_status("Not Scanned")
             self.run_state_badge.set_status("Stopped")
             self.append_log("Dataset scan stopped before completion.")
+            self._refresh_run_button_availability()
             return
         self.last_scan_result = result
         self._sweep_label = result.get("sweep_label", "Frequency (GHz)")
@@ -1480,6 +1481,7 @@ class MlpTrainingStudio(QMainWindow):
         self._refresh_transfer_note_text()
         self.run_progress_bar.setValue(100)
         self.run_state_badge.set_status("Completed")
+        self._refresh_run_button_availability()
 
     def _on_suggest_completed(self, result: dict[str, Any]) -> None:
         if result.get("status") == "stopped":
@@ -2246,10 +2248,33 @@ class MlpTrainingStudio(QMainWindow):
     def _update_start_button_text(self) -> None:
         return
 
+    def _start_blocked_reason(self) -> str | None:
+        """Why the start buttons are disabled, or None when they are enabled.
+
+        This covers only the two conditions that DISABLE the buttons. The
+        remaining prerequisites (a dataset file, a completed scan, valid split
+        fractions, corner columns) are checked when the button is clicked and
+        already explain themselves in a dialog.
+
+        A disabled button never emits clicked, so those dialogs are unreachable
+        and the user is left with a dead control and no stated reason. This text
+        becomes the tooltip, which Qt still shows on a disabled widget.
+        """
+        if self._controls_locked:
+            running = self.current_task_name if self.current_task_name != "idle" else "background"
+            return f"A {running} task is running. Wait for it to finish, or press Stop."
+        if not self._license_allows_new_runs():
+            return self._license_display_message()
+        return None
+
     def _refresh_run_button_availability(self) -> None:
-        start_enabled = (not self._controls_locked) and self._license_allows_new_runs()
-        self.start_baseline_button.setEnabled(start_enabled)
-        self.start_transfer_button.setEnabled(start_enabled)
+        blocked_reason = self._start_blocked_reason()
+        start_enabled = blocked_reason is None
+        for button in (self.start_baseline_button, self.start_transfer_button):
+            button.setEnabled(start_enabled)
+            # Qt shows a tooltip on a disabled widget, which is the only channel
+            # left for telling the user what to fix.
+            button.setToolTip("" if start_enabled else blocked_reason)
 
     def _set_action_controls_enabled(self, enabled: bool) -> None:
         widgets = [
@@ -2609,8 +2634,13 @@ class MlpTrainingStudio(QMainWindow):
                 stem = path.parent.name or stem
             self.run_name_edit.setText(stem.replace(" ", "_").lower())
             self.dataset_schema_status_badge.set_status("Not Scanned")
+        # A scan describes one dataset. Keeping the previous result would let a
+        # run start against a dataset the badge says was never scanned, and would
+        # validate corner columns against the old dataset's column names.
+        self.last_scan_result = None
         self._sync_auto_cache_path()
         self._update_topbar_run_name()
+        self._refresh_run_button_availability()
 
     def _note_removed_data_source_fields(self, data_sources: dict[str, Any]) -> None:
         """Report saved values for fields this GUI no longer has.

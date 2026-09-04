@@ -821,3 +821,105 @@ def test_applying_a_corner_projection_suggestion_fills_the_picker(gui_window, tm
     assert gui_window._selected_projection_columns() == ["Temp_C", "VDD"]
     assert gui_window.baseline_projection_columns_list.isEnabled()
     assert gui_window._validate_projection_settings()
+
+
+def _revoke_test_seat(window) -> None:
+    """Put the window in the unlicensed state a fresh install starts in.
+
+    Set explicitly rather than assumed: a lease cached by the licensing tests can
+    survive into this fixture, which would silently make the assertions vacuous.
+    """
+    from dataclasses import replace
+
+    window.license_server_url_edit.setText("")
+    window.license_lease_state = replace(
+        window.license_lease_state,
+        phase="unconfigured",
+        badge_text="Unconfigured",
+        server_url="",
+        lease_id=None,
+    )
+    window._refresh_run_button_availability()
+
+
+def test_a_disabled_start_button_says_why_it_is_disabled(gui_window) -> None:
+    """The dead-end this closes: licensing fails closed, so out of the box the
+    start buttons are disabled. A disabled button never emits clicked, so the
+    explanatory dialog inside start_baseline_training is unreachable and the
+    user is left with a greyed control and nothing telling them what to fix."""
+    _revoke_test_seat(gui_window)
+    assert not gui_window.start_baseline_button.isEnabled()
+
+    expected = gui_window._start_blocked_reason()
+    assert expected == gui_window._license_display_message()
+    for button in (gui_window.start_baseline_button, gui_window.start_transfer_button):
+        reason = button.toolTip()
+        assert reason, "a disabled start button must carry its reason as a tooltip"
+        assert reason == expected
+        assert "Acquire Seat" in reason
+
+
+def test_the_start_button_tooltip_clears_once_a_seat_is_held(gui_window) -> None:
+    _grant_test_seat(gui_window)
+    gui_window._refresh_run_button_availability()
+
+    assert gui_window.start_baseline_button.isEnabled()
+    assert gui_window.start_baseline_button.toolTip() == ""
+    assert gui_window._start_blocked_reason() is None
+
+
+def test_a_running_task_is_named_in_the_start_button_tooltip(gui_window) -> None:
+    _grant_test_seat(gui_window)
+    gui_window.current_task_name = "training"
+    gui_window._set_action_controls_enabled(False)
+
+    assert not gui_window.start_baseline_button.isEnabled()
+    assert "training task is running" in gui_window.start_baseline_button.toolTip()
+
+    gui_window._set_action_controls_enabled(True)
+    assert gui_window.start_baseline_button.isEnabled()
+    assert gui_window.start_baseline_button.toolTip() == ""
+
+
+def test_changing_the_dataset_file_invalidates_the_previous_scan(gui_window, tmp_path) -> None:
+    """A scan describes one dataset.
+
+    The badge already reset to Not Scanned, but last_scan_result stayed, so a
+    run could start against a dataset that was never scanned and corner columns
+    would validate against the previous dataset's column names.
+    """
+    first = tmp_path / "first.npz"
+    second = tmp_path / "second.npz"
+    for path in (first, second):
+        path.write_bytes(b"")
+
+    gui_window.dataset_file_edit.setText(str(first))
+    gui_window.last_scan_result = {
+        "active_input_feature_names": ["Temp_C", "VDD"],
+        "dropped_input_feature_names": [],
+        "frequency_count": 8,
+    }
+    gui_window.dataset_schema_status_badge.set_status("Valid")
+
+    gui_window.dataset_file_edit.setText(str(second))
+
+    assert gui_window.last_scan_result is None
+    assert gui_window.dataset_schema_status_badge.text() == "Not Scanned"
+
+
+def test_starting_without_a_scan_explains_itself_instead_of_running(gui_window, tmp_path) -> None:
+    """The click-time prerequisites stay dialogs, so they are not silent."""
+    dataset = tmp_path / "d.npz"
+    dataset.write_bytes(b"")
+    gui_window.dataset_file_edit.setText(str(dataset))
+    gui_window.model_output_folder_path_edit.setText(str(tmp_path / "out"))
+    gui_window.run_name_edit.setText("r")
+    _grant_test_seat(gui_window)
+    gui_window._refresh_run_button_availability()
+    assert gui_window.start_baseline_button.isEnabled()
+
+    started = []
+    gui_window._start_task = lambda *a, **k: started.append(True)
+    gui_window.start_baseline_training()
+
+    assert not started, "training must not start before the dataset is scanned"

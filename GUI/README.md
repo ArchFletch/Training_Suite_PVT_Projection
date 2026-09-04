@@ -174,6 +174,14 @@ python launch_gui.py
 
 The GUI can scan datasets, generate recommended settings, run baseline training, run self-transfer learning, and manage seat checkout against an on-prem license server. Quick search is currently not exposed in the GUI.
 
+Start Baseline Training and Start Self-Transfer Learning are disabled while a task is
+running and whenever no license seat is checked out. A disabled button carries the
+reason as its tooltip, because a disabled button cannot be clicked and so cannot raise
+the dialog that would otherwise explain itself. The remaining prerequisites (a dataset
+file, a completed scan, valid split fractions, corner columns for the projection model)
+are checked on click and reported in a dialog. Changing the Dataset File clears the
+previous scan, so a run cannot start against a dataset that was never scanned.
+
 The Baseline tab shows only the settings the selected model actually reads. The PVT
 Corner Columns and Corner Projection Width rows appear for `SpectraHydraProj` and are
 hidden for every other model, rather than being shown greyed out. Which model types
