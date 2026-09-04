@@ -58,6 +58,7 @@ from .gui_backend import (
 from .gui_theme import APP_THEME, apply_application_theme, configure_plot_widget, plot_color_cycle, status_colors
 from .gui_workers import QtTaskExecutor
 from .licensing import (
+    LICENSE_REQUIRED_MESSAGE,
     LicenseClientError,
     LicenseLeaseController,
     LicenseLeaseState,
@@ -216,7 +217,7 @@ class MlpTrainingStudio(QMainWindow):
         super().__init__()
         self.executor = executor or QtTaskExecutor()
         self.current_task = None
-        self.license_connection_message = "Enter a license server URL to enable floating-seat checkout."
+        self.license_connection_message = LICENSE_REQUIRED_MESSAGE
         self.license_server_status: LicenseStatus | None = None
         self.license_state_bridge = _LicenseStateBridge(self)
         self.license_controller = LicenseLeaseController(state_callback=self.license_state_bridge.state_changed.emit)
@@ -976,7 +977,7 @@ class MlpTrainingStudio(QMainWindow):
             self.license_server_status = None
 
         if not server_url:
-            self.license_connection_message = "Enter a license server URL to enable floating-seat checkout."
+            self.license_connection_message = LICENSE_REQUIRED_MESSAGE
             self.license_controller.clear_configuration()
             self._refresh_license_display()
             return
@@ -1071,7 +1072,7 @@ class MlpTrainingStudio(QMainWindow):
         active_url = normalize_server_url(self.license_lease_state.server_url)
         if not configured_url:
             self.license_server_status_badge.set_status("Unconfigured")
-            self.license_connection_message = "Enter a license server URL to enable floating-seat checkout."
+            self.license_connection_message = LICENSE_REQUIRED_MESSAGE
         elif configured_url != active_url:
             self.license_server_status_badge.set_status("Not Checked")
             self.license_connection_message = "Click Test Connection or Acquire Seat to use this server."
@@ -1097,10 +1098,14 @@ class MlpTrainingStudio(QMainWindow):
         return self.license_connection_message
 
     def _license_allows_new_runs(self) -> bool:
+        # Fail closed. There is no "no server configured, so anything goes" branch:
+        # that made an untouched License Server field equivalent to an unlimited
+        # licence. A run requires a seat checked out from the server currently
+        # named in the field.
         configured_url = normalize_server_url(self.license_server_url_edit.text())
         active_url = normalize_server_url(self.license_lease_state.server_url)
-        if not configured_url and not active_url:
-            return True
+        if not configured_url or not active_url:
+            return False
         if configured_url != active_url:
             return False
         return self.license_lease_state.can_start_runs
@@ -1353,7 +1358,7 @@ class MlpTrainingStudio(QMainWindow):
         server_url = normalize_server_url(self.license_server_url_edit.text())
         if not server_url:
             self.license_server_status = None
-            self.license_connection_message = "Enter a license server URL to enable floating-seat checkout."
+            self.license_connection_message = LICENSE_REQUIRED_MESSAGE
             self.license_controller.clear_configuration()
             self._refresh_license_display()
             return
