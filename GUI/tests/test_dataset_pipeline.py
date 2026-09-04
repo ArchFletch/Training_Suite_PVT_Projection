@@ -104,6 +104,48 @@ def test_build_cache_from_dataset_autodetect_touchstone(synthetic_dataset: dict[
     assert summary["num_frequencies"] == 3  # 4 points minus the dropped first
 
 
+def test_headerless_logtxt_picks_the_id_column_that_matches_the_files(
+    synthetic_dataset: dict[str, Path], tmp_path: Path
+) -> None:
+    """A log.txt with no header must not assume its last column is the sample id.
+
+    These datasets end with a low-cardinality tile id sitting to the right of the
+    real per-sample index. Binding to it loads the same handful of Touchstone
+    files over and over, so the cache builds and trains but its targets are
+    near-constant.
+    """
+    import shutil
+
+    root = tmp_path / "headerless_touchstone"
+    sp_dir = root / "SPData"
+    sp_dir.mkdir(parents=True)
+    for f in sorted(synthetic_dataset["output_dir"].glob("*.s2p")):
+        shutil.copy(f, sp_dir / f.name)
+
+    # No "# [...]" header, and a trailing tid taking only 3 distinct values.
+    rows = []
+    for sample_id in range(1, 11):
+        x = float(sample_id)
+        y = float((sample_id % 4) - 1.5)
+        rows.append(str([x, y, 7.0, sample_id, sample_id % 3]))
+    (root / "log.txt").write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    cache_path = tmp_path / "headerless.npz"
+    summary = data.build_cache_from_dataset(str(root), str(cache_path))
+
+    assert summary["num_samples"] == 10
+    # x0, x1, x2 and the trailing x4; only the chosen id column is dropped.
+    assert summary["num_features"] == 4
+
+    with np.load(cache_path) as cached:
+        targets = cached["targets"]
+    distinct = np.unique(targets.reshape(targets.shape[0], -1), axis=0).shape[0]
+    assert distinct == 10, (
+        f"only {distinct} distinct spectra for 10 rows -- the id column bound to "
+        "the tile id instead of the per-sample index"
+    )
+
+
 def test_build_cache_from_dataset_autodetect_cadence(tmp_path: Path) -> None:
     """Cadence CSVs are auto-detected and channels sharing an axis are combined."""
 

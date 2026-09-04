@@ -73,7 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model-type",
         default=None,
-        help="SpectraNet, SpectraHydra, or SpectraHydraProj (legacy FlatMLP / CTLE_MLP also accepted).",
+        help="SpectraNet, SpectraHydra, SpectraHydraProj, or SpectraTrunk (legacy FlatMLP / CTLE_MLP also accepted).",
     )
     parser.add_argument("--width", type=int, default=None)
     parser.add_argument("--depth", type=int, default=None)

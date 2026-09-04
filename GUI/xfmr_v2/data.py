@@ -559,19 +559,54 @@ def _read_logtxt_columns(log_txt: Path) -> list[str]:
     return [f"x{i}" for i in range(width)]
 
 
+def _pick_sample_id_column(columns: list[str], log_txt: Path, sp_dir: Path, extension: str) -> str:
+    """Choose the log.txt column that names each sample's per-sample file.
+
+    A column literally called ``index`` is authoritative.  Without one -- a
+    log.txt with no ``# [col, col, ...]`` header only gets generic ``x0..xN``
+    names -- the column is chosen by evidence: its values must be whole numbers,
+    unique per row, and every one of them must name a file that exists.  Taking
+    the rightmost column on faith instead pairs thousands of feature rows with a
+    handful of files whenever that column is a batch or tile id, which builds a
+    cache whose targets are silently near-constant.
+    """
+    if "index" in columns:
+        return "index"
+    try:
+        rows = _load_input_feature_rows(log_txt, None, expected_width=len(columns))
+        stems = {p.stem for p in sp_dir.iterdir() if p.suffix.lower() == extension}
+    except (OSError, ValueError, SyntaxError):
+        return columns[-1]
+    if not rows or not stems:
+        return columns[-1]
+    # Right to left, so the historical "last column" still wins a genuine tie.
+    for position in range(len(columns) - 1, -1, -1):
+        values = [row[position] for row in rows]
+        try:
+            if any(float(v) != int(float(v)) for v in values):
+                continue
+            ids = [str(int(float(v))) for v in values]
+        except (TypeError, ValueError):
+            continue
+        if len(set(ids)) != len(ids):
+            continue
+        if all(i in stems for i in ids):
+            return columns[position]
+    return columns[-1]
+
+
 def _build_touchstone_auto(
     root: Path, log_txt: Path, sp_dir: Path, max_samples: int | None, emit, should_stop=None
 ) -> dict[str, Any]:
     """Auto-detect a per-sample Touchstone dataset (log.txt + .sNp files)."""
     columns = _read_logtxt_columns(log_txt)
-    sample_id = "index" if "index" in columns else columns[-1]
-    id_like = {"index", "tid", "id", "batch", "sample_id", sample_id}
-    feature_columns = [c for c in columns if c not in id_like]
-
     ext = next(
         (f.suffix.lower() for f in sorted(sp_dir.iterdir()) if re.fullmatch(r"\.s\d+p", f.suffix.lower())),
         ".s2p",
     )
+    sample_id = _pick_sample_id_column(columns, log_txt, sp_dir, ext)
+    id_like = {"index", "tid", "id", "batch", "sample_id", sample_id}
+    feature_columns = [c for c in columns if c not in id_like]
     nports = int(re.fullmatch(r"\.s(\d+)p", ext).group(1))
     # Upper-triangular unique S-parameters (S is symmetric for reciprocal networks).
     sparams = [f"S{i}{j}" for i in range(1, nports + 1) for j in range(i, nports + 1)]

@@ -116,7 +116,7 @@ def _reference(ref: dict, x: np.ndarray) -> np.ndarray:
     return y.reshape(x.shape[0], ref["channels"] * ref["freqs"])
 
 
-@pytest.mark.parametrize("model_type", ["SpectraHydra", "SpectraNet", "SpectraHydraProj"])
+@pytest.mark.parametrize("model_type", ["SpectraHydra", "SpectraNet", "SpectraHydraProj", "SpectraTrunk"])
 def test_export_matches_torch_pipeline(tmp_path: Path, model_type: str) -> None:
     ckpt, ref = _make_checkpoint(tmp_path / model_type, model_type=model_type, with_cache=True)
     out = export_checkpoint_to_onnx(ckpt)
@@ -245,8 +245,9 @@ def _make_transfer_run(tmp_path: Path, *, freqs: int = 9, num_bands: int = 3, ch
                   "model_type": model_type}
 
 
-def test_transfer_export_matches_stitched_torch(tmp_path: Path) -> None:
-    trun, info = _make_transfer_run(tmp_path, freqs=9, num_bands=3)
+@pytest.mark.parametrize("model_type", ["SpectraHydra", "SpectraTrunk"])
+def test_transfer_export_matches_stitched_torch(tmp_path: Path, model_type: str) -> None:
+    trun, info = _make_transfer_run(tmp_path, freqs=9, num_bands=3, model_type=model_type)
     out = export_transfer_to_onnx(trun)
 
     meta = json.loads(out.with_suffix(".meta.json").read_text())
@@ -262,7 +263,7 @@ def test_transfer_export_matches_stitched_torch(tmp_path: Path) -> None:
     C, F = info["channels"], info["freqs"]
     stitched = np.zeros((len(x), C, F), dtype=np.float32)
     for state, band in zip(info["states"], info["bands"]):
-        m = build_model("SpectraHydra", num_frequencies=int(len(band)), **info["model_kwargs"])
+        m = build_model(info["model_type"], num_frequencies=int(len(band)), **info["model_kwargs"])
         m.load_state_dict(state)
         m.eval()
         with torch.no_grad():
