@@ -10,7 +10,7 @@ import pytest
 import numpy as np
 import torch
 
-from xfmr_v2 import data, gui_backend
+from xfmr_v2 import atomic_json, data, gui_backend
 
 
 def test_scan_dataset_returns_preview_rows(synthetic_dataset: dict[str, Path]) -> None:
@@ -198,3 +198,60 @@ def test_scan_dataset_falls_back_to_row_level_on_bad_corner_columns(tmp_path: Pa
     assert rows["Training Samples"] == "57"
     assert rows["Split Mode"].startswith("Row-level (requested design-level split unavailable")
     assert "Temp_K" in rows["Split Mode"]
+
+
+def test_save_gui_config_leaves_no_temp_file_behind(tmp_path: Path) -> None:
+    target = tmp_path / "gui" / "last_session.json"
+
+    gui_backend.save_gui_config(target, {"device": "cpu"})
+
+    assert json.loads(target.read_text(encoding="utf-8")) == {"device": "cpu"}
+    assert [p.name for p in target.parent.iterdir()] == ["last_session.json"]
+
+
+def test_a_failed_save_keeps_the_previous_session_file_intact(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The save used to truncate the target before writing, so a crash or a
+    full disk part-way through left a JSON fragment -- and the GUI would not
+    start again until someone deleted it. The old file must survive a failed
+    write untouched, with no fragment left beside it."""
+    target = tmp_path / "gui" / "last_session.json"
+    gui_backend.save_gui_config(target, {"device": "cpu", "run": 1})
+    before = target.read_text(encoding="utf-8")
+
+    def out_of_space(_fd: int) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(atomic_json.os, "fsync", out_of_space)
+    with pytest.raises(OSError):
+        gui_backend.save_gui_config(target, {"device": "cuda:0", "run": 2})
+
+    assert target.read_text(encoding="utf-8") == before
+    assert json.loads(before)["run"] == 1
+    assert [p.name for p in target.parent.iterdir()] == ["last_session.json"]
+
+
+def test_a_failure_at_the_final_rename_still_cleans_up_and_keeps_the_old_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The write completed but the swap did not (a locked target on Windows, a
+    permission change in between): no temp may be left beside the old file."""
+    target = tmp_path / "gui" / "last_session.json"
+    gui_backend.save_gui_config(target, {"run": 1})
+
+    def cannot_swap(_src: str, _dst: str) -> None:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(atomic_json.os, "replace", cannot_swap)
+    with pytest.raises(PermissionError):
+        gui_backend.save_gui_config(target, {"run": 2})
+
+    assert json.loads(target.read_text(encoding="utf-8")) == {"run": 1}
+    assert [p.name for p in target.parent.iterdir()] == ["last_session.json"]
+
+
+def test_an_unserializable_payload_touches_nothing_on_disk(tmp_path: Path) -> None:
+    target = tmp_path / "gui" / "last_session.json"
+
+    with pytest.raises(TypeError):
+        gui_backend.save_gui_config(target, {"bad": object()})
+
+    assert not target.parent.exists()
+

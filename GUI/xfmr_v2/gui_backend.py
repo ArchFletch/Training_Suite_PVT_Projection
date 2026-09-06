@@ -23,6 +23,7 @@ import numpy as np
 import torch
 
 from .app_paths import current_runtime_paths
+from .atomic_json import write_json_atomically
 from .data import build_cache_from_dataset, load_existing_cache, load_split_bundle
 from .export_onnx import export_checkpoint_to_onnx
 from .runner import TrainConfig, TransferConfig, run_self_transfer, train_baseline
@@ -338,11 +339,9 @@ def export_model_to_onnx(
 
 
 def save_gui_config(path: str | Path, payload: dict[str, Any]) -> None:
-    """Save one GUI config payload as JSON."""
+    """Save one GUI config payload as JSON, atomically (see atomic_json)."""
 
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    write_json_atomically(path, payload)
 
 
 def load_gui_config(path: str | Path) -> dict[str, Any]:
