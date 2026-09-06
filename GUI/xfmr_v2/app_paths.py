@@ -47,7 +47,9 @@ def current_runtime_paths(
 
     `MLP_APP_PATH_MODE=packaged` is intentionally supported so packaging smoke
     tests and documentation helpers can exercise the packaged path policy
-    without needing a frozen executable.
+    without needing a frozen executable. The override only works in that
+    direction: a frozen or compiled build is always packaged, whatever the
+    variable says.
     """
 
     active_platform = platform or sys.platform
@@ -58,11 +60,18 @@ def current_runtime_paths(
 
 
 def _is_packaged_runtime(*, env: Mapping[str, str]) -> bool:
-    mode_override = str(env.get(_PATH_MODE_ENV, "")).strip().lower()
-    if mode_override == "packaged":
+    # A frozen build is packaged, full stop. `MLP_APP_PATH_MODE=source` used to
+    # be honoured here ahead of the freeze markers, so two environment variables
+    # a customer could set talked a shipped build into source mode -- which is
+    # exactly the mode the development licence bypass (gui_window.dev_unlicensed_mode)
+    # keys off, and which also points every writable path back into the install
+    # directory. The override now only promotes a source checkout to packaged.
+    if _is_frozen_build():
         return True
-    if mode_override == "source":
-        return False
+    return str(env.get(_PATH_MODE_ENV, "")).strip().lower() == "packaged"
+
+
+def _is_frozen_build() -> bool:
     # `sys.frozen` alone is not enough: PyInstaller and cx_Freeze set it, but
     # Nuitka -- the freezer this project actually ships with -- does not. It marks
     # every compiled module with `__compiled__` instead. Relying on sys.frozen
