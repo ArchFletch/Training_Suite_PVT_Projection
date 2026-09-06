@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pyqtgraph as pg
-from PySide6.QtCore import QObject, QThread, Qt, QUrl, Signal, Slot
+from PySide6.QtCore import QObject, QThread, QTimer, Qt, QUrl, Signal, Slot
 from PySide6.QtGui import QCloseEvent, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -44,6 +44,28 @@ from PySide6.QtWidgets import (
 )
 
 from .app_paths import current_runtime_paths
+from .atomic_json import write_json_atomically
+from .licensing.client_config import (
+    license_client_config_path,
+    load_license_client_config,
+    save_license_client_config,
+)
+
+# The validation fold selects the best checkpoint, so it can never be empty. The
+# engine used to clamp a 0 fraction to one arbitrary row and then report that
+# single-row loss as "Best val".
+MIN_VALIDATION_FRACTION = 0.01
+
+# Human names for the task ids in _start_task, for the disabled-button tooltip.
+_TASK_DISPLAY_NAMES = {
+    "scan": "dataset scan",
+    "suggest": "settings suggestion",
+    "search": "quick search",
+    "training": "training run",
+    "license_test": "license connection test",
+    "license_checkout": "license checkout",
+    "export": "ONNX export",
+}
 
 # Development-only escape from the licence gate. Set MLP_DEV_UNLICENSED=1 to run
 # the GUI from a source checkout without a licence server.
@@ -233,6 +255,9 @@ class MlpTrainingStudio(QMainWindow):
         self.selected_search_full_config: dict[str, Any] | None = None
         self.search_row_configs: list[dict[str, Any]] = []
         self.current_task_name = "idle"
+        # Set when the user closes the window while a task is running: the close
+        # is finished from _handle_task_finished once the worker has unwound.
+        self._close_after_task = False
         # Display-only: the cache path the engine last used. Always derived from
         # the output folder and run name, never chosen by the user.
         self._cache_path_value = ""
@@ -643,7 +668,14 @@ class MlpTrainingStudio(QMainWindow):
             "when you judge the model by other means — on one measured dataset it was "
             "about 19% better."
         )
-        self.baseline_validation_fraction_spin_box = self._make_float_spin(0.0, 0.90, 0.10, decimals=3, step=0.01)
+        self.baseline_validation_fraction_spin_box = self._make_float_spin(
+            MIN_VALIDATION_FRACTION, 0.90, 0.10, decimals=3, step=0.01
+        )
+        self.baseline_validation_fraction_spin_box.setToolTip(
+            "Fraction of the dataset held out to choose the best epoch. It cannot be "
+            "0: the engine would then score every epoch on a single arbitrary row and "
+            "report that one-row loss as \"Best val\"."
+        )
         self.baseline_seed_spin_box = self._make_int_spin(0, 1000000, 42)
         self.restore_recommended_baseline_button = self._make_button("Restore Recommended", secondary=True)
         self.restore_recommended_baseline_button.clicked.connect(self._restore_recommended_baseline)
@@ -717,11 +749,28 @@ class MlpTrainingStudio(QMainWindow):
         runner emits them only when the dataset declares channel units, so datasets
         without units keep the single averaged card and nothing is created here.
         """
+        parsed: list[tuple[str, str]] = []
         for label in labels:
             name, _, value = str(label).partition(":")
             name, value = name.strip(), value.strip()
-            if not name or not value:
-                continue
+            if name and value:
+                parsed.append((name, value))
+        current = {name for name, _ in parsed}
+        stale = [name for name in self._channel_metric_cards if name not in current]
+        if current and stale:
+            # Cards from a previous dataset's channels were never removed, so the
+            # panel kept showing metrics for channels this run does not have.
+            for name in stale:
+                card = self._channel_metric_cards.pop(name)
+                self._channel_metric_grid.removeWidget(card)
+                card.setParent(None)
+                card.deleteLater()
+            for position, card in enumerate(self._channel_metric_cards.values()):
+                self._channel_metric_grid.removeWidget(card)
+                self._channel_metric_grid.addWidget(
+                    card, self._channel_metric_row + position // 3, position % 3
+                )
+        for name, value in parsed:
             card = self._channel_metric_cards.get(name)
             if card is None:
                 card = MetricCard(f"MAE {name}")
@@ -845,13 +894,61 @@ class MlpTrainingStudio(QMainWindow):
         self.append_log("Ready. Select the .npz dataset file and scan the data to begin.")
 
     def _load_last_session_if_available(self) -> None:
-        payload = load_last_session()
+        # Nothing in the saved session may stop the window from opening. The read
+        # used to sit outside this guard, so a truncated last_session.json (a save
+        # interrupted by a crash, kill or full disk) raised straight out of
+        # __init__ and the GUI never started again until the file was deleted by
+        # hand -- with no console in a packaged build to say why.
+        try:
+            payload = load_last_session()
+        except Exception as exc:
+            self.append_log(
+                f"Could not read the last GUI session ({exc}); starting with default "
+                f"settings. File: {current_runtime_paths().last_session_path}"
+            )
+            payload = None
+        seeded_url = self._license_client_config_url()
         if not payload:
+            if seeded_url:
+                self._apply_license_payload({"server_url": seeded_url})
             return
+        if seeded_url:
+            payload = dict(payload)
+            licensing = payload.get("licensing")
+            licensing = dict(licensing) if isinstance(licensing, dict) else {}
+            if normalize_server_url(str(licensing.get("server_url") or "")) != seeded_url:
+                # A remembered status belongs to whichever server the session knew.
+                licensing.pop("last_status", None)
+            licensing["server_url"] = seeded_url
+            payload["licensing"] = licensing
         try:
             self.apply_config_payload(payload)
         except Exception as exc:  # pragma: no cover - defensive startup path
             self.append_log(f"Could not restore the last GUI session: {exc}")
+
+    def _license_client_config_url(self) -> str:
+        """The server URL from the shared license_client.json, or "" when unset.
+
+        The install docs and the pre-seed helper have always described this file
+        as where an administrator configures the licence server, but the GUI only
+        ever read the URL back from its own session file, so a pre-seeded URL never
+        appeared. The config file wins over the session: it is the one IT edits,
+        and closeEvent rewrites it, so the two only differ after a deliberate re-seed.
+        """
+        try:
+            config = load_license_client_config()
+        except Exception as exc:
+            self.append_log(
+                f"Could not read the license client config ({exc}); ignoring it. "
+                f"File: {license_client_config_path()}"
+            )
+            return ""
+        if not isinstance(config, dict):
+            return ""
+        server_url = normalize_server_url(str(config.get("server_url") or ""))
+        if server_url:
+            self.append_log(f"License server URL taken from {license_client_config_path()}.")
+        return server_url
 
     def collect_config_payload(self) -> dict[str, Any]:
         return {
@@ -1028,7 +1125,13 @@ class MlpTrainingStudio(QMainWindow):
             return "Server URL changed. Click Acquire Seat to reconnect before starting another run."
         if self.license_lease_state.phase != "unconfigured":
             return self.license_lease_state.message
-        return self.license_connection_message
+        message = self.license_connection_message
+        if configured_url and self.license_server_status is not None and not dev_unlicensed_mode():
+            # After a successful Test Connection this text is also the reason the
+            # Start button is disabled, and a bare success message ("Connected to
+            # ACME. 0/5 seats in use.") does not say what is still missing.
+            message += " Click Acquire Seat to check out a seat before starting a run."
+        return message
 
     def _license_allows_new_runs(self) -> bool:
         if dev_unlicensed_mode():
@@ -1182,8 +1285,14 @@ class MlpTrainingStudio(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(self, "Export Summary", str(default_path), "JSON Files (*.json)")
         if not path:
             return
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        try:
+            write_json_atomically(path, payload)
+        except (OSError, TypeError, ValueError) as exc:
+            # A write failure used to raise out of the slot and vanish: no dialog,
+            # no log line, no file.
+            self.append_log(f"Could not export the GUI summary to {path}: {exc}")
+            self._show_warning(f"Could not write the summary file:\n{path}\n\n{exc}")
+            return
         self.append_log(f"Exported GUI summary to {path}")
 
     def export_baseline_to_onnx(self) -> None:
@@ -1216,6 +1325,17 @@ class MlpTrainingStudio(QMainWindow):
         self.append_log(f"Exported ONNX model to {onnx_path}")
         if meta_path:
             self.append_log(f"Wrote metadata sidecar to {meta_path}")
+            try:
+                source = json.loads(Path(meta_path).read_text(encoding="utf-8")).get("axis_metadata_source")
+            except (OSError, ValueError):
+                source = None
+            if source == "cache":
+                # Only a checkpoint from before the metadata was saved takes this path.
+                self.append_log(
+                    "Caution: this checkpoint predates saved axis metadata, so the channel "
+                    "transforms and frequency axis were read from the training cache. Check that "
+                    "the cache still describes this model, or re-train to embed the metadata."
+                )
 
     def run_license_connection_test(self) -> None:
         server_url = normalize_server_url(self.license_server_url_edit.text())
@@ -1308,6 +1428,12 @@ class MlpTrainingStudio(QMainWindow):
             # Don't leave the confidence badge frozen at "Checking".
             self.initial_suggestion_confidence_badge.set_status("Error")
             self.initial_suggestion_status_text.setText("Suggestion failed; see the log for details.")
+        elif self.current_task_name in {"license_test", "license_checkout"}:
+            # Same for the licence panel: it was left at "Checking" with a stale
+            # "Testing connectivity..." message while nothing was in flight.
+            self.license_server_status_badge.set_status("Error")
+            self.license_connection_message = f"License check failed: {message}"
+            self._refresh_license_display()
         self.append_log(f"Error: {message}")
         self._show_warning(f"{message}\n\n{traceback_text}")
 
@@ -1357,6 +1483,12 @@ class MlpTrainingStudio(QMainWindow):
         self.stop_training_button.setEnabled(False)
         if self.run_state_badge.text() in {"Training", "Searching", "Scanning", "Suggesting", "Checking", "Exporting"}:
             self.run_state_badge.set_status("Idle")
+        if self._close_after_task:
+            self._close_after_task = False
+            # `finished` is emitted from the worker thread just before it exits, so
+            # give the QThread one event-loop turn to fully stop before the window
+            # (and with it the application) goes away.
+            QTimer.singleShot(0, self.close)
 
     # ------------------------------------------------------------------
     # Progress and results
@@ -1993,8 +2125,12 @@ class MlpTrainingStudio(QMainWindow):
         becomes the tooltip, which Qt still shows on a disabled widget.
         """
         if self._controls_locked:
-            running = self.current_task_name if self.current_task_name != "idle" else "background"
-            return f"A {running} task is running. Wait for it to finish, or press Stop."
+            running = _TASK_DISPLAY_NAMES.get(
+                self.current_task_name, self.current_task_name.replace("_", " ") or "background"
+            )
+            if self.stop_training_button.isEnabled():
+                return f"A {running} is running. Wait for it to finish, or press Stop."
+            return f"A {running} is running. Wait for it to finish."
         if not self._license_allows_new_runs():
             return self._license_display_message()
         return None
@@ -2230,8 +2366,11 @@ class MlpTrainingStudio(QMainWindow):
         if not 0.0 < train_frac < 1.0:
             self._show_warning("Train fraction must be between 0 and 1.")
             return False
-        if not 0.0 <= val_frac < 1.0:
-            self._show_warning("Validation fraction must be between 0 and 1.")
+        if not MIN_VALIDATION_FRACTION <= val_frac < 1.0:
+            self._show_warning(
+                f"Validation fraction must be at least {MIN_VALIDATION_FRACTION:g} and below 1: "
+                "it selects the best checkpoint, so it cannot be empty."
+            )
             return False
         if train_frac + val_frac > 1.0:
             self._show_warning("Train fraction plus validation fraction cannot exceed 1.0.")
@@ -2239,9 +2378,13 @@ class MlpTrainingStudio(QMainWindow):
         return True
 
     def _preferred_output_path(self) -> str | None:
-        if self.last_workflow_summary:
-            if self.last_workflow_summary.get("baseline"):
-                return self.last_workflow_summary["baseline"]["run_dir"]
+        # A stopped run's partial summary has no run_dir; fall back to the output
+        # folder rather than raise KeyError out of the Open Output Folder slot,
+        # which left the button dead with no message.
+        baseline = (self.last_workflow_summary or {}).get("baseline")
+        run_dir = baseline.get("run_dir") if isinstance(baseline, dict) else None
+        if run_dir:
+            return str(run_dir)
         return self.model_output_folder_path_edit.text().strip() or None
 
     def _current_baseline_run_dir(self) -> str | None:
@@ -2287,10 +2430,27 @@ class MlpTrainingStudio(QMainWindow):
         if not model_output_dir:
             self._show_warning("Select the output folder first.")
             return None
-        if not self.run_name_edit.text().strip():
+        run_name = self.run_name_edit.text().strip()
+        if not run_name:
             self._show_warning("Provide a run name before starting.")
             return None
-        Path(model_output_dir).mkdir(parents=True, exist_ok=True)
+        if "/" in run_name or "\\" in run_name or run_name in {".", ".."}:
+            # The run name becomes a folder and a cache file under the output
+            # folder; a separator would let it escape that folder.
+            self._show_warning("The run name cannot contain path separators (/ or \\).")
+            return None
+        output_path = Path(model_output_dir)
+        if output_path.is_file():
+            self._show_warning(f"The output folder points at an existing file, not a folder:\n{model_output_dir}")
+            return None
+        try:
+            output_path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            # An unwritable or unmounted location raised out of the clicked slot;
+            # PySide6 swallowed it and Scan / Suggest / Start silently did nothing.
+            self._show_warning(f"Could not create the output folder:\n{model_output_dir}\n\n{exc}")
+            self.append_log(f"Could not create the output folder {model_output_dir}: {exc}")
+            return None
         return {
             "dataset_root": dataset_file,
             "input_feature_path": "",
@@ -2555,21 +2715,45 @@ class MlpTrainingStudio(QMainWindow):
         return f"{seconds}s"
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
+        if self.current_task is not None:
+            # Never block the GUI thread on a worker and never QThread.terminate()
+            # one. The old close path waited up to 10 s with the window frozen and
+            # then terminated the thread; a worker that had not reached a
+            # should_stop poll was killed while holding the GIL, which deadlocked
+            # the whole process. Ask the task to stop and finish the close from
+            # _handle_task_finished once it has actually unwound.
+            self._request_close_after_task()
+            event.ignore()
+            return
         try:
             save_last_session(self.collect_config_payload())
         except Exception:  # pragma: no cover - best effort on close
             pass
-        if self.current_task is not None and self.current_task.thread is not None and self.current_task.thread.isRunning():
-            self.current_task.stop()
-            self.current_task.thread.quit()
-            # Workers poll should_stop between batches/samples, so give them time
-            # to unwind. Destroying a QThread that is still running aborts the
-            # whole process, so fall back to terminate() as the lesser evil.
-            if not self.current_task.thread.wait(10000):
-                self.current_task.thread.terminate()
-                self.current_task.thread.wait(2000)
+        try:
+            server_url = normalize_server_url(self.license_server_url_edit.text())
+            if server_url or license_client_config_path().is_file():
+                save_license_client_config({"server_url": server_url})
+        except Exception:  # pragma: no cover - best effort on close
+            pass
+        # Threads retired by _force_clear_task_state have finished their Python
+        # work and are only quitting; wait for them so none is destroyed while
+        # still running, which aborts the process.
+        for thread in list(getattr(self, "_retiring_threads", [])):
+            thread.wait(5000)
         self.license_controller.shutdown()
         super().closeEvent(event)
+
+    def _request_close_after_task(self) -> None:
+        if self._close_after_task:
+            self.append_log("Still waiting for the current task to stop; the window will close when it has.")
+            return
+        self._close_after_task = True
+        self.current_task.stop()
+        self.run_state_badge.set_status("Stopping")
+        self.stop_training_button.setEnabled(False)
+        self.append_log(
+            "Close requested: stopping the current task. The window will close as soon as it has stopped."
+        )
 
 
 def create_application() -> tuple[QApplication, MlpTrainingStudio]:

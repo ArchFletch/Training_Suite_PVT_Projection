@@ -8,15 +8,23 @@ background threads cleanly.
 from __future__ import annotations
 
 from PySide6.QtCore import QCoreApplication, QTimer
+from PySide6.QtWidgets import QApplication
 
 from xfmr_v2.gui_workers import QtTaskExecutor
 
 
 def _app() -> QCoreApplication:
-    """Return one reusable Qt core application for the executor test."""
+    """Return one reusable Qt application for the executor test.
+
+    This must be a QApplication, not a bare QCoreApplication: the instance is a
+    process-wide singleton that is never torn down, and a QCoreApplication cannot
+    host widgets. Creating one here used to make every GUI test that ran later in
+    the same process abort with SIGABRT -- hidden only because this file sorted
+    after test_gui_window.py.
+    """
 
     app = QCoreApplication.instance()
-    return app if app is not None else QCoreApplication([])
+    return app if app is not None else QApplication([])
 
 
 def test_qt_task_executor_stops_thread_after_completion() -> None:
@@ -42,7 +50,6 @@ def test_qt_task_executor_stops_thread_after_completion() -> None:
         if handle is not None and handle.thread is not None:
             state["thread_running_on_finish"] = handle.thread.isRunning()
         state["finished"] = True
-        app.quit()
 
     handle = executor.start(
         task,
@@ -53,7 +60,16 @@ def test_qt_task_executor_stops_thread_after_completion() -> None:
         on_finished=on_finished,
     )
     QTimer.singleShot(5000, lambda: (state.__setitem__("timed_out", True), app.quit()))
-    app.exec()
+    # Pump events until the task reports finished instead of app.exec(): Qt 6 posts a
+    # Quit event when the last top-level window closes, and under pytest no loop is
+    # running to consume it, so any earlier GUI test that closed its window would make
+    # exec() here return before the worker had run at all.
+    import time as _time
+
+    deadline = _time.monotonic() + 5.0
+    while "finished" not in state and _time.monotonic() < deadline:
+        app.processEvents()
+        _time.sleep(0.005)
 
     assert state["timed_out"] is False
     assert state["result"] == {"ok": True}
