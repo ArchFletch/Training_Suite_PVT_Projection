@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 import json
 
 from xfmr_v2.licensing import LicenseHttpClient, LicenseIdentity
@@ -106,3 +108,33 @@ def test_release_result_carries_the_server_rejection_reason(monkeypatch) -> None
     assert result.ok is False
     assert result.reason_code == "machine_mismatch"
     assert result.message == "The lease is owned by a different machine_id."
+
+
+def test_a_bare_host_gets_a_scheme_instead_of_a_traceback() -> None:
+    """'licsrv01:27850' is the most likely thing a user types into a field labelled
+    License Server. Without a scheme urllib raised a bare ValueError out of the
+    client, which reached the GUI as a raw traceback dialog."""
+    from xfmr_v2.licensing import normalize_server_url
+
+    assert normalize_server_url("licsrv01:27850") == "http://licsrv01:27850"
+    assert normalize_server_url("  licsrv01/ ") == "http://licsrv01"
+    assert normalize_server_url("https://lic.example.com/") == "https://lic.example.com"
+    assert normalize_server_url("") == ""
+    assert license_client_module.LicenseHttpClient("licsrv01:27850").api_base == "http://licsrv01:27850/api/v1"
+
+
+def test_a_malformed_url_is_a_license_error_not_a_raw_exception(monkeypatch) -> None:
+    """A space in the host makes http.client raise InvalidURL, which is neither a
+    URLError nor an OSError and so escaped every `except LicenseClientError`."""
+    import http.client
+
+    def fake_urlopen(request, timeout: float):
+        raise http.client.InvalidURL("URL can't contain control characters")
+
+    monkeypatch.setattr(license_client_module.urllib.request, "urlopen", fake_urlopen)
+    client = license_client_module.LicenseHttpClient("http://lic srv01:27850")
+
+    with pytest.raises(license_client_module.LicenseClientError) as excinfo:
+        client.get_status()
+    assert "not a valid license server URL" in str(excinfo.value)
+    assert "http://host:port" in str(excinfo.value)

@@ -24,9 +24,18 @@ LICENSE_REQUIRED_MESSAGE = (
 
 
 def normalize_server_url(server_url: str) -> str:
-    """Normalize a configured server URL into a stable form."""
+    """Normalize a configured server URL into a stable form.
 
-    return server_url.strip().rstrip("/")
+    A bare host or host:port gets ``http://`` in front: that is what someone
+    typing ``licsrv01:27850`` into the License Server field means, and without
+    a scheme urllib raised ``ValueError('unknown url type')`` out of the licence
+    client -- a raw traceback in a dialog and a panel stuck at "Checking".
+    """
+
+    normalized = server_url.strip().rstrip("/")
+    if normalized and "://" not in normalized:
+        normalized = f"http://{normalized}"
+    return normalized
 
 
 def parse_utc_timestamp(value: str | None) -> datetime | None:
