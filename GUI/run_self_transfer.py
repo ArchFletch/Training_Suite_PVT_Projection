@@ -7,6 +7,7 @@ that workflow as a shell command and optionally opens the generated plots in VS 
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 import json
 
 from xfmr_v2.data import CACHE_PATH
@@ -58,13 +59,25 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=defaults["seed"].default)
     parser.add_argument("--disable-amp", action="store_true")
     parser.add_argument("--open-plots-in-vscode", action="store_true")
+    parser.add_argument(
+        "--device",
+        default=defaults["device"].default,
+        help='Compute device, e.g. "cuda:0", "cuda:1" or "cpu" (default: first CUDA device, else CPU).',
+    )
     args = parser.parse_args()
+    if not Path(args.cache_path).is_file():
+        # Otherwise the run dies inside numpy with a bare FileNotFoundError.
+        parser.error(
+            f"cache file not found: {args.cache_path}. Build it first with prepare_cache.py "
+            "or point --cache-path at an existing training cache."
+        )
 
     # Build the configuration object exactly once, then hand it off to the runner.
     summary = run_self_transfer(
         TransferConfig(
             cache_path=args.cache_path,
             output_dir=args.output_dir,
+            device=args.device,
             model_type=args.model_type,
             width=args.width,
             depth=args.depth,

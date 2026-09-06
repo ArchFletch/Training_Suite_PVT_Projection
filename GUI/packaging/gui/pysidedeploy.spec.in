@@ -18,4 +18,4 @@ plugins =
 
 [nuitka]
 mode = standalone
-extra_args = --quiet --assume-yes-for-downloads --module-parameter=torch-disable-jit=yes --noinclude-qt-translations --include-module=PySide6.QtOpenGL --include-module=PySide6.QtOpenGLWidgets --include-module=PySide6.QtSvg --include-module=PySide6.QtTest --include-package=xfmr_v2 --include-package=numpy --include-package=pyqtgraph --include-package=torch
+extra_args = --quiet --assume-yes-for-downloads --module-parameter=torch-disable-jit=yes --noinclude-qt-translations --include-module=PySide6.QtOpenGL --include-module=PySide6.QtOpenGLWidgets --include-module=PySide6.QtSvg --include-module=PySide6.QtTest --include-package=xfmr_v2 --include-package=numpy --include-package=pyqtgraph --include-package=torch --include-package=matplotlib --include-package-data=matplotlib --include-package=onnx --include-package=onnxruntime --include-package-data=onnxruntime --include-package=onnxscript --include-package-data=onnxscript

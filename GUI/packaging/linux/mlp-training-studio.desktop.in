@@ -2,7 +2,7 @@
 Type=Application
 Version=1.0
 Name=Surrogate Model Training Suite
-Comment=README-driven baseline training and self-transfer workflow
+Comment=Train neural-network surrogate models from PVT corner datasets
 Exec=__INSTALL_ROOT__/bin/mlp-training-studio
 Terminal=false
 StartupNotify=true
