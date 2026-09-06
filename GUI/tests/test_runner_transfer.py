@@ -776,3 +776,14 @@ def test_eval_loss_rejects_an_empty_validation_loader() -> None:
                                num_frequencies=4, width=8, depth=2)
     with pytest.raises(ValueError, match="validation split is empty"):
         runner._eval_loss(model, loader, torch.device("cpu"), amp=False)
+
+
+def test_train_baseline_refuses_zero_epochs() -> None:
+    """`--epochs 0` used to report status ok, save an untrained checkpoint, and
+    write a bare `Infinity` into summary.json. It fails before touching the cache."""
+    import pytest
+
+    from xfmr_v2 import runner
+
+    with pytest.raises(ValueError, match="epochs must be at least 1"):
+        runner.train_baseline(runner.TrainConfig(epochs=0, cache_path="/nonexistent/cache.npz"))

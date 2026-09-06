@@ -913,6 +913,11 @@ def train_baseline(
     """Train one full-spectrum baseline model and save the best checkpoint."""
     # `run_baseline_trial` already contains the full implementation. This wrapper
     # simply fixes the evaluation split and returns a smaller top-level summary.
+    if int(config.epochs) < 1:
+        # `--epochs 0` used to report status "ok", save an untrained random-init
+        # checkpoint, and write a bare `Infinity` best_val_loss into summary.json,
+        # which is not valid JSON.
+        raise ValueError(f"epochs must be at least 1 (got {config.epochs}).")
     result = run_baseline_trial(
         config=config,
         show_progress=show_progress,
@@ -1724,6 +1729,15 @@ def _save_checkpoint(
             "input_feature_std": bundle.input_feature_std,
             "target_mean": bundle.target_mean,
             "target_std": bundle.target_std,
+            # Axis metadata the ONNX exporter needs to invert per-channel transforms
+            # and label the output. It used to be read back from the training cache
+            # at export time, so a cache rebuilt for another dataset silently baked
+            # the wrong log10 inverse into the graph. The checkpoint is the record of
+            # what this model was trained on, so it carries the metadata itself.
+            "channel_transforms": [str(item) for item in bundle.channel_transforms],
+            "channel_units": [str(item) for item in bundle.channel_units],
+            "frequency_hz": np.asarray(bundle.frequency_hz, dtype=np.float64),
+            "sweep_label": str(bundle.sweep_label),
         },
         path,
     )
