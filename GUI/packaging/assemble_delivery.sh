@@ -349,7 +349,7 @@ readme_line ""
 
 collect "engineers-gui" "Linux desktop bundle (cu128 - Turing through Blackwell)" \
   "artifacts/packaging/linux-cu128/mlp-training-studio-linux-cu128.tar.gz" \
-  'pip install torch --index-url https://download.pytorch.org/whl/cu128
+  'pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu128   # pinned: 2.11.0 crashes Nuitka in torch/_dynamo/pgo.py
 bash packaging/linux/build_gui.sh --python <build venv python> --output-dir artifacts/packaging/linux-cu128
 bash packaging/linux/build_bundle.sh --standalone-dir <deployment directory reported by build_gui.sh> \
   --output-dir artifacts/packaging/linux-cu128 --tarball-name mlp-training-studio-linux-cu128.tar.gz' \
