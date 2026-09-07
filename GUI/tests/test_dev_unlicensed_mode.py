@@ -123,3 +123,12 @@ def test_a_frozen_build_keeps_the_gate_closed_when_told_it_is_a_source_checkout(
     assert not window.start_baseline_button.isEnabled()
     assert "licence check disabled" not in window.windowTitle()
     assert window.license_seat_state_badge.text() != "Dev Bypass"
+
+
+def test_a_nuitka_compiled_build_ignores_the_bypass(monkeypatch) -> None:
+    import xfmr_v2.app_paths as app_paths
+
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    monkeypatch.setitem(app_paths.__dict__, "__compiled__", True)
+    for value in ("1", "true", "yes", "on"):
+        assert dev_unlicensed_mode({DEV_UNLICENSED_ENV: value, "MLP_APP_PATH_MODE": "source"}) is False

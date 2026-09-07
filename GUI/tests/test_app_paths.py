@@ -92,3 +92,17 @@ def test_the_override_still_promotes_a_source_checkout_to_packaged(monkeypatch, 
 
     assert packaged.mode == "packaged"
     assert source.mode == "source"
+
+
+def test_a_nuitka_compiled_module_is_packaged_whatever_the_override_says(monkeypatch, tmp_path: Path) -> None:
+    """Nuitka never sets sys.frozen; it marks every compiled module with a
+    module-level __compiled__ instead. That is the marker a shipped build actually
+    carries, so pin it separately from the sys.frozen path."""
+    import xfmr_v2.app_paths as app_paths
+
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    monkeypatch.setitem(app_paths.__dict__, "__compiled__", True)
+
+    for override in ("source", "", "packaged"):
+        paths = current_runtime_paths(platform="linux", env={"MLP_APP_PATH_MODE": override, "HOME": str(tmp_path)})
+        assert paths.mode == "packaged", f"__compiled__ build downgraded by MLP_APP_PATH_MODE={override!r}"
