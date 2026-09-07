@@ -27,7 +27,10 @@ Thumbs.db
 /artifacts/packaging/
 /build/
 /dist/
-/deployment/
+# pyside6-deploy builds beside the project it compiles, which is GUI/,
+# not the repo root. Rooted at '/' this never matched and `git add -A`
+# tried to stage a 10 GB build tree.
+deployment/
 /gui_smoke_err.txt
 /gui_smoke_out.txt
 # Nuitka writes this beside the project it compiles, which is GUI/, not the repo root.

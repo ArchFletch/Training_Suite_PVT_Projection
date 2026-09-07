@@ -17,5 +17,20 @@ modules =
 plugins =
 
 [nuitka]
+# Exclusions below keep third-party TEST SUITES out of the customer bundle.
+# Eight of the ten largest generated C files were tests; torch.testing._internal
+# alone produced 40.8 MB of C and held one cc1 for 13+ minutes, and the result
+# shipped to the customer.
+#
+# Every entry is verified against the app's real import surface by
+# tests/test_packaging_exclusions.py. Do not add one without adding it there.
+# Three candidates were REJECTED by that check and must stay included:
+#   unittest    - torch imports it for real, from torch/utils/_config_module.py
+#                 via torch/_inductor/config.py. Excluding it produced a bundle
+#                 that aborted at startup with no message on any stream.
+#   torch.testing (the package itself) - torch imports _creation, _comparison
+#                 and _utils from it at import time; only _internal is dropped.
+#   sympy.polys.polyquinticconst (15.6 MB) - polyroots imports it at module
+#                 scope, so a bare `import sympy` would raise ImportError.
 mode = standalone
-extra_args = --quiet --assume-yes-for-downloads --noinclude-unittest-mode=nofollow --noinclude-pytest-mode=nofollow --nofollow-import-to=torch.testing._internal --nofollow-import-to=numpy.tests --nofollow-import-to=numpy._core.tests --nofollow-import-to=matplotlib.tests --nofollow-import-to=onnx.test --module-parameter=torch-disable-jit=yes --noinclude-qt-translations --include-module=PySide6.QtOpenGL --include-module=PySide6.QtOpenGLWidgets --include-module=PySide6.QtSvg --include-module=PySide6.QtTest --include-package=xfmr_v2 --include-package=numpy --include-package=pyqtgraph --include-package=torch --include-package=matplotlib --include-package-data=matplotlib --include-package=onnx --include-package=onnxruntime --include-package-data=onnxruntime --include-package=onnxscript --include-package-data=onnxscript
+extra_args = --quiet --assume-yes-for-downloads --noinclude-pytest-mode=nofollow --nofollow-import-to=torch.testing._internal --nofollow-import-to=numpy.tests --nofollow-import-to=numpy._core.tests --nofollow-import-to=matplotlib.tests --nofollow-import-to=onnx.test --module-parameter=torch-disable-jit=yes --noinclude-qt-translations --include-module=PySide6.QtOpenGL --include-module=PySide6.QtOpenGLWidgets --include-module=PySide6.QtSvg --include-module=PySide6.QtTest --include-package=xfmr_v2 --include-package=numpy --include-package=pyqtgraph --include-package=torch --include-package=matplotlib --include-package-data=matplotlib --include-package=onnx --include-package=onnxruntime --include-package-data=onnxruntime --include-package=onnxscript --include-package-data=onnxscript
