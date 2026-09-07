@@ -106,6 +106,34 @@ if [[ -n "$pep695_report" ]]; then
   exit 1
 fi
 
+# Nuitka links the final binary with -lpython3.<minor> but passes no matching -L,
+# so gcc falls back to its default search path. That works for a system Python and
+# fails for a relocated one -- and it fails at the LINK step, after the entire
+# compile, with nothing but "/usr/bin/ld: cannot find -lpython3.12". Forty minutes
+# of compilation are thrown away to learn one path is missing, and because the
+# variables below are ambient, a build that worked in one shell fails in the next
+# with no change to the tree.
+#
+# Take the directory from the build interpreter itself, and refuse in two seconds
+# if the library genuinely is not there.
+python_libdir="$("$python_bin" -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR") or "")')"
+python_ldlibrary="$("$python_bin" -c 'import sysconfig; print(sysconfig.get_config_var("LDLIBRARY") or "")')"
+if [[ -n "$python_libdir" && -n "$python_ldlibrary" ]]; then
+  if [[ ! -e "$python_libdir/$python_ldlibrary" ]]; then
+    echo "Refusing to build: the build interpreter reports its shared library at" >&2
+    echo "  $python_libdir/$python_ldlibrary" >&2
+    echo "but no such file exists. Nuitka would compile everything and then fail at" >&2
+    echo "the link step with 'cannot find -l${python_ldlibrary#lib}'." >&2
+    echo "Install the matching python3-devel, or fix LIBDIR in the interpreter's" >&2
+    echo "_sysconfigdata module if this is a relocated CPython." >&2
+    exit 1
+  fi
+  # gcc resolves -l against LIBRARY_PATH; the loader uses LD_LIBRARY_PATH.
+  export LIBRARY_PATH="${python_libdir}${LIBRARY_PATH:+:$LIBRARY_PATH}"
+  export LD_LIBRARY_PATH="${python_libdir}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  echo "Linking against the build interpreter's libdir: $python_libdir" >&2
+fi
+
 spec_template="$repo_root/packaging/gui/pysidedeploy.spec.in"
 spec_path="$output_dir/pysidedeploy.spec"
 input_file="$repo_root/launch_gui.py"
