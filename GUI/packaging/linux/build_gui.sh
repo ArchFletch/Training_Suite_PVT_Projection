@@ -76,4 +76,29 @@ fi
 
 "$deploy_bin" "${deploy_args[@]}"
 
-echo "Standalone Linux build completed. Inspect $output_dir for the deployment folder."
+# pyside6-deploy exits 0 even when Nuitka fails: a missing Python.h aborts the C
+# backend with "FATAL: Failed unexpectedly in Scons C backend compilation", deploy
+# reports the exception and still returns success, and this script would then
+# announce a completed build over an empty folder. Verify the artifact instead of
+# trusting the exit code.
+dist_dir="$output_dir/mlp-training-studio.dist"
+if [[ ! -d "$dist_dir" ]]; then
+  echo "Build FAILED: $dist_dir was not created. See the Nuitka output above." >&2
+  exit 1
+fi
+
+missing=()
+for entry in mlp-training-studio xfmr_v2 numpy torch pyqtgraph PySide6 matplotlib onnx onnxruntime onnxscript; do
+  compgen -G "$dist_dir/$entry*" >/dev/null || missing+=("$entry")
+done
+# matplotlib needs its mpl-data tree (matplotlibrc, fonts) on disk at runtime, which
+# only --include-package-data copies; without it every run dies when it saves a plot.
+[[ -d "$dist_dir/matplotlib/mpl-data" ]] || missing+=("matplotlib/mpl-data")
+
+if (( ${#missing[@]} )); then
+  echo "Build FAILED: $dist_dir is missing ${missing[*]}." >&2
+  echo "Check the --include-package flags in packaging/gui/pysidedeploy.spec.in." >&2
+  exit 1
+fi
+
+echo "Standalone Linux build completed: $dist_dir ($(du -sh "$dist_dir" | cut -f1))."
