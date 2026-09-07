@@ -7,12 +7,17 @@ Usage:
   assemble_delivery.sh [options]
 
 Collects the customer-facing artifacts already built under artifacts/packaging
-into one delivery tree grouped by recipient, and reports the artifacts this
-machine has not built. A missing artifact is not an error.
+into one delivery tree, one directory per shipment, and reports the artifacts
+this machine has not built. A missing artifact is not an error.
 
-No single host builds all four artifacts, so one --output-dir is normally filled
-in by several runs on several machines. An artifact that is already in the tree
-but cannot be rebuilt here is kept, checksummed and reported as CARRIED OVER.
+The tree holds three shipments: server/ for customer IT, and one of gui-cu128/
+or gui-cu121/ for the design engineers, chosen by the oldest GPU generation in
+their fleet. Only one of the two GUI directories is ever sent -- both bundles
+extract to the same path. This tree is Linux only.
+
+An artifact that is already in the tree but cannot be rebuilt here is kept,
+checksummed and reported as CARRIED OVER, so one --output-dir can still be
+filled in by runs on several machines.
 This script never deletes a destination it is not about to replace, so running
 it on a machine with a partial toolchain cannot destroy another machine's
 contribution. --clean does discard the whole tree, on purpose.
@@ -28,10 +33,12 @@ Exit status:
   0  tree assembled; every file in it is accounted for
   1  hard failure (vendor key material found, or a copy/checksum failed)
   2  usage error
-  3  tree assembled, but the recipient directories hold files this run did not
-     place. They are listed in the console output, in checksums.txt and in the
-     generated README.md. Nothing was deleted; the tree must not ship until
-     they are explained, removed, or the tree is rebuilt with --clean.
+  3  tree assembled, but it holds files this run did not place, anywhere under
+     --output-dir. They are listed in the console output, in checksums.txt and
+     in the generated README.md. Nothing was deleted; the tree must not ship
+     until they are explained or removed. Note that --clean removes only the
+     directories this version of the script writes, so a directory left by an
+     earlier layout has to be deleted by hand.
 EOF
 }
 
@@ -99,20 +106,25 @@ fi
 mkdir -p "$output_dir"
 output_dir="$(cd "$output_dir" && pwd)"
 
-engineers_dir="$output_dir/engineers-gui"
-server_dir="$output_dir/server-admin"
+# One directory per shipment, so each can be handed over as it stands. The two
+# GUI directories hold the same application built against different PyTorch
+# wheels; the install doc is copied into both, because whichever one is sent is
+# the only one the recipient will ever see.
+gui_cu128_dir="$output_dir/gui-cu128"
+gui_cu121_dir="$output_dir/gui-cu121"
+server_dir="$output_dir/server"
 readme_path="$output_dir/README.md"
 checksums_path="$output_dir/checksums.txt"
 
 if [[ $clean -eq 1 ]]; then
   # Only the fixed paths this script writes are removed. "rm -rf $output_dir" would
   # take out anything else a release manager parked in a --output-dir of their own.
-  rm -rf "$engineers_dir" "$server_dir"
+  rm -rf "$gui_cu128_dir" "$gui_cu121_dir" "$server_dir"
   rm -f "$readme_path" "$checksums_path"
 fi
 
 # The recipient directories are created on demand, when something is actually put
-# in them. An empty engineers-gui/ next to an empty checksums.txt reads like a
+# in them. An empty gui-cu128/ next to an empty checksums.txt reads like a
 # delivery with nothing wrong in it.
 
 placed_count=0
@@ -306,48 +318,41 @@ collect() {
   readme_line ""
 }
 
-windows_server_zip_rel="artifacts/packaging/license_server/windows/MLP License Server.zip"
-windows_server_zip_dest="$server_dir/$(basename "$windows_server_zip_rel")"
-
 printf 'Repo root:     %s\n' "$repo_root"
 printf 'Delivery tree: %s\n' "$output_dir"
 printf '\n'
 
-readme_line "## engineers-gui/"
-readme_line ""
-readme_line "Goes to the design engineers who run the desktop app, one file per platform."
-readme_line "Install and first-run notes for them are in \`engineers-gui/gui_install_run.md\`,"
-readme_line "included in this delivery. On Linux, read its \"Linux System Prerequisites\" section"
-readme_line "before the first launch: an X11 desktop needs system libraries a stock install may"
-readme_line "not have, and Qt's own error names the wrong one. The same list is in the bundle's"
-readme_line "\`INSTALL.txt\`, and the launcher checks it and names what is actually missing."
-readme_line "The app needs the license server below to be running before it can take a seat."
-readme_line ""
-
-printf 'engineers-gui/  (design engineers running the desktop app)\n'
-
-collect "engineers-gui" "Windows desktop installer" \
-  "artifacts/packaging/windows/installer/SurrogateModelTrainingSuite-Windows.exe" \
-  'packaging\windows\build_gui.ps1
-packaging\windows\build_installer.ps1 -StandaloneDir artifacts\packaging\windows\SurrogateModelTrainingSuite.dist' \
-  'Windows host, PowerShell, a Python with the GUI dependencies, PySide6, Nuitka, Inno Setup 6'
-
-readme_line "Two Linux bundles are provided. They are the same application and extract to the"
-readme_line "same directory; they differ only in the bundled PyTorch build, which decides which"
-readme_line "GPUs can be used. No single PyTorch wheel covers both ends of the range, so pick by"
+readme_line "The same application is built twice, against two PyTorch wheels. They extract to"
+readme_line "the same directory and differ only in which GPUs can be used for training. No"
+readme_line "single PyTorch wheel covers both ends of the range, so send the one that matches"
 readme_line "the oldest GPU generation in the fleet:"
 readme_line ""
-readme_line "| Bundle | GPU architectures | Cards |"
+readme_line "| Send | GPU architectures | Cards |"
 readme_line "| --- | --- | --- |"
-readme_line "| \`...-cu128.tar.gz\` | sm_75 - sm_120 | Turing, Ampere, Ada, Hopper, Blackwell (RTX 50-series) |"
-readme_line "| \`...-cu121.tar.gz\` | sm_50 - sm_90 | Maxwell, Pascal, Volta, Turing, Ampere, Ada, Hopper |"
+readme_line "| \`gui-cu128/\` | sm_75 - sm_120 | Turing, Ampere, Ada, Hopper, Blackwell (RTX 50-series) |"
+readme_line "| \`gui-cu121/\` | sm_50 - sm_90 | Maxwell, Pascal, Volta, Turing, Ampere, Ada, Hopper |"
 readme_line ""
-readme_line "A card outside the bundled range still runs the app; training falls back to the CPU"
-readme_line "and the app prints a \"CUDA capability sm_NNN is not compatible\" warning at startup."
-readme_line "Install only one: both extract to the same path and would overwrite each other."
+readme_line "**Send one, not both.** They extract to the same path and would overwrite each"
+readme_line "other. A card outside the bundled range still runs the app, but training falls"
+readme_line "back to the CPU and the app prints a \"CUDA capability sm_NNN is not compatible\""
+readme_line "warning at startup -- on a real dataset that is slow enough to look like a hang."
 readme_line ""
 
-collect "engineers-gui" "Linux desktop bundle (cu128 - Turing through Blackwell)" \
+readme_line "## gui-cu128/"
+readme_line ""
+readme_line "Goes to the design engineers, if the fleet is Turing (RTX 20-series) or newer."
+readme_line "This is the bundle for Blackwell cards such as the RTX 5070 Ti. Install and"
+readme_line "first-run notes are in \`gui-cu128/gui_install_run.md\`, included here. On Linux,"
+readme_line "read its \"Linux System Prerequisites\" section before the first launch: an X11"
+readme_line "desktop needs system libraries a stock install may not have, and Qt's own error"
+readme_line "names the wrong one. The same list is in the bundle's \`INSTALL.txt\`, and the"
+readme_line "launcher checks it and names what is actually missing. The app needs the license"
+readme_line "server running before it can take a seat."
+readme_line ""
+
+printf 'gui-cu128/      (design engineers -- Turing through Blackwell, incl. RTX 50-series)\n'
+
+collect "gui-cu128" "Linux desktop bundle (cu128 - Turing through Blackwell)" \
   "artifacts/packaging/linux-cu128/mlp-training-studio-linux-cu128.tar.gz" \
   'pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu128   # pinned: 2.11.0 crashes Nuitka in torch/_dynamo/pgo.py
 bash packaging/linux/build_gui.sh --python <build venv python> --output-dir artifacts/packaging/linux-cu128
@@ -355,7 +360,19 @@ bash packaging/linux/build_bundle.sh --standalone-dir <deployment directory repo
   --output-dir artifacts/packaging/linux-cu128 --tarball-name mlp-training-studio-linux-cu128.tar.gz' \
   'Linux host, a Python with the GUI dependencies (numpy 2.3.4 -- see the PEP 695 guard in build_gui.sh), PySide6 (pyside6-deploy), Nuitka'
 
-collect "engineers-gui" "Linux desktop bundle (cu121 - Maxwell through Hopper)" \
+collect_doc "gui-cu128" "doc/customer/gui_install_run.md"
+
+readme_line "## gui-cu121/"
+readme_line ""
+readme_line "The same application and the same notes, for a fleet that still has a Maxwell,"
+readme_line "Pascal or Volta card in it. Those architectures are dropped by the cu128 wheel."
+readme_line "If every machine is Turing or newer, this directory is not needed and should not"
+readme_line "be sent."
+readme_line ""
+
+printf 'gui-cu121/      (design engineers -- only if a Maxwell/Pascal/Volta card is in the fleet)\n'
+
+collect "gui-cu121" "Linux desktop bundle (cu121 - Maxwell through Hopper)" \
   "artifacts/packaging/linux-cu121/mlp-training-studio-linux-cu121.tar.gz" \
   'pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
 bash packaging/linux/build_gui.sh --python <build venv python> --output-dir artifacts/packaging/linux-cu121
@@ -363,24 +380,26 @@ bash packaging/linux/build_bundle.sh --standalone-dir <deployment directory repo
   --output-dir artifacts/packaging/linux-cu121 --tarball-name mlp-training-studio-linux-cu121.tar.gz' \
   'Linux host, a Python with the GUI dependencies (numpy 2.3.4 -- see the PEP 695 guard in build_gui.sh), PySide6 (pyside6-deploy), Nuitka'
 
-collect_doc "engineers-gui" "doc/customer/gui_install_run.md"
+collect_doc "gui-cu121" "doc/customer/gui_install_run.md"
 
-readme_line "## server-admin/"
+readme_line "## server/"
 readme_line ""
 readme_line "Goes to customer IT, who installs the on-prem floating license server on one LAN"
-readme_line "host. Send the file matching the server OS. The Linux bundle carries its own"
-readme_line "\`INSTALL.md\`; the Windows bundle carries \`install-service.ps1\`. This half of the"
-readme_line "delivery goes out first: no engineer gets a seat until the server is licensed."
+readme_line "host. The bundle carries its own \`INSTALL.md\`. This half of the delivery goes out"
+readme_line "first: no engineer gets a seat until the server is licensed."
+readme_line ""
+readme_line "Two things to pass on before they start. The service reads its config with"
+readme_line "\`tomllib\`, so **Python 3.11 or newer is a hard floor** -- Ubuntu 22.04's default"
+readme_line "\`python3\` is 3.10 and builds a venv that installs cleanly and then fails at"
+readme_line "service start. And the host fingerprint is computed once at \`init\` and stored, so"
+readme_line "**the hostname and its DNS name have to be settled first**, and"
+readme_line "\`/var/lib/mlp-license-server/\` has to be backed up: losing it means a re-issued"
+readme_line "license. Both are covered in the bundle's \`INSTALL.md\`."
 readme_line ""
 
-printf 'server-admin/   (customer IT installing the floating license server)\n'
+printf 'server/         (customer IT installing the floating license server)\n'
 
-collect "server-admin" "Windows license server bundle" \
-  "$windows_server_zip_rel" \
-  'packaging\license_server\windows\build_bundle.ps1 -WinSWExePath <path to WinSW-x64.exe>' \
-  'Windows host, PowerShell, Python 3.12 (its base prefix is copied into the bundle), a downloaded WinSW x64 executable, and network access to PyPI (the build runs ensurepip and pip install -r runtime_requirements.txt into the bundled runtime)'
-
-collect "server-admin" "Linux license server bundle" \
+collect "server" "Linux license server bundle" \
   "artifacts/packaging/license_server/linux/mlp-license-server-linux.tar.gz" \
   'bash packaging/license_server/linux/build_bundle.sh' \
   'any host with bash and tar, no Python or Qt toolchain, no network access'
@@ -413,24 +432,29 @@ fi
 # full, the strays are recorded in the two places anyone verifying this tree
 # reads (checksums.txt and the delivery README), and the run exits 3 so nothing
 # automated can treat the tree as shippable.
-scan_dirs=()
-if [[ -d "$engineers_dir" ]]; then
-  scan_dirs+=("$engineers_dir")
-fi
-if [[ -d "$server_dir" ]]; then
-  scan_dirs+=("$server_dir")
-fi
-
+# Scan the WHOLE tree, not just the directories this version of the script
+# writes. Scoping it to the known recipient directories meant that renaming them
+# -- engineers-gui/ and server-admin/ became gui-cu128/, gui-cu121/ and server/
+# -- left the old ones in place, holding 5.3 GB of superseded artifacts, and the
+# run still exited 0. --clean removes only the paths this script owns, so it
+# cannot clear a directory a previous layout owned either. Anything in the tree
+# that this run did not place is a stray, whatever directory it sits in.
+#
+# README.md and checksums.txt are written by this script at the top level and are
+# not artifacts, so they are the only exceptions.
 unaccounted_rels=""
 unaccounted_count=0
-if [[ ${#scan_dirs[@]} -gt 0 ]]; then
+if [[ -d "$output_dir" ]]; then
   while IFS= read -r -d '' found_path; do
     found_rel="${found_path#"$output_dir/"}"
+    case "$found_rel" in
+      README.md|checksums.txt) continue ;;
+    esac
     if ! printf '%s' "$accounted_rels" | grep -Fxq -- "$found_rel"; then
       unaccounted_count=$((unaccounted_count + 1))
       unaccounted_rels+="$found_rel"$'\n'
     fi
-  done < <(find "${scan_dirs[@]}" \( -type f -o -type l \) -print0)
+  done < <(find "$output_dir" \( -type f -o -type l \) -print0)
 fi
 
 if [[ $present_count -eq 0 ]]; then
@@ -480,8 +504,12 @@ Everything under this directory goes to a customer. It is assembled by
 contributed here. This file and `checksums.txt` are rewritten on every run, so
 nothing here should be edited by hand.
 
-The two folders go to two different people at the customer site, usually at
-different times. Build commands quoted below run from the repository root.
+Each folder is one shipment. `server/` goes to customer IT and goes out first;
+one of `gui-cu128/` or `gui-cu121/` goes to the design engineers -- never both,
+see the table below. Build commands quoted below run from the repository root.
+
+This tree covers Linux only. The Windows desktop installer and Windows license
+server are not part of it and are not built here.
 
 EOF
   printf '%s\n\n' "$status_line"
@@ -491,10 +519,11 @@ EOF
     cat <<'EOF'
 ## Files this tree does not account for
 
-DO NOT SHIP until these are explained. The files below are in the recipient
-directories but were not placed by the assembly script, so they are absent from
+DO NOT SHIP until these are explained. The files below are somewhere in this
+tree but were not placed by the assembly script, so they are absent from
 `checksums.txt` and from the artifact list above, and no one has said what they
-are. A stale installer from a previous release looks exactly like this.
+are. A stale installer from a previous release, or a recipient directory left
+behind by an earlier layout, looks exactly like this.
 
 EOF
     printf '%s' "$unaccounted_rels" | while IFS= read -r stray; do
@@ -515,7 +544,7 @@ EOF
 They are issued per customer against one specific server, which has to exist
 first:
 
-1. The server admin installs the `server-admin/` bundle, runs `init`, then
+1. The server admin installs the `server/` bundle, runs `init`, then
    `export-request`, which writes `license_request.json`. That file carries a
    server ID, a host fingerprint, the hostname and the OS family, nothing else.
 2. The admin sends `license_request.json` back to the vendor.
@@ -618,23 +647,12 @@ cat <<'EOF'
 Vendor key material: file names were checked, archive contents were not.
   Checked:     every path under the delivery tree against *signing_key*, *.pem,
                *.jsonl, license.json and license_vendor. Nothing matched.
-  Not checked: what is inside the .exe, .zip and .tar.gz files. This script does
-               not open them, so it cannot vouch for their contents.
+  Not checked: what is inside the .tar.gz files. This script does not open them,
+               so it cannot vouch for their contents. Both build scripts that
+               stage them -- packaging/linux/build_bundle.sh and
+               packaging/license_server/linux/build_bundle.sh -- apply the same
+               name guard to their staging before writing the tarball.
 EOF
-
-if [[ -f "$windows_server_zip_dest" ]]; then
-  cat <<'EOF'
-  Open by hand before shipping: server-admin/"MLP License Server.zip".
-               packaging/license_server/windows/build_bundle.ps1 copies the build
-               machine's whole license_server/ directory into that zip and has no
-               leak guard of its own, so a vendor_public_key.pem, license.json or
-               issuance_log.jsonl left in that directory during development
-               would be inside the archive. The Linux server bundle needs no
-               such check:
-               packaging/license_server/linux/build_bundle.sh applies the same
-               name guard to its staging before it writes the tarball.
-EOF
-fi
 
 cat <<'EOF'
 
@@ -645,7 +663,7 @@ EOF
 if [[ $unaccounted_count -gt 0 ]]; then
   cat <<EOF
 
-NOT SHIPPABLE: $unaccounted_count file(s) in the recipient directories were not placed by
+NOT SHIPPABLE: $unaccounted_count file(s) under the delivery tree were not placed by
 this run. They are not in checksums.txt and not described in the delivery
 README's artifact list, but they are in the tree and would go out with it:
 EOF
