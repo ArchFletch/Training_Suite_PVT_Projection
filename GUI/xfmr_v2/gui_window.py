@@ -256,8 +256,9 @@ class MlpTrainingStudio(QMainWindow):
         self.search_row_configs: list[dict[str, Any]] = []
         self.current_task_name = "idle"
         # Set when the user closes the window while a task is running: the close
-        # is finished from _handle_task_finished once the worker has unwound.
+        # is finished once the worker has unwound.
         self._close_after_task = False
+        self._close_poll_timer: QTimer | None = None
         # Display-only: the cache path the engine last used. Always derived from
         # the output folder and run name, never chosen by the user.
         self._cache_path_value = ""
@@ -1403,6 +1404,22 @@ class MlpTrainingStudio(QMainWindow):
         busy_state: str,
         on_result,
     ) -> None:
+        if QThread.currentThread() is not self.thread():
+            # Result and progress callbacks run on the worker thread (only
+            # `finished` arrives on the main one), so a task chained from a result
+            # callback -- the pattern _force_clear_task_state exists for -- would
+            # create its QThread with worker-thread affinity. That thread's own
+            # `quit` and `finished` are then queued to a thread that is about to
+            # exit and never run: the task never reports completion and the window
+            # can never close. Start on the main thread instead.
+            QTimer.singleShot(
+                0,
+                self,
+                lambda: self._start_task(
+                    function, kwargs=kwargs, task_name=task_name, busy_state=busy_state, on_result=on_result
+                ),
+            )
+            return
         if self.current_task is not None:
             self._show_warning("A task is already running. Please stop it or wait for it to finish.")
             return
@@ -1485,6 +1502,8 @@ class MlpTrainingStudio(QMainWindow):
             self.run_state_badge.set_status("Idle")
         if self._close_after_task:
             self._close_after_task = False
+            if self._close_poll_timer is not None:
+                self._close_poll_timer.stop()
             # `finished` is emitted from the worker thread just before it exits, so
             # give the QThread one event-loop turn to fully stop before the window
             # (and with it the application) goes away.
@@ -2738,8 +2757,13 @@ class MlpTrainingStudio(QMainWindow):
         # Threads retired by _force_clear_task_state have finished their Python
         # work and are only quitting; wait for them so none is destroyed while
         # still running, which aborts the process.
+        if self._close_poll_timer is not None:
+            self._close_poll_timer.stop()
         for thread in list(getattr(self, "_retiring_threads", [])):
-            thread.wait(5000)
+            try:
+                thread.wait(5000)
+            except RuntimeError:
+                pass  # already deleted by its own deleteLater; nothing to wait for
         self.license_controller.shutdown()
         super().closeEvent(event)
 
@@ -2754,6 +2778,32 @@ class MlpTrainingStudio(QMainWindow):
         self.append_log(
             "Close requested: stopping the current task. The window will close as soon as it has stopped."
         )
+        # _handle_task_finished is the fast path, but it cannot be relied on alone.
+        # Result callbacks run on the worker thread, so a callback that chains a
+        # follow-up task (the scan -> suggest pattern _force_clear_task_state exists
+        # for) connects the new task's `finished` from a thread that then exits, and
+        # the signal is never delivered -- which left the window open forever. Poll
+        # as well, so the close depends on observable state rather than on a signal.
+        if self._close_poll_timer is None:
+            self._close_poll_timer = QTimer(self)
+            self._close_poll_timer.setInterval(200)
+            self._close_poll_timer.timeout.connect(self._poll_close_after_task)
+        self._close_poll_timer.start()
+
+    def _poll_close_after_task(self) -> None:
+        if not self._close_after_task:
+            self._close_poll_timer.stop()
+            return
+        task = self.current_task
+        thread = getattr(task, "thread", None) if task is not None else None
+        still_running = task is not None and (thread is None or thread.isRunning())
+        if still_running:
+            # A task chained after the close request never saw the stop flag.
+            task.stop()
+            return
+        self._close_poll_timer.stop()
+        self._close_after_task = False
+        self.close()
 
 
 def create_application() -> tuple[QApplication, MlpTrainingStudio]:

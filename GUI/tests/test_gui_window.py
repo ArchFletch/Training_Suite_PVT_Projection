@@ -1214,3 +1214,48 @@ def test_window_export_of_a_legacy_checkpoint_without_its_cache_reports_an_error
     assert shown and "training cache" in shown[0]
     assert "Error:" in gui_window.run_log_text_edit.toPlainText()
     assert gui_window.run_state_badge.text() == "Error"
+
+
+def test_a_task_chained_from_a_worker_callback_still_lets_the_window_close(qtbot, monkeypatch) -> None:
+    """Result callbacks run on the worker thread, so a task chained from one used to
+    get a QThread with worker-thread affinity: its own quit/finished were queued to a
+    thread that immediately exited, the task never reported completion, and a window
+    waiting to close after it stayed open forever. The old code hid this by calling
+    QThread.terminate() after a 10 s freeze."""
+    import time
+
+    window = _make_window(qtbot, monkeypatch, QtTaskExecutor())
+
+    def quick(*, progress_callback, should_stop):
+        time.sleep(0.2)
+        return {"status": "ok"}
+
+    def chain(_result):
+        window._force_clear_task_state()
+        window._start_task(quick, kwargs={}, task_name="suggest", busy_state="Suggesting", on_result=lambda r: None)
+
+    window._start_task(quick, kwargs={}, task_name="scan", busy_state="Scanning", on_result=chain)
+    qtbot.waitUntil(lambda: window.current_task_name == "suggest", timeout=5000)
+    # The chained task must have been marshalled onto the GUI thread.
+    assert window.current_task is not None and window.current_task.thread is not None
+    assert window.current_task.thread.thread() is window.thread()
+
+    window.close()
+    assert window.isVisible()
+    qtbot.waitUntil(lambda: not window.isVisible(), timeout=8000)
+
+
+def test_closing_survives_a_worker_whose_thread_wrapper_is_already_gone(qtbot, monkeypatch) -> None:
+    """Threads retired by _force_clear_task_state delete themselves via deleteLater,
+    so closeEvent's wait() can meet a live Python wrapper around a dead C++ object."""
+    from PySide6.QtCore import QThread
+
+    window = _make_window(qtbot, monkeypatch, ImmediateTaskExecutor())
+
+    class _DeadThread:
+        def wait(self, _ms):
+            raise RuntimeError("Internal C++ object (PySide6.QtCore.QThread) already deleted.")
+
+    window._retiring_threads = [_DeadThread()]
+    window.close()  # must not raise
+    assert not window.isVisible()
