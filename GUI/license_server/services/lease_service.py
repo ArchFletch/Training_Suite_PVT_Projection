@@ -53,10 +53,71 @@ class LeaseService:
                 connection=connection,
             )
             if isinstance(license_or_denial, CheckoutDenied):
+                # validate_checkout returns invalid_license, license_not_started,
+                # license_expired and feature_not_enabled straight to the caller and
+                # writes nothing, so those refusals left no trace at all: an audit
+                # could not answer "who was turned away because a feature was not
+                # licensed". Only all_seats_in_use below was ever recorded. The audit
+                # write happens here because this is the write-locked connection.
+                self.repository.add_audit_event(
+                    connection,
+                    event_type="checkout_denied",
+                    event_time=now,
+                    details={
+                        "reason_code": license_or_denial.reason_code,
+                        "machine_id": request.machine_id,
+                        "hostname": request.hostname,
+                        "username": request.username,
+                        "requested_feature": request.requested_feature,
+                    },
+                )
                 return license_or_denial
 
             imported_license = license_or_denial
             license_ends_at = coerce_utc_datetime(imported_license.payload.ends_at)
+
+            # A seat is floating per MACHINE. A machine that already holds a live
+            # lease gets that same lease back (with its expiry extended) instead of a
+            # second seat, so two windows on one workstation cannot consume two seats
+            # of a small licence and lock a colleague out.
+            existing = self.repository.get_active_lease_for_machine(
+                connection, machine_id=request.machine_id, now=now
+            )
+            if existing is not None:
+                renewed_expiry = format_utc_datetime(
+                    min(coerce_utc_datetime(now) + self._lease_ttl_delta, license_ends_at)
+                )
+                self.repository.update_lease_expiry(
+                    connection,
+                    lease_id=existing.lease_id,
+                    machine_id=request.machine_id,
+                    expires_at=renewed_expiry,
+                )
+                seats_in_use = self.repository.count_active_leases(connection, now=now)
+                self.repository.add_audit_event(
+                    connection,
+                    event_type="checkout_reused",
+                    event_time=now,
+                    details={
+                        "lease_id": existing.lease_id,
+                        "license_id": imported_license.payload.license_id,
+                        "machine_id": request.machine_id,
+                        "hostname": request.hostname,
+                    },
+                )
+                return CheckoutGranted(
+                    granted=True,
+                    lease_id=existing.lease_id,
+                    heartbeat_interval_seconds=self.config.heartbeat_interval_seconds,
+                    lease_ttl_seconds=self.config.lease_ttl_seconds,
+                    grace_seconds=self.config.grace_seconds,
+                    expires_at=renewed_expiry,
+                    license_type=imported_license.payload.license_type,
+                    company_name=imported_license.payload.company_name,
+                    seat_count=imported_license.payload.seat_count,
+                    seats_in_use=seats_in_use,
+                )
+
             active_count = self.repository.count_active_leases(connection, now=now)
             if active_count >= imported_license.payload.seat_count:
                 self.repository.add_audit_event(

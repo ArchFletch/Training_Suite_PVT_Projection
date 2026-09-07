@@ -125,7 +125,6 @@ done
 # strings then dies of SIGPIPE, and `set -o pipefail` turns that into a spurious
 # build failure on a perfectly good binary.
 symbols_file="$(mktemp)"
-trap 'rm -f "$symbols_file"' EXIT
 strings -a "$dist_dir/mlp-training-studio" >"$symbols_file" 2>/dev/null || true
 for entry in xfmr_v2.gui_window xfmr_v2.runner onnxscript; do
   grep -qF "$entry" "$symbols_file" || missing+=("$entry (compiled-in)")
@@ -137,5 +136,56 @@ if (( ${#missing[@]} )); then
   exit 1
 fi
 
+# Every external library the Qt xcb (X11) plugin chain pulls in must be declared in
+# x11_runtime_requirements.txt, which INSTALL.txt and the launcher's preflight are
+# both rendered from. An `ldd` check on the build host cannot catch this: 26 of the
+# 27 happen to be installed here, so they resolve and the dist looks self-contained
+# while a stock Ubuntu X11 session fails to start. Comparing against the declared
+# list instead of the build host's /usr/lib64 is what makes the check meaningful.
+requirements_file="$repo_root/packaging/linux/x11_runtime_requirements.txt"
+if [[ ! -f "$requirements_file" ]]; then
+  echo "Build FAILED: $requirements_file is missing; it is the source of truth for the" >&2
+  echo "system libraries INSTALL.txt and the launcher preflight tell the customer to install." >&2
+  exit 1
+fi
+
+declared="$(mktemp)"; shipped="$(mktemp)"; external="$(mktemp)"
+trap 'rm -f "$symbols_file" "$declared" "$shipped" "$external"' EXIT
+grep -vE '^\s*#|^\s*$' "$requirements_file" | awk '{print $1}' | sort -u >"$declared"
+find "$dist_dir" -name '*.so*' -type f -printf '%f\n' | sort -u >"$shipped"
+
+# Transitively walk the xcb plugin chain and collect what it needs from outside.
+: >"$external"
+pending="$(find "$dist_dir" \( -name 'libqxcb.so' -o -name 'libQt6XcbQpa.so.6' \) -type f)"
+visited=""
+while [[ -n "$pending" ]]; do
+  current="$(echo "$pending" | head -1)"; pending="$(echo "$pending" | tail -n +2)"
+  case " $visited " in *" $current "*) continue;; esac
+  visited="$visited $current"
+  while read -r soname; do
+    [[ -z "$soname" ]] && continue
+    if grep -qxF "$soname" "$shipped"; then
+      next="$(find "$dist_dir" -name "$soname" -type f | head -1)"
+      [[ -n "$next" ]] && pending="$(printf '%s\n%s' "$pending" "$next")"
+    else
+      echo "$soname" >>"$external"
+    fi
+  done < <(objdump -p "$current" 2>/dev/null | awk '/NEEDED/{print $2}')
+done
+
+# glibc and the C++ runtime are on every Linux host worth shipping to.
+undeclared="$(sort -u "$external" \
+  | grep -vE '^(libc|libm|libdl|librt|libpthread|libutil|libresolv|libnsl|libcrypt|libgcc_s|libstdc\+\+|ld-linux-x86-64)\.so' \
+  | grep -vxFf "$declared" || true)"
+if [[ -n "$undeclared" ]]; then
+  echo "Build FAILED: the Qt xcb plugin needs system libraries that are not declared in" >&2
+  echo "packaging/linux/x11_runtime_requirements.txt:" >&2
+  echo "$undeclared" | sed 's/^/  /' >&2
+  echo "Add them there (with their Debian and RHEL package names) so INSTALL.txt and the" >&2
+  echo "launcher preflight tell the customer to install them." >&2
+  exit 1
+fi
+
 echo "Standalone Linux build completed: $dist_dir ($(du -sh "$dist_dir" | cut -f1))."
 echo "Executable: $dist_dir/mlp-training-studio"
+echo "X11 system libraries required at runtime: $(wc -l <"$declared") declared, all accounted for."

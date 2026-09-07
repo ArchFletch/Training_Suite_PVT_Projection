@@ -165,6 +165,37 @@ reject_key_material() {
   esac
 }
 
+# Documentation the recipient needs in their hands. The README used to point
+# engineers at `doc/customer/gui_install_run.md`, which is in the repo and not in
+# the delivery -- so the one instruction they were given named a file they did not
+# have. Docs are checksummed alongside the archives so the tree stays fully
+# accounted for.
+collect_doc() {
+  local recipient="$1"
+  local source_rel="$2"
+
+  local source_path="$repo_root/$source_rel"
+  local base; base="$(basename "$source_rel")"
+  local dest="$output_dir/$recipient/$base"
+  local rel="$recipient/$base"
+
+  reject_key_material "$base"
+
+  if [[ ! -f "$source_path" ]]; then
+    echo "Missing delivery document: $source_rel" >&2
+    exit 1
+  fi
+  mkdir -p "$output_dir/$recipient"
+  if ! cp "$source_path" "$dest"; then
+    echo "Failed to copy $source_rel into the delivery tree" >&2
+    exit 1
+  fi
+  local digest; digest="$(sha256_of "$dest")"
+  checksum_lines+="$digest  $rel"$'\n'
+  accounted_rels+="$rel"$'\n'
+  printf '  INCLUDED %s\n' "$rel"
+}
+
 collect() {
   local recipient="$1"
   local label="$2"
@@ -285,7 +316,9 @@ printf '\n'
 readme_line "## engineers-gui/"
 readme_line ""
 readme_line "Goes to the design engineers who run the desktop app, one file per platform."
-readme_line "Install and first-run notes for them are in \`doc/customer/gui_install_run.md\`."
+readme_line "Install and first-run notes for them are in \`engineers-gui/gui_install_run.md\`,"
+readme_line "included in this delivery. The Linux bundle's own \`INSTALL.txt\` additionally lists"
+readme_line "the X11 system libraries a stock desktop may be missing."
 readme_line "The app needs the license server below to be running before it can take a seat."
 readme_line ""
 
@@ -302,6 +335,8 @@ collect "engineers-gui" "Linux desktop bundle" \
   'bash packaging/linux/build_gui.sh
 bash packaging/linux/build_bundle.sh --standalone-dir <deployment directory reported by build_gui.sh>' \
   'Linux host, a Python with the GUI dependencies, PySide6 (pyside6-deploy), Nuitka'
+
+collect_doc "engineers-gui" "doc/customer/gui_install_run.md"
 
 readme_line "## server-admin/"
 readme_line ""

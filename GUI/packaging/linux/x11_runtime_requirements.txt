@@ -1,0 +1,48 @@
+# System libraries the Linux bundle expects from the host, with the packages that
+# provide them. Single source of truth: packaging/linux/build_gui.sh checks the
+# built dist's Qt xcb plugin chain against this list and fails the build when it
+# needs something not listed here, and build_bundle.sh renders both INSTALL.txt
+# and the launcher's preflight check from it.
+#
+# Why these are not bundled: libGL/libEGL/libX11 must come from the host's own
+# graphics stack, and the xcb helpers are only safe to mix with the host's
+# libxcb.so.1. Note xcb-util-cursor is EPEL-only on RHEL 8, so bundling it would
+# add an EPEL build dependency for every build.
+#
+# Format: <soname> <debian-package> <rhel-package> <required|optional>
+#
+# Qt's own diagnostic here is actively misleading: a missing libxcb-icccm or
+# libxcb-keysyms makes it print "From 6.5.0, xcb-cursor0 or libxcb-cursor0 is
+# needed", naming the wrong library. Only QT_DEBUG_PLUGINS=1 shows the real one,
+# which is why the launcher checks these itself and names the right package.
+#
+# This whole class is invisible on a Wayland desktop: Qt silently falls back to
+# the wayland plugin and the app works. It only breaks in an X11 session, which
+# is the default in plenty of enterprise environments.
+libxcb-icccm.so.4        libxcb-icccm4        xcb-util-wm          required
+libxcb-keysyms.so.1      libxcb-keysyms1      xcb-util-keysyms     required
+libxcb-image.so.0        libxcb-image0        xcb-util-image       required
+libxcb-render-util.so.0  libxcb-render-util0  xcb-util-renderutil  required
+libxcb-util.so.1         libxcb-util1         xcb-util             required
+libxcb-cursor.so.0       libxcb-cursor0       xcb-util-cursor      required
+libxkbcommon-x11.so.0    libxkbcommon-x11-0   libxkbcommon-x11     required
+libxcb-xkb.so.1          libxcb-xkb1          libxcb              required
+libxcb-randr.so.0        libxcb-randr0        libxcb              required
+libxcb-shape.so.0        libxcb-shape0        libxcb              required
+libxcb-shm.so.0          libxcb-shm0          libxcb              required
+libxcb-sync.so.1         libxcb-sync1         libxcb              required
+libxcb-xfixes.so.0       libxcb-xfixes0       libxcb              required
+libxcb-render.so.0       libxcb-render0       libxcb              required
+libxcb.so.1              libxcb1              libxcb              required
+libX11.so.6              libx11-6             libX11              required
+libX11-xcb.so.1          libx11-xcb1          libX11              required
+libxkbcommon.so.0        libxkbcommon0        libxkbcommon        required
+libfontconfig.so.1       libfontconfig1       fontconfig          required
+libfreetype.so.6         libfreetype6         freetype            required
+libglib-2.0.so.0         libglib2.0-0         glib2               required
+libgthread-2.0.so.0      libglib2.0-0         glib2               required
+libdbus-1.so.3           libdbus-1-3          dbus-libs           required
+libz.so.1                zlib1g               zlib                required
+libzstd.so.1             libzstd1             libzstd             required
+libGL.so.1               libgl1               mesa-libGL          required
+libEGL.so.1              libegl1              mesa-libEGL         optional

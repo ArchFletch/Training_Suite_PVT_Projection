@@ -247,6 +247,26 @@ class LicenseServerRepository:
         ).fetchall()
         return [self._row_to_lease(row) for row in rows]
 
+    def get_active_lease_for_machine(
+        self, connection: sqlite3.Connection, *, machine_id: str, now: str
+    ) -> LeaseRecord | None:
+        """The live lease this machine already holds, if any.
+
+        A floating seat is per machine, not per process: without this lookup a
+        second GUI window on one workstation took a second seat and could lock a
+        colleague out of a small licence.
+        """
+        row = connection.execute(
+            """
+            SELECT * FROM seat_leases
+            WHERE machine_id = ? AND released_at IS NULL AND expires_at > ?
+            ORDER BY checked_out_at DESC, lease_id DESC
+            LIMIT 1
+            """,
+            (machine_id, now),
+        ).fetchone()
+        return self._row_to_lease(row) if row is not None else None
+
     def count_active_leases(self, connection: sqlite3.Connection, *, now: str) -> int:
         row = connection.execute(
             """

@@ -287,3 +287,118 @@ def test_release_rejects_an_unknown_lease(runtime) -> None:
 
     assert missing.ok is False
     assert missing.reason_code == "invalid_lease"
+
+
+def _audit_events(server_runtime) -> list[dict]:
+    import json as _json
+
+    with server_runtime.session_factory.session() as connection:
+        rows = connection.execute(
+            "SELECT event_type, details_json FROM audit_events ORDER BY id"
+        ).fetchall()
+    return [{"event_type": r["event_type"], **_json.loads(r["details_json"])} for r in rows]
+
+
+def test_a_second_checkout_from_one_machine_reuses_its_seat(runtime, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A floating seat is per machine, not per process. Two GUI windows on one
+    workstation used to take two seats, so one engineer could lock a colleague out
+    of a two-seat licence."""
+    server_runtime = runtime["runtime"]
+    monkeypatch.setattr("license_server.services.license_service.utc_now", lambda: _utc(2026, 3, 13, 12, 5, 0))
+    server_runtime.license_service.import_license(
+        _make_signed_license(
+            runtime, seat_count=2, starts_at=_utc(2026, 3, 13), ends_at=_utc(2026, 4, 13), license_id="lic_two_seats"
+        )
+    )
+    monkeypatch.setattr("license_server.services.lease_service.utc_now", lambda: _utc(2026, 3, 13, 12, 10, 0))
+
+    first = server_runtime.lease_service.checkout(_checkout_request("gui_same", "eda-win-17"))
+    second = server_runtime.lease_service.checkout(_checkout_request("gui_same", "eda-win-17"))
+
+    assert first.granted is True and second.granted is True
+    assert second.lease_id == first.lease_id, "a second window took a second lease"
+    assert second.seats_in_use == 1
+
+    # A genuinely different machine still consumes the second seat.
+    other = server_runtime.lease_service.checkout(_checkout_request("gui_other", "eda-win-18"))
+    assert other.granted is True
+    assert other.lease_id != first.lease_id
+    assert other.seats_in_use == 2
+
+    # And the third machine is refused, so dedup did not inflate the seat pool.
+    third = server_runtime.lease_service.checkout(_checkout_request("gui_third", "eda-win-19"))
+    assert third.granted is False and third.reason_code == "all_seats_in_use"
+
+    reused = [e for e in _audit_events(server_runtime) if e["event_type"] == "checkout_reused"]
+    assert len(reused) == 1 and reused[0]["machine_id"] == "gui_same"
+
+
+def test_reusing_a_seat_extends_the_lease_rather_than_leaving_it_to_expire(
+    runtime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server_runtime = runtime["runtime"]
+    monkeypatch.setattr("license_server.services.license_service.utc_now", lambda: _utc(2026, 3, 13, 12, 5, 0))
+    server_runtime.license_service.import_license(
+        _make_signed_license(
+            runtime, seat_count=2, starts_at=_utc(2026, 3, 13), ends_at=_utc(2026, 4, 13), license_id="lic_renew"
+        )
+    )
+    monkeypatch.setattr("license_server.services.lease_service.utc_now", lambda: _utc(2026, 3, 13, 12, 10, 0))
+    first = server_runtime.lease_service.checkout(_checkout_request("gui_same", "eda-win-17"))
+
+    # Still inside the 120 s lease TTL: the same machine must get the SAME lease
+    # back, with its expiry pushed out. (Past the TTL a fresh lease is correct,
+    # which the heartbeat-timeout test already covers.)
+    monkeypatch.setattr("license_server.services.lease_service.utc_now", lambda: _utc(2026, 3, 13, 12, 11, 0))
+    again = server_runtime.lease_service.checkout(_checkout_request("gui_same", "eda-win-17"))
+
+    assert again.lease_id == first.lease_id
+    assert again.expires_at > first.expires_at, "the reused lease kept its old expiry"
+
+
+@pytest.mark.parametrize(
+    "reason_code, requested_feature, license_window",
+    [
+        ("feature_not_enabled", "quantum_solver", (_utc(2026, 3, 13), _utc(2026, 4, 13))),
+        ("license_expired", None, (_utc(2026, 1, 1), _utc(2026, 2, 1))),
+        ("license_not_started", None, (_utc(2026, 6, 1), _utc(2026, 7, 1))),
+    ],
+)
+def test_license_layer_refusals_are_written_to_the_audit_log(
+    runtime, monkeypatch: pytest.MonkeyPatch, reason_code, requested_feature, license_window
+) -> None:
+    """validate_checkout returned these straight to the caller and wrote nothing, so
+    an audit could not answer 'who was turned away, and why'. Only all_seats_in_use
+    was ever recorded."""
+    server_runtime = runtime["runtime"]
+    monkeypatch.setattr("license_server.services.license_service.utc_now", lambda: _utc(2026, 3, 13, 12, 5, 0))
+    starts_at, ends_at = license_window
+    server_runtime.license_service.import_license(
+        _make_signed_license(
+            runtime, seat_count=2, starts_at=starts_at, ends_at=ends_at, license_id=f"lic_{reason_code}"
+        )
+    )
+    monkeypatch.setattr("license_server.services.lease_service.utc_now", lambda: _utc(2026, 3, 13, 12, 10, 0))
+
+    request = _checkout_request("gui_denied", "eda-win-17")
+    if requested_feature is not None:
+        request = request.model_copy(update={"requested_feature": requested_feature})
+    denied = server_runtime.lease_service.checkout(request)
+
+    assert denied.granted is False and denied.reason_code == reason_code
+    recorded = [e for e in _audit_events(server_runtime) if e["event_type"] == "checkout_denied"]
+    assert len(recorded) == 1, f"{reason_code} left no audit trail"
+    assert recorded[0]["reason_code"] == reason_code
+    assert recorded[0]["machine_id"] == "gui_denied"
+    assert recorded[0]["requested_feature"] == requested_feature
+
+
+def test_a_checkout_with_no_license_at_all_is_audited(runtime, monkeypatch: pytest.MonkeyPatch) -> None:
+    server_runtime = runtime["runtime"]
+    monkeypatch.setattr("license_server.services.lease_service.utc_now", lambda: _utc(2026, 3, 13, 12, 10, 0))
+
+    denied = server_runtime.lease_service.checkout(_checkout_request("gui_nolic", "eda-win-17"))
+
+    assert denied.granted is False and denied.reason_code == "invalid_license"
+    recorded = [e for e in _audit_events(server_runtime) if e["event_type"] == "checkout_denied"]
+    assert len(recorded) == 1 and recorded[0]["reason_code"] == "invalid_license"
