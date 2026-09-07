@@ -10,8 +10,9 @@ This exporter wraps the network so the exported graph is end-to-end:
     raw design parameters  ->  [normalize] -> network -> [denormalize] -> physical curves
 
 so MATLAB only has to call ``predict`` -- no pre/post math on the MATLAB side.  A
-sidecar ``<out>.meta.json`` records the input feature order, channel names/units, and
-the frequency axis so the MATLAB demo can label and reshape the output.
+sidecar named after it -- ``model.onnx`` gets ``model.meta.json``, the extension is
+replaced and not appended -- records the input feature order, channel names/units,
+and the frequency axis so the MATLAB demo can label and reshape the output.
 
 Run it from the ``GUI`` directory (where ``xfmr_v2`` is importable)::
 
@@ -249,7 +250,10 @@ def export_checkpoint_to_onnx(
     check: bool = False,
     cache_path: str | Path | None = None,
 ) -> Path:
-    """Export ``checkpoint_path`` to ONNX and write a ``<out>.meta.json`` sidecar.
+    """Export ``checkpoint_path`` to ONNX and write its sidecar.
+
+    The sidecar replaces the ``.onnx`` extension rather than appending to it:
+    ``model.onnx`` is written alongside ``model.meta.json``.
 
     ``cache_path`` is only consulted for checkpoints that predate saved axis
     metadata (see ``_resolve_axis_metadata``). Returns the path to the ``.onnx``.
@@ -367,7 +371,8 @@ def export_transfer_to_onnx(
     embed their own normalization stats, model type, channel names, and frequency axis,
     so no baseline is needed. Older runs that were seeded from a baseline resolve those
     from the baseline (via the transfer ``summary.json``'s ``base_run_dir``, or an
-    explicit ``baseline_checkpoint``). Writes ``<out>.onnx`` + ``<out>.meta.json``; the
+    explicit ``baseline_checkpoint``). Writes ``<out>.onnx`` and, beside it, the same
+    name with ``.meta.json`` in place of ``.onnx``; the
     output contract matches the baseline exporter, so the same MATLAB loader works.
     """
     transfer_run_dir = Path(transfer_run_dir)
