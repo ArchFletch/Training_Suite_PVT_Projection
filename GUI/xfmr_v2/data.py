@@ -33,6 +33,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
+from .atomic_json import dumps_json
 from .dataset_schema import DatasetSchema, Ground_TruthSchema, InputFeatureSchema
 from .progress import request_stop
 
@@ -231,7 +232,7 @@ def _save_cache(
         "num_channels": int(targets.shape[1]),
         "num_frequencies": int(targets.shape[2]),
     }
-    meta_path.write_text(json.dumps(summary, indent=2))
+    meta_path.write_text(dumps_json(summary))
     return summary
 
 

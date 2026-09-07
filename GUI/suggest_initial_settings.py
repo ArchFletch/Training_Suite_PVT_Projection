@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 
+from xfmr_v2.atomic_json import dumps_json
 from xfmr_v2.suggest import SuggestConfig, suggest_initial_settings
 
 
@@ -71,7 +72,7 @@ def main() -> None:
             variance_threshold=args.variance_threshold,
         )
     )
-    print(json.dumps(summary, indent=2))
+    print(dumps_json(summary))
 
 
 if __name__ == "__main__":

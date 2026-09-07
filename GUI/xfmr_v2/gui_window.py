@@ -1602,6 +1602,8 @@ class MlpTrainingStudio(QMainWindow):
 
     def _on_training_workflow_completed(self, result: dict[str, Any]) -> None:
         self.last_workflow_summary = result
+        for message in result.get("run_warnings", []):
+            self.append_log(f"[Run] {message}")
         status = result.get("status", "ok")
         if status == "stopped":
             self.run_state_badge.set_status("Stopped")
@@ -1615,6 +1617,14 @@ class MlpTrainingStudio(QMainWindow):
             self.last_baseline_summary = baseline
             self._apply_baseline_summary(baseline)
             self.append_log(f"Baseline run saved to {baseline['run_dir']}")
+            skipped = baseline.get("skipped_projection_columns") or []
+            if skipped:
+                # The picker still shows these ticked, so say plainly what the model
+                # actually got rather than leaving the UI contradicting the artifacts.
+                self.append_log(
+                    f"Note: corner column(s) {skipped} are constant in this training split and were "
+                    f"not embedded. The model projects {baseline.get('effective_projection_columns') or []}."
+                )
             if baseline.get("test_sample_data"):
                 self._populate_test_sample_plots(baseline)
             self.append_log("Baseline training completed.")

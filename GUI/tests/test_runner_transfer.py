@@ -7,6 +7,8 @@ the GUI and summaries depend on.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from time import perf_counter
 
 import pytest
@@ -787,3 +789,81 @@ def test_train_baseline_refuses_zero_epochs() -> None:
 
     with pytest.raises(ValueError, match="epochs must be at least 1"):
         runner.train_baseline(runner.TrainConfig(epochs=0, cache_path="/nonexistent/cache.npz"))
+
+
+def _pvt_cache_with_a_constant_corner(path, num_designs: int = 12):
+    """A cache whose MN corner column varies but whose Temp_C is constant."""
+    import numpy as np
+
+    from xfmr_v2.data import _save_cache
+
+    rows, names = [], ["geom_a", "geom_b", "MN", "Temp_C"]
+    for design in range(num_designs):
+        for mn in (0.0, 1.0):
+            rows.append([float(design), float(design) * 0.5, mn, 27.0])  # Temp_C never varies
+    features = np.asarray(rows, dtype=np.float32)
+    rng = np.random.default_rng(0)
+    targets = rng.standard_normal((len(rows), 2, 4)).astype(np.float32)
+    _save_cache(
+        path, dataset_root=path.parent, dataset_name="pvt", features=features, targets=targets,
+        frequency_hz=np.linspace(1e9, 4e9, 4).astype(np.float32), feature_names=names,
+        channel_names=["gain", "phase"], target_names=["gain", "phase"],
+        channel_units=["dB", "deg"], channel_transforms=["", ""], sweep_label="Frequency (GHz)",
+    )
+
+
+def test_a_constant_corner_column_is_recorded_as_skipped_not_silently_dropped(tmp_path) -> None:
+    """The run used to claim both columns in summary.json and best_model.pt while the
+    network embedded only one, and the ONNX sidecar (which re-resolves) disagreed with
+    both. All three must now describe the same model."""
+    import json as _json
+    import warnings as _warnings
+    from pathlib import Path
+
+    import torch as _torch
+
+    cache_path = tmp_path / "pvt_cache.npz"
+    _pvt_cache_with_a_constant_corner(cache_path)
+
+    with _warnings.catch_warnings(record=True) as caught:
+        _warnings.simplefilter("always")
+        summary = runner.train_baseline(
+            runner.TrainConfig(
+                cache_path=str(cache_path), output_dir=str(tmp_path / "runs"),
+                model_type="SpectraHydraProj", projection_columns=["MN", "Temp_C"], projection_dim=4,
+                width=8, depth=2, epochs=1, batch_size=8, use_amp=False, device="cpu",
+            ),
+            show_progress=False,
+        )
+
+    assert any("constant in this training split" in str(w.message) for w in caught)
+    assert summary["effective_projection_columns"] == ["MN"]
+    assert summary["skipped_projection_columns"] == ["Temp_C"]
+
+    saved = _json.loads((Path(summary["run_dir"]) / "summary.json").read_text())
+    assert saved["effective_projection_columns"] == ["MN"]
+    # What was REQUESTED is still recorded, so the run stays reproducible.
+    assert saved["config"]["projection_columns"] == ["MN", "Temp_C"]
+
+    checkpoint = _torch.load(Path(summary["run_dir"]) / "best_model.pt", map_location="cpu", weights_only=False)
+    assert checkpoint["effective_projection_columns"] == ["MN"]
+
+
+def test_summary_json_is_valid_json_even_when_a_metric_diverged(tmp_path, monkeypatch) -> None:
+    """best_val_loss stays inf when nothing beats the initial best; the artifact must
+    still parse."""
+    import json as _json
+
+    cache_path = tmp_path / "pvt_cache.npz"
+    _write_pvt_cache(cache_path)
+    summary = runner.train_baseline(
+        runner.TrainConfig(
+            cache_path=str(cache_path), output_dir=str(tmp_path / "runs"),
+            width=8, depth=2, epochs=1, batch_size=8, use_amp=False, device="cpu",
+        ),
+        show_progress=False,
+    )
+    text = (Path(summary["run_dir"]) / "summary.json").read_text()
+    assert "Infinity" not in text and "NaN" not in text
+    _json.loads(text)
+    _json.loads((Path(summary["run_dir"]) / "history.json").read_text())

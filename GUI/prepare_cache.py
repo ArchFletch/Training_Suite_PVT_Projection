@@ -14,6 +14,7 @@ import argparse
 import json
 from pathlib import Path
 
+from xfmr_v2.atomic_json import json_safe
 from xfmr_v2.data import CACHE_PATH, build_cache_from_dataset, load_existing_cache
 
 
@@ -47,7 +48,7 @@ def main() -> None:
 
     # Print a machine-readable summary so shell users, tests, and GUI wrappers can
     # all consume the same output format.
-    print(json.dumps(summary, indent=2, default=str))
+    print(json.dumps(json_safe(summary), indent=2, default=str, allow_nan=False))
 
 
 if __name__ == "__main__":

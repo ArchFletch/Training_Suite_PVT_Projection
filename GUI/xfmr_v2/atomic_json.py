@@ -8,10 +8,36 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import tempfile
 from pathlib import Path
 from typing import Any
+
+
+def json_safe(value: Any) -> Any:
+    """Replace non-finite floats with None so the result is valid JSON.
+
+    ``json.dumps`` emits the bare tokens ``NaN``, ``Infinity`` and ``-Infinity``
+    for those values. RFC 8259 has no such literals: Python's own strict parser
+    rejects them, and jq silently reads Infinity as 1.797e308 -- so a "pick the
+    best run by best_val_loss" script scores a diverged run as a finite loss
+    instead of failing. A diverged or untrained metric is genuinely "no value",
+    which is what null means.
+    """
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    return value
+
+
+def dumps_json(payload: Any, *, indent: int = 2) -> str:
+    """``json.dumps`` that cannot emit NaN/Infinity (see :func:`json_safe`)."""
+
+    return json.dumps(json_safe(payload), indent=indent, allow_nan=False)
 
 
 def write_json_atomically(path: str | Path, payload: Any) -> Path:
@@ -25,7 +51,7 @@ def write_json_atomically(path: str | Path, payload: Any) -> Path:
     """
 
     # Serialize first so an unserializable payload fails before the filesystem is touched.
-    text = json.dumps(payload, indent=2)
+    text = dumps_json(payload)
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     # Same directory as the target: os.replace is only atomic within one filesystem.

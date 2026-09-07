@@ -10,6 +10,7 @@ import argparse
 from pathlib import Path
 import json
 
+from xfmr_v2.atomic_json import dumps_json
 from xfmr_v2.data import CACHE_PATH
 from xfmr_v2.runner import TransferConfig, open_in_vscode, run_self_transfer
 
@@ -119,7 +120,7 @@ def main() -> None:
                 summary["final_average_mae_plot_path"],
             ]
         )
-    print(json.dumps(summary, indent=2))
+    print(dumps_json(summary))
 
 
 if __name__ == "__main__":

@@ -34,6 +34,7 @@ import numpy as np
 import torch
 from torch import nn
 
+from .atomic_json import dumps_json
 from .runner import build_model, resolve_projection_kwargs
 
 
@@ -342,7 +343,7 @@ def export_checkpoint_to_onnx(
         sidecar["projection_corner_indices"] = list(projection_kwargs["corner_indices"])
         sidecar["projection_dim"] = int(projection_kwargs["projection_dim"])
     meta_path = out_path.with_suffix(".meta.json")
-    meta_path.write_text(json.dumps(sidecar, indent=2))
+    meta_path.write_text(dumps_json(sidecar))
 
     if check:
         _verify(wrapper, str(out_path), len(active_names))
@@ -488,7 +489,7 @@ def export_transfer_to_onnx(
         sidecar["projection_columns"] = [active_names[i] for i in corner_indices]
         sidecar["projection_corner_indices"] = corner_indices
         sidecar["projection_dim"] = int(model_kwargs.get("projection_dim", 16))
-    out_path.with_suffix(".meta.json").write_text(json.dumps(sidecar, indent=2))
+    out_path.with_suffix(".meta.json").write_text(dumps_json(sidecar))
 
     if check:
         _verify(wrapper, str(out_path), len(active_names))

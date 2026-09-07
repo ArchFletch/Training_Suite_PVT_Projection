@@ -22,6 +22,7 @@ import argparse
 import json
 from dataclasses import asdict, fields
 
+from xfmr_v2.atomic_json import dumps_json
 from xfmr_v2.data import CACHE_PATH, DATA_ROOT
 from xfmr_v2.runner import (
     LOSS_FUNCTIONS,
@@ -210,7 +211,7 @@ def main() -> None:
         ]
         if plot_paths:
             open_in_vscode(plot_paths)
-    print(json.dumps(summary, indent=2))
+    print(dumps_json(summary))
 
 
 if __name__ == "__main__":

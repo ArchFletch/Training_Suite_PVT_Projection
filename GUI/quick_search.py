@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 
+from xfmr_v2.atomic_json import dumps_json
 from xfmr_v2.search import SearchConfig, quick_hyperparameter_search
 
 
@@ -112,7 +113,7 @@ def main() -> None:
         ),
         show_progress=True,
     )
-    print(json.dumps(_cli_summary(summary), indent=2))
+    print(dumps_json(_cli_summary(summary)))
 
 
 def _cli_summary(summary: dict) -> dict:

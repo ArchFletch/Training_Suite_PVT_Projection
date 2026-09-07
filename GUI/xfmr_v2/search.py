@@ -18,6 +18,7 @@ from itertools import product
 from pathlib import Path
 from typing import Any
 
+from .atomic_json import dumps_json
 from .data import CACHE_PATH, DATA_ROOT
 from .progress import ProgressCallback, StopChecker, emit_progress, request_stop
 from .runner import TrainConfig, canonical_model_type, make_run_dir, run_baseline_trial
@@ -302,9 +303,9 @@ def _build_search_summary(
         },
     }
 
-    (run_dir / "suggestion.json").write_text(json.dumps(suggestion, indent=2))
-    (run_dir / "trial_results.json").write_text(json.dumps(ranked_trials, indent=2))
-    (run_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+    (run_dir / "suggestion.json").write_text(dumps_json(suggestion))
+    (run_dir / "trial_results.json").write_text(dumps_json(ranked_trials))
+    (run_dir / "summary.json").write_text(dumps_json(summary))
     return {
         **summary,
         "trial_results": ranked_trials,

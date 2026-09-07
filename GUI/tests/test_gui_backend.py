@@ -255,3 +255,28 @@ def test_an_unserializable_payload_touches_nothing_on_disk(tmp_path: Path) -> No
 
     assert not target.parent.exists()
 
+
+def test_written_json_can_never_contain_nan_or_infinity(tmp_path: Path) -> None:
+    """json.dumps emits the bare tokens NaN/Infinity, which RFC 8259 has no
+    literals for: Python's strict parser rejects them and jq reads Infinity as
+    1.797e308, so a "best run by best_val_loss" script scores a diverged run as a
+    finite loss. A diverged metric is written as null instead."""
+    target = tmp_path / "summary.json"
+    atomic_json.write_json_atomically(
+        target,
+        {"best_val_loss": float("inf"), "test_loss": float("nan"),
+         "history": [{"val": float("-inf")}, {"val": 0.25}], "run": "x"},
+    )
+    text = target.read_text(encoding="utf-8")
+
+    assert "Infinity" not in text and "NaN" not in text
+    reloaded = json.loads(text)  # strict: would raise on the bare tokens
+    assert reloaded["best_val_loss"] is None
+    assert reloaded["test_loss"] is None
+    assert reloaded["history"] == [{"val": None}, {"val": 0.25}]
+    assert reloaded["run"] == "x"
+
+
+def test_dumps_json_matches_json_dumps_for_ordinary_payloads() -> None:
+    payload = {"a": 1, "b": [1.5, "x", None, True], "c": {"d": 0.0}}
+    assert json.loads(atomic_json.dumps_json(payload)) == payload
