@@ -53,6 +53,10 @@ eval_license.json
 paid_license.json
 license_vendor_issuance_log.jsonl
 issuance_log.jsonl
+# The customer's request is not secret the way the signing key is, but it carries
+# their server_id, host fingerprint and hostname, and license_vendor/README.md has
+# the operator running issue-eval against it from whatever directory they are in.
+license_request.json
 
 # Claude Code
 .claude/
