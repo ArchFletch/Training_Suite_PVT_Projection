@@ -53,6 +53,22 @@ pyqtgraph>=0.13
 #
 # The observed-good 2.13.0+cu130 above carries a +cu130 local version tag,
 # which indicates it came from that CUDA index and not from default PyPI.
+#
+# GPU ARCHITECTURE, for anyone building a bundle to ship: the wheel decides which
+# GPUs work, and a wheel that is too old fails at RUN time, not build time. A
+# cu121 wheel supports sm_50 through sm_90 and prints, on every launch on an RTX
+# 50-series card:
+#
+#     NVIDIA GeForce RTX 5070 Ti with CUDA capability sm_120 is not compatible
+#     with the current PyTorch installation.
+#
+# and then trains on the CPU. Blackwell (sm_120) needs a CUDA 12.8-or-newer
+# build, so build the shippable bundle against a cu128+ index:
+#
+#     pip install torch --index-url https://download.pytorch.org/whl/cu128
+#
+# Check before building, not after: `python -c "import torch;
+# print(torch.cuda.get_arch_list())"` must list sm_120.
 torch>=2.3
 
 # Imported inside the plot helpers rather than at module scope, so grepping the

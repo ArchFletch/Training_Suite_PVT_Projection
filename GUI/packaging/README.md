@@ -31,6 +31,49 @@ This folder contains the proposed desktop packaging flow for the PySide6 GUI.
 - Windows installer builds additionally need Inno Setup 6
 - `assemble_delivery.sh` needs only `bash`, `install`, `find` and `sha256sum` (or `shasum`)
 
+### Build environment pins that are not in `requirements.txt`
+
+`requirements.txt` states runtime floors for people working from a checkout. A
+build environment needs two extra constraints that only matter to Nuitka and to
+the customer's hardware; `build_gui.sh` checks both and refuses rather than
+producing a broken bundle:
+
+- **`numpy==2.3.4`.** numpy 2.5.3 uses PEP 695 generic type aliases
+  (`type Name[T] = ...`), which Nuitka 2.7.11 cannot parse. It does not name the
+  file --- it aborts with `AssertionError: [<ast.TypeVar object ...>]` from
+  `buildTypeAliasNode`, and `pyside6-deploy` re-raises that as a
+  `CalledProcessError`. Either pin numpy below 2.5 or raise the Nuitka pin in
+  `packaging/gui/pysidedeploy.spec.in` and re-rehearse the build.
+- **The torch wheel decides which GPUs work,** and a wheel that is too old fails
+  at run time, not build time: the app prints `CUDA capability sm_NNN is not
+  compatible with the current PyTorch installation` on every launch and trains on
+  the CPU. `build_gui.sh` prints the bundled architecture list, and
+  `MLP_REQUIRE_GPU_ARCH=sm_120` turns that into a hard gate.
+
+Build the environment from `requirements.txt` and nothing else. A venv that
+borrows a larger environment's `site-packages` --- a `.pth` pointing at another
+env, or `--system-site-packages` --- makes Nuitka follow imports into whatever
+else is installed there, and unrelated third-party material ends up in a
+customer artifact. That is how gRPC root certificates came to be in a shipped
+GUI bundle.
+
+### Two Linux GUI bundles
+
+No single PyTorch wheel covers both Pascal/Volta and Blackwell, so the Linux
+delivery carries one bundle per wheel. They are the same application, extract to
+the same directory, and share the launcher and desktop entry --- only the
+archive filename and the bundled torch differ, which is what `--tarball-name`
+on `build_bundle.sh` is for.
+
+| Output directory | Torch | Architectures |
+| --- | --- | --- |
+| `artifacts/packaging/linux-cu128` | cu128 | sm_75 - sm_120 (Turing to Blackwell) |
+| `artifacts/packaging/linux-cu121` | 2.5.1+cu121 | sm_50 - sm_90 (Maxwell to Hopper) |
+
+The two builds cannot run in parallel: `pyside6-deploy` uses one `deployment/`
+directory next to the project root, so run them in sequence and `rm -rf
+deployment` in between.
+
 ## Customer Delivery
 
 The GUI and license server builds each write into their own `artifacts/packaging/`

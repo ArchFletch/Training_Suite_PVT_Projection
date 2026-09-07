@@ -30,7 +30,8 @@ Thumbs.db
 /deployment/
 /gui_smoke_err.txt
 /gui_smoke_out.txt
-/nuitka-crash-report.xml
+# Nuitka writes this beside the project it compiles, which is GUI/, not the repo root.
+nuitka-crash-report.xml
 /runtime/
 
 # Vendor license issuance material.

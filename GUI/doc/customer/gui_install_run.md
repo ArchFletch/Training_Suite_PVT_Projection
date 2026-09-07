@@ -44,6 +44,80 @@ SurrogateModelTrainingSuite-Windows.exe /VERYSILENT /NORESTART
 
 Writable files are not stored in the extracted bundle directory.
 
+### Linux System Prerequisites (X11 sessions)
+
+The bundle ships its own Python, Qt and PyTorch, but Qt's X11 platform plugin
+loads these from the host. Install them before the first launch:
+
+```bash
+# Debian / Ubuntu
+sudo apt update
+sudo apt install -y \
+  libdbus-1-3 \
+  libfontconfig1 \
+  libfreetype6 \
+  libgl1 \
+  libglib2.0-0 \
+  libx11-6 \
+  libx11-xcb1 \
+  libxcb-cursor0 \
+  libxcb-icccm4 \
+  libxcb-image0 \
+  libxcb-keysyms1 \
+  libxcb-randr0 \
+  libxcb-render-util0 \
+  libxcb-render0 \
+  libxcb-shape0 \
+  libxcb-shm0 \
+  libxcb-sync1 \
+  libxcb-util1 \
+  libxcb-xfixes0 \
+  libxcb-xkb1 \
+  libxcb1 \
+  libxkbcommon-x11-0 \
+  libxkbcommon0 \
+  libzstd1 \
+  zlib1g
+```
+
+```bash
+# RHEL / Rocky 8 -- xcb-util-cursor is in EPEL
+sudo dnf install -y epel-release
+sudo dnf install -y \
+  dbus-libs \
+  fontconfig \
+  freetype \
+  glib2 \
+  libX11 \
+  libxcb \
+  libxkbcommon \
+  libxkbcommon-x11 \
+  libzstd \
+  mesa-libGL \
+  xcb-util \
+  xcb-util-cursor \
+  xcb-util-image \
+  xcb-util-keysyms \
+  xcb-util-renderutil \
+  xcb-util-wm \
+  zlib
+```
+
+Two things worth knowing before diagnosing a launch failure:
+
+- **A Wayland session uses none of these.** Qt falls back to its own Wayland
+  plugin, so the app starts on a desktop that has none of the `libxcb-*`
+  helpers installed. The failure only appears in an X11 session, which is why a
+  host that works for one engineer can fail for another.
+- **Qt names the wrong library.** A missing `libxcb-icccm` or `libxcb-keysyms`
+  makes Qt print `From 6.5.0, xcb-cursor0 or libxcb-cursor0 is needed`, which
+  sends you after a package that is already installed. The launcher checks the
+  full list itself and names the real one; trust the launcher's list. To skip
+  that check, set `MLP_SKIP_LIBRARY_CHECK=1`.
+
+The same list, with the soname each package provides, is in the bundle's own
+`INSTALL.txt` and in `packaging/linux/x11_runtime_requirements.txt`.
+
 ### Linux User Data Locations
 
 - license server settings: `~/.config/mlp-training-studio/license_client.json`

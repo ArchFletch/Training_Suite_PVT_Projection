@@ -7,3 +7,7 @@ Exec=__INSTALL_ROOT__/bin/mlp-training-studio
 Terminal=false
 StartupNotify=true
 Categories=Science;Engineering;
+# Ties the running window to this entry, so the taskbar shows this icon and this
+# name instead of a generic one. It must match QApplication.setDesktopFileName()
+# in xfmr_v2.gui_window, which is what Qt puts in WM_CLASS / the Wayland app_id.
+StartupWMClass=mlp-training-studio

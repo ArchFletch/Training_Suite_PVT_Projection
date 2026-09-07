@@ -4,8 +4,21 @@ This bundle is the complete Linux delivery: the application package, the
 `systemd` install script with its templates, and the sample config. It is not a
 source checkout and it carries no license signing tooling.
 
-Requirements: a `systemd` host (Ubuntu 22.04/24.04 or equivalent), Python 3.12,
-and `python3-venv`. Run the install from an account that can `sudo`.
+Requirements: a `systemd` host, **Python 3.11 or newer**, and `python3-venv`.
+Run the install from an account that can `sudo`. Verified on Ubuntu 24.04
+(Python 3.12) and Ubuntu 26.04 (Python 3.14).
+
+Python 3.11 is a hard floor, not a preference: the service reads its config with
+`tomllib`, which arrived in 3.11 and has no fallback. On **Ubuntu 22.04** the
+default `python3` is 3.10, so the venv below has to be built with a newer
+interpreter installed alongside it:
+
+```bash
+sudo apt update
+sudo apt install -y python3.12 python3.12-venv
+```
+
+and every `python3` in step 3 becomes `python3.12`.
 
 ## 1. Extract the bundle
 
@@ -41,7 +54,17 @@ The listening port comes from the service command in
 
 ## 3. Stage the application and build its virtual environment
 
+`apt update` first. On a freshly provisioned host the package lists are empty,
+and without it all three of the commands below fail in sequence: `python3-venv`
+has no installation candidate, `venv` then reports `ensurepip is not available`,
+and the `pip` the next command calls was never created.
+
+Check the interpreter version first. A 3.10 `python3` builds a venv that
+installs every dependency without complaint and then fails at service start.
+
 ```bash
+python3 --version          # must be 3.11 or newer
+sudo apt update
 sudo apt install -y python3-venv
 sudo cp -rT ./license_server /opt/mlp-license-server/license_server
 sudo python3 -m venv /opt/mlp-license-server/.venv
@@ -49,15 +72,54 @@ sudo /opt/mlp-license-server/.venv/bin/pip install \
   -r /opt/mlp-license-server/license_server/requirements.txt
 ```
 
-Confirm the service account can import the package from the unit's working
-directory before involving systemd:
+Both lines below must print `ok` before you involve systemd. The second one is
+the one that matters: it imports the module the unit actually loads, so it fails
+if any of the five dependencies is missing.
 
 ```bash
 sudo -u mlp-license-server env -C /opt/mlp-license-server \
   /opt/mlp-license-server/.venv/bin/python -c "import license_server; print('ok')"
+sudo -u mlp-license-server env -C /opt/mlp-license-server \
+  /opt/mlp-license-server/.venv/bin/python -c "import license_server.main; print('ok')"
 ```
 
+`import license_server` on its own is not a sufficient check: `env -C` puts the
+staged package on the import path, so it resolves to
+`/opt/mlp-license-server/license_server/` and never touches the virtual
+environment's `site-packages`. It prints `ok` against an empty venv --- or no
+venv at all. A `ModuleNotFoundError: No module named 'fastapi'` from the second
+line means the `pip install` above did not run; re-run this step from
+`apt update`. `ModuleNotFoundError: No module named 'tomllib'` means the venv
+was built with Python 3.10 or older --- rebuild it with a 3.11+ interpreter as
+described at the top of this document.
+
 ## 4. Create the identity and export the license request
+
+**Settle the hostname and its DNS entry before you run `init`.** `init`
+computes a host fingerprint from the hostname, the OS family and
+`/etc/machine-id`, and stores it in `/var/lib/mlp-license-server/`. The stored
+value is what a license is checked against, so:
+
+- a rename after `init` does not stop the running server --- the stored
+  fingerprint is unchanged;
+- but if that directory is ever lost or the host is rebuilt, `init` recomputes
+  the fingerprint from the host **as it is then**. If the hostname or
+  `/etc/machine-id` has changed in the meantime, the existing license no longer
+  imports and has to be re-issued;
+- reinstalling the OS or cloning the VM changes `/etc/machine-id`, so it has the
+  same effect as a rename;
+- replacing the NIC, RAM or disk changes nothing --- the binding is to the
+  installed system, not the hardware.
+
+If this host is going to be renamed to something like `mlp-license-01`, or given
+its LAN DNS name, do that now and reboot before continuing. Settling it first
+means a later recovery reproduces the same fingerprint.
+
+**Back up `/var/lib/mlp-license-server/` once step 5 has finished.** It holds
+`server_id`, generated here and never regenerated, alongside the stored
+fingerprint. Losing that directory loses the identity the license was signed
+against, and recovery needs a new license request and a re-issued license ---
+the license file alone is not enough to restore it.
 
 Run every admin command as the service account: a root-created `license.db`
 leaves the service unable to write it, which presents as a successful activation
@@ -115,4 +177,8 @@ sudo ufw allow 27850/tcp          # Ubuntu / Debian
 sudo firewall-cmd --permanent --add-port=27850/tcp && sudo firewall-cmd --reload
 ```
 
-Share the LAN URL with engineers, for example `http://mlp-license-01:27850`.
+Share the LAN URL with engineers. It is built from this host's own name as
+settled in step 4 --- `http://<this-host>:27850`, for example
+`http://mlp-license-01:27850` if that is what the host is called. Do not rename
+the host to match an example: the name is part of the license binding by now,
+and changing it needs a re-issued license.

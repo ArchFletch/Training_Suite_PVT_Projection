@@ -33,6 +33,79 @@ fi
 
 mkdir -p "$output_dir"
 
+# The bundled torch decides which GPUs work, and a wheel that is too old fails at
+# RUN time -- every launch on the customer's card prints "CUDA capability sm_NNN
+# is not compatible with the current PyTorch installation" and the app then trains
+# on the CPU. A cu121 wheel shipped that way once. Report the arch list here, in
+# the build log, where there is still time to change the wheel.
+#
+# Advisory by default: a CPU-only bundle is a legitimate build. Set
+# MLP_REQUIRE_GPU_ARCH to the architecture a shippable bundle must cover
+# (MLP_REQUIRE_GPU_ARCH=sm_120 for RTX 50-series) to make it a hard gate.
+gpu_arch_list="$("$python_bin" -c 'import torch; print(" ".join(torch.cuda.get_arch_list()))' 2>/dev/null || true)"
+required_gpu_arch="${MLP_REQUIRE_GPU_ARCH:-}"
+if [[ -z "$gpu_arch_list" ]]; then
+  echo "NOTE: bundled torch reports no CUDA architectures -- this will be a CPU-only bundle." >&2
+else
+  echo "Bundled torch CUDA architectures: $gpu_arch_list" >&2
+fi
+if [[ -n "$required_gpu_arch" ]]; then
+  if [[ " $gpu_arch_list " != *" $required_gpu_arch "* ]]; then
+    echo "Refusing to build: MLP_REQUIRE_GPU_ARCH=$required_gpu_arch is not in the bundled torch." >&2
+    echo "  bundled: ${gpu_arch_list:-<none>}" >&2
+    echo "  install a matching wheel first, e.g. for sm_120 (Blackwell):" >&2
+    echo "    $python_bin -m pip install torch --index-url https://download.pytorch.org/whl/cu128" >&2
+    exit 1
+  fi
+  echo "Required GPU architecture $required_gpu_arch is present." >&2
+fi
+
+# Nuitka 2.7.11 cannot parse PEP 695 generic type aliases (`type Name[T] = ...`).
+# It does not report the file: it aborts with `AssertionError: [<ast.TypeVar
+# object ...>]` from buildTypeAliasNode, twenty frames deep in its own importer,
+# and pyside6-deploy then re-raises that as a CalledProcessError. numpy 2.5.3
+# introduced them in numpy/_typing/, which is enough to kill the whole build.
+# Find them here and name the file instead.
+pep695_report="$("$python_bin" - <<'PYEOF' || true
+import re, sys, importlib.util
+
+# The packages Nuitka is told to compile whole; those are the ones it parses.
+PACKAGES = ("numpy", "pyqtgraph", "torch", "matplotlib", "onnx", "onnxruntime", "onnxscript", "xfmr_v2")
+ALIAS = re.compile(r"^[ \t]*type[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*\[", re.M)
+
+for name in PACKAGES:
+    try:
+        spec = importlib.util.find_spec(name)
+    except Exception:
+        continue
+    if spec is None or not spec.submodule_search_locations:
+        continue
+    for root in spec.submodule_search_locations:
+        import pathlib
+        for path in pathlib.Path(root).rglob("*.py"):
+            if "/tests/" in str(path) or "/test/" in str(path):
+                continue  # Nuitka does not follow test trees into the bundle
+            try:
+                if ALIAS.search(path.read_text(encoding="utf-8", errors="ignore")):
+                    version = getattr(__import__(name), "__version__", "?")
+                    print(f"{name} {version}: {path}")
+                    break
+            except OSError:
+                continue
+        else:
+            continue
+        break
+PYEOF
+)"
+if [[ -n "$pep695_report" ]]; then
+  echo "Refusing to build: a package to be compiled uses PEP 695 type aliases, which the" >&2
+  echo "pinned Nuitka cannot parse. It would abort with a bare AssertionError naming no file." >&2
+  printf '  %s\n' "$pep695_report" >&2
+  echo "Pin that package lower in the build environment (numpy 2.3.4 is known good), or" >&2
+  echo "raise the Nuitka pin in packaging/gui/pysidedeploy.spec.in and re-rehearse the build." >&2
+  exit 1
+fi
+
 spec_template="$repo_root/packaging/gui/pysidedeploy.spec.in"
 spec_path="$output_dir/pysidedeploy.spec"
 input_file="$repo_root/launch_gui.py"

@@ -317,8 +317,10 @@ readme_line "## engineers-gui/"
 readme_line ""
 readme_line "Goes to the design engineers who run the desktop app, one file per platform."
 readme_line "Install and first-run notes for them are in \`engineers-gui/gui_install_run.md\`,"
-readme_line "included in this delivery. The Linux bundle's own \`INSTALL.txt\` additionally lists"
-readme_line "the X11 system libraries a stock desktop may be missing."
+readme_line "included in this delivery. On Linux, read its \"Linux System Prerequisites\" section"
+readme_line "before the first launch: an X11 desktop needs system libraries a stock install may"
+readme_line "not have, and Qt's own error names the wrong one. The same list is in the bundle's"
+readme_line "\`INSTALL.txt\`, and the launcher checks it and names what is actually missing."
 readme_line "The app needs the license server below to be running before it can take a seat."
 readme_line ""
 
@@ -330,11 +332,36 @@ collect "engineers-gui" "Windows desktop installer" \
 packaging\windows\build_installer.ps1 -StandaloneDir artifacts\packaging\windows\SurrogateModelTrainingSuite.dist' \
   'Windows host, PowerShell, a Python with the GUI dependencies, PySide6, Nuitka, Inno Setup 6'
 
-collect "engineers-gui" "Linux desktop bundle" \
-  "artifacts/packaging/linux/mlp-training-studio-linux.tar.gz" \
-  'bash packaging/linux/build_gui.sh
-bash packaging/linux/build_bundle.sh --standalone-dir <deployment directory reported by build_gui.sh>' \
-  'Linux host, a Python with the GUI dependencies, PySide6 (pyside6-deploy), Nuitka'
+readme_line "Two Linux bundles are provided. They are the same application and extract to the"
+readme_line "same directory; they differ only in the bundled PyTorch build, which decides which"
+readme_line "GPUs can be used. No single PyTorch wheel covers both ends of the range, so pick by"
+readme_line "the oldest GPU generation in the fleet:"
+readme_line ""
+readme_line "| Bundle | GPU architectures | Cards |"
+readme_line "| --- | --- | --- |"
+readme_line "| \`...-cu128.tar.gz\` | sm_75 - sm_120 | Turing, Ampere, Ada, Hopper, Blackwell (RTX 50-series) |"
+readme_line "| \`...-cu121.tar.gz\` | sm_50 - sm_90 | Maxwell, Pascal, Volta, Turing, Ampere, Ada, Hopper |"
+readme_line ""
+readme_line "A card outside the bundled range still runs the app; training falls back to the CPU"
+readme_line "and the app prints a \"CUDA capability sm_NNN is not compatible\" warning at startup."
+readme_line "Install only one: both extract to the same path and would overwrite each other."
+readme_line ""
+
+collect "engineers-gui" "Linux desktop bundle (cu128 - Turing through Blackwell)" \
+  "artifacts/packaging/linux-cu128/mlp-training-studio-linux-cu128.tar.gz" \
+  'pip install torch --index-url https://download.pytorch.org/whl/cu128
+bash packaging/linux/build_gui.sh --python <build venv python> --output-dir artifacts/packaging/linux-cu128
+bash packaging/linux/build_bundle.sh --standalone-dir <deployment directory reported by build_gui.sh> \
+  --output-dir artifacts/packaging/linux-cu128 --tarball-name mlp-training-studio-linux-cu128.tar.gz' \
+  'Linux host, a Python with the GUI dependencies (numpy 2.3.4 -- see the PEP 695 guard in build_gui.sh), PySide6 (pyside6-deploy), Nuitka'
+
+collect "engineers-gui" "Linux desktop bundle (cu121 - Maxwell through Hopper)" \
+  "artifacts/packaging/linux-cu121/mlp-training-studio-linux-cu121.tar.gz" \
+  'pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+bash packaging/linux/build_gui.sh --python <build venv python> --output-dir artifacts/packaging/linux-cu121
+bash packaging/linux/build_bundle.sh --standalone-dir <deployment directory reported by build_gui.sh> \
+  --output-dir artifacts/packaging/linux-cu121 --tarball-name mlp-training-studio-linux-cu121.tar.gz' \
+  'Linux host, a Python with the GUI dependencies (numpy 2.3.4 -- see the PEP 695 guard in build_gui.sh), PySide6 (pyside6-deploy), Nuitka'
 
 collect_doc "engineers-gui" "doc/customer/gui_install_run.md"
 

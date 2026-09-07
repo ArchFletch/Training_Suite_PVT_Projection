@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import json
 import os
+import signal
+import socket
 from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 import pyqtgraph as pg
-from PySide6.QtCore import QObject, QThread, QTimer, Qt, QUrl, Signal, Slot
+from PySide6.QtCore import QObject, QSocketNotifier, QThread, QTimer, Qt, QUrl, Signal, Slot
 from PySide6.QtGui import QCloseEvent, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -43,7 +45,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .app_paths import current_runtime_paths
+from .app_paths import APP_NAME, APP_SLUG, current_runtime_paths
 from .atomic_json import write_json_atomically
 from .licensing.client_config import (
     license_client_config_path,
@@ -2816,8 +2818,109 @@ class MlpTrainingStudio(QMainWindow):
         self.close()
 
 
+def apply_application_identity(app: QApplication) -> None:
+    """Give the process a stable identity for the desktop environment.
+
+    Left to itself Qt derives the X11 ``WM_CLASS`` from the executable's own
+    basename, which under a source checkout is ``python`` and under the packaged
+    build is whatever the binary happens to be called. Neither matches
+    ``mlp-training-studio.desktop``, so the running window does not associate
+    with its launcher entry and the taskbar shows a generic icon.
+
+    ``setDesktopFileName`` is the one Qt consults first -- for ``WM_CLASS`` on
+    X11, for the ``app_id`` on Wayland, and for the GTK application id -- so it
+    has to match the desktop file's basename and the entry's ``StartupWMClass``.
+    """
+
+    app.setApplicationName(APP_SLUG)
+    # The user-visible name; applicationName is the machine-readable one above.
+    app.setApplicationDisplayName(APP_NAME)
+    app.setDesktopFileName(APP_SLUG)
+
+
+def install_termination_handler(app: QApplication, window: MlpTrainingStudio) -> QSocketNotifier | None:
+    """Route SIGTERM and SIGINT into the window's normal close path.
+
+    Closing the window releases the floating seat within a couple of seconds,
+    but a signal never reached that path: Qt's event loop sits in C++, so the
+    interpreter only runs a Python signal handler once it happens to return, and
+    the default SIGTERM disposition kills the process before that. An IT
+    ``kill``, a logout, or a shutdown script therefore stranded the seat for the
+    full lease TTL -- the same two minutes a SIGKILL costs, which is the part
+    that genuinely cannot be helped.
+
+    The fix is the standard self-pipe: Python's C-level handler writes the signal
+    number to a socket, Qt watches that socket as an ordinary event source, and
+    the close runs on the GUI thread like any other. A task still in flight is
+    stopped first by ``closeEvent`` exactly as it is for the window's own close
+    button.
+    """
+
+    try:
+        read_socket, write_socket = socket.socketpair()
+    except (OSError, AttributeError):  # pragma: no cover - no socketpair on this host
+        return None
+
+    read_socket.setblocking(False)
+    write_socket.setblocking(False)
+    notifier = QSocketNotifier(read_socket.fileno(), QSocketNotifier.Type.Read, app)
+    requested: dict[str, bool] = {"closing": False}
+
+    def _on_signal() -> None:
+        try:
+            read_socket.recv(64)
+        except OSError:
+            pass
+        if requested["closing"]:
+            # A second signal while the first close is still stopping a task.
+            # Qt would re-enter closeEvent; the deferred close already logs that
+            # it is waiting, so there is nothing useful to do twice.
+            return
+        requested["closing"] = True
+        window.close()
+
+    notifier.activated.connect(_on_signal)
+
+    previous_wakeup_fd = -1
+    installed: list[int] = []
+    try:
+        previous_wakeup_fd = signal.set_wakeup_fd(write_socket.fileno())
+        for signal_number in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGINT", None)):
+            if signal_number is None:
+                continue
+            # The handler body is deliberately empty: it exists only so Python's
+            # C-level handler runs at all, which is what writes to the wakeup fd.
+            signal.signal(signal_number, lambda *_: None)
+            installed.append(signal_number)
+    except (ValueError, OSError):  # pragma: no cover - not the main thread
+        # set_wakeup_fd and signal() are main-thread only. Nothing installed
+        # means the previous behaviour, not a broken application.
+        if previous_wakeup_fd != -1:
+            signal.set_wakeup_fd(previous_wakeup_fd)
+        notifier.setEnabled(False)
+        return None
+
+    # Qt does not own the sockets, and a garbage-collected socketpair would take
+    # the wakeup fd with it. Park them on the notifier, which lives as long as
+    # the application object does.
+    notifier._mlp_signal_sockets = (read_socket, write_socket)  # type: ignore[attr-defined]
+    notifier._mlp_installed_signals = tuple(installed)  # type: ignore[attr-defined]
+    return notifier
+
+
 def create_application() -> tuple[QApplication, MlpTrainingStudio]:
+    # WM_CLASS has two fields and Qt fills them from different places. The class
+    # field comes from setDesktopFileName below; the resource-name field comes
+    # from RESOURCE_NAME, and failing that from the basename of argv[0] -- which
+    # PySide6 sets to the file of whichever module constructed QApplication, so
+    # the window advertised itself as "gui_window.py". Qt reads the variable once
+    # when it builds the first native window, so it has to be set before then.
+    os.environ.setdefault("RESOURCE_NAME", APP_SLUG)
     app = QApplication.instance() or QApplication([])
+    # Before the first window exists: Qt reads the identity when it creates the
+    # native window, so setting it afterwards leaves WM_CLASS at the default.
+    apply_application_identity(app)
     apply_application_theme(app)
     window = MlpTrainingStudio()
+    install_termination_handler(app, window)
     return app, window

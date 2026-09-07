@@ -11,9 +11,16 @@ import uuid
 
 
 def detect_hostname() -> str:
-    """Return the current hostname in the form used by the request export."""
+    """Return the current hostname in the form used by the request export.
 
-    return socket.gethostname().strip() or platform.node().strip() or "unknown-host"
+    Case-folded on purpose. The same host can report either casing depending on
+    which resolution path answers -- ``PC`` from one, ``pc`` from another -- and
+    the two hash to different fingerprints, so an unfolded name made the identity
+    depend on something that is not actually a property of the host.
+    """
+
+    hostname = socket.gethostname().strip() or platform.node().strip() or "unknown-host"
+    return hostname.lower()
 
 
 def read_machine_token(os_family: str | None = None) -> str:
@@ -51,8 +58,18 @@ def generate_server_id() -> str:
 
 
 def build_host_fingerprint(*, hostname: str, os_family: str, machine_token: str | None = None) -> str:
-    """Derive a deterministic fingerprint from stable host properties."""
+    """Derive a deterministic fingerprint from stable host properties.
+
+    Hostname and OS family are folded here as well as in ``detect_hostname``, so
+    the fingerprint is stable no matter which caller supplies them: a stored
+    identity, a re-init after a rebuild, and an ad-hoc check all have to agree or
+    a valid license stops importing.
+    """
 
     token = machine_token or read_machine_token(os_family)
-    digest = hashlib.sha256(f"{hostname}|{os_family}|{token}".encode("utf-8")).hexdigest()
+    normalized_hostname = hostname.strip().lower()
+    normalized_os_family = os_family.strip().lower()
+    digest = hashlib.sha256(
+        f"{normalized_hostname}|{normalized_os_family}|{token}".encode("utf-8")
+    ).hexdigest()
     return f"host_{digest[:12]}"

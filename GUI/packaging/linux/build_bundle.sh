@@ -6,6 +6,11 @@ output_dir=""
 install_root="/opt/mlp-training-studio"
 bundle_name="mlp-training-studio"
 binary_name="mlp-training-studio"
+# Archive filename, separate from bundle_name on purpose. Two bundles built from
+# different torch wheels must extract to the SAME directory, carry the same
+# launcher and the same desktop entry -- the install docs and StartupWMClass name
+# that path -- and differ only in the file the customer downloads.
+tarball_name=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -27,6 +32,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --binary-name)
       binary_name="$2"
+      shift 2
+      ;;
+    --tarball-name)
+      tarball_name="$2"
       shift 2
       ;;
     *)
@@ -59,7 +68,7 @@ if [[ ! -f "$standalone_dir/$binary_name" ]]; then
 fi
 
 staging_root="$output_dir/$bundle_name"
-tarball_path="$output_dir/${bundle_name}-linux.tar.gz"
+tarball_path="$output_dir/${tarball_name:-${bundle_name}-linux.tar.gz}"
 desktop_template="$repo_root/packaging/linux/mlp-training-studio.desktop.in"
 desktop_output="$staging_root/share/applications/mlp-training-studio.desktop"
 
@@ -90,7 +99,16 @@ app_dir="\$(cd "\$script_dir/../app" && pwd)"
 # Preflight: an X11 session needs these from the host. Skipped under Wayland, where
 # Qt uses its own plugin and none of them are involved -- which is also why this
 # class of failure is invisible on a Wayland desktop and only bites in X11.
-if [[ "\${MLP_SKIP_LIBRARY_CHECK:-0}" != "1" && "\${XDG_SESSION_TYPE:-}" != "wayland" && -n "\${DISPLAY:-}" ]]; then
+#
+# Wayland is detected by WAYLAND_DISPLAY as well as XDG_SESSION_TYPE. Testing this
+# on XDG_SESSION_TYPE alone made the check block a perfectly runnable app: WSLg,
+# bare compositors, \`su\` into another user and systemd-user launches all leave
+# XDG_SESSION_TYPE unset while still exporting WAYLAND_DISPLAY, so the check ran,
+# found the X11 helpers absent, and exited 1 on a session that never needed them.
+if [[ "\${MLP_SKIP_LIBRARY_CHECK:-0}" != "1" \\
+   && -z "\${WAYLAND_DISPLAY:-}" \\
+   && "\${XDG_SESSION_TYPE:-}" != "wayland" \\
+   && -n "\${DISPLAY:-}" ]]; then
   # The cache is read ONCE into a variable. Piping it per soname into \`grep -q\`
   # makes grep exit on the first match, ldconfig then dies of SIGPIPE, and the
   # script's own \`set -o pipefail\` turns that into "missing" for every library --
