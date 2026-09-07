@@ -29,7 +29,10 @@ def load_license_client_config() -> dict[str, Any]:
     path = license_client_config_path()
     if not path.is_file():
         return {}
-    return json.loads(path.read_text(encoding="utf-8"))
+    # utf-8-sig: Windows PowerShell 5's `Set-Content -Encoding UTF8` -- what the
+    # pre-seed helper scripts/configure_gui_license_server.ps1 uses -- writes a
+    # UTF-8 BOM, and json.loads rejects a leading BOM in a str.
+    return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
 def save_license_client_config(payload: dict[str, Any]) -> Path:

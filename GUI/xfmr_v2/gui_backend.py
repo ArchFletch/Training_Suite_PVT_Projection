@@ -347,7 +347,8 @@ def save_gui_config(path: str | Path, payload: dict[str, Any]) -> None:
 def load_gui_config(path: str | Path) -> dict[str, Any]:
     """Load one GUI config payload."""
 
-    return json.loads(Path(path).read_text(encoding="utf-8"))
+    # utf-8-sig tolerates a BOM from a hand-edited or PowerShell-written file.
+    return json.loads(Path(path).read_text(encoding="utf-8-sig"))
 
 
 def save_last_session(payload: dict[str, Any]) -> None:

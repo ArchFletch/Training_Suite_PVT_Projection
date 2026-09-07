@@ -27,3 +27,15 @@ def test_license_client_config_round_trips_in_packaged_linux_mode(monkeypatch, t
     assert path == license_client_config_path()
     assert path.is_file()
     assert load_license_client_config() == payload
+
+
+def test_a_bom_prefixed_config_from_powershell_is_read() -> None:
+    """Windows PowerShell 5's `Set-Content -Encoding UTF8`, which the pre-seed helper
+    scripts/configure_gui_license_server.ps1 uses, writes a UTF-8 BOM; json.loads
+    rejects a leading BOM, so the file IT actually creates on Windows was reported
+    as unreadable and ignored."""
+    path = license_client_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"\xef\xbb\xbf" + b'{\r\n    "server_url":  "http://mlp-license-01:27850"\r\n}\r\n')
+
+    assert load_license_client_config() == {"server_url": "http://mlp-license-01:27850"}
