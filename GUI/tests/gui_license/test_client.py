@@ -120,6 +120,11 @@ def test_a_bare_host_gets_a_scheme_instead_of_a_traceback() -> None:
     assert normalize_server_url("  licsrv01/ ") == "http://licsrv01"
     assert normalize_server_url("https://lic.example.com/") == "https://lic.example.com"
     assert normalize_server_url("") == ""
+    # A bare scheme is already a scheme: rstrip eats the slashes, and the old
+    # substring test for "://" then produced "http://http:".
+    assert normalize_server_url("http://") == "http:"
+    assert normalize_server_url("HTTPS://lic.example.com") == "HTTPS://lic.example.com"
+    assert normalize_server_url("10.0.0.5:27850") == "http://10.0.0.5:27850"
     assert license_client_module.LicenseHttpClient("licsrv01:27850").api_base == "http://licsrv01:27850/api/v1"
 
 

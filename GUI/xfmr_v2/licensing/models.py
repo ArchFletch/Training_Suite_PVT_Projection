@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import getpass
 import hashlib
 import socket
@@ -23,6 +25,12 @@ LICENSE_REQUIRED_MESSAGE = (
 )
 
 
+# A scheme is "name://", or a bare "name:" with nothing after it (what rstrip("/")
+# leaves of "http://"). Matching a plain "name:" would misread the host:port form
+# this exists to fix -- "licsrv01:27850" is a host and a port, not a scheme.
+_HAS_SCHEME = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*:(//|$)")
+
+
 def normalize_server_url(server_url: str) -> str:
     """Normalize a configured server URL into a stable form.
 
@@ -33,9 +41,9 @@ def normalize_server_url(server_url: str) -> str:
     """
 
     normalized = server_url.strip().rstrip("/")
-    if normalized and "://" not in normalized:
-        normalized = f"http://{normalized}"
-    return normalized
+    if not normalized or _HAS_SCHEME.match(normalized):
+        return normalized
+    return f"http://{normalized}"
 
 
 def parse_utc_timestamp(value: str | None) -> datetime | None:
