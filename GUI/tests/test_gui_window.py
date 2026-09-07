@@ -9,7 +9,7 @@ from PySide6.QtWidgets import QMessageBox
 
 import xfmr_v2.gui_window as gui_window_module
 from xfmr_v2.progress import emit_progress
-from xfmr_v2.gui_workers import ImmediateTaskExecutor
+from xfmr_v2.gui_workers import ImmediateTaskExecutor, QtTaskExecutor, TaskHandle
 
 
 @pytest.fixture
@@ -313,8 +313,12 @@ def test_window_baseline_training_progress_updates_live_metrics_and_plots(
     assert gui_window.metric_cards["elapsed"].value_label.text() == "2s"
 
 
-def _write_minimal_baseline_checkpoint(run_dir: Path) -> None:
-    """Write a tiny but valid best_model.pt the ONNX exporter can consume."""
+def _write_minimal_baseline_checkpoint(run_dir: Path, *, legacy: bool = False) -> None:
+    """Write a tiny but valid best_model.pt the ONNX exporter can consume.
+
+    ``legacy=True`` omits the axis metadata that runner._save_checkpoint now
+    embeds, i.e. a checkpoint from before this version.
+    """
     import numpy as np
     import torch
 
@@ -340,6 +344,16 @@ def _write_minimal_baseline_checkpoint(run_dir: Path) -> None:
             "input_feature_std": np.ones(n_features, dtype=np.float32),
             "target_mean": np.zeros((channels, freqs), dtype=np.float32),
             "target_std": np.ones((channels, freqs), dtype=np.float32),
+            **(
+                {}
+                if legacy
+                else {
+                    "channel_transforms": ["", ""],
+                    "channel_units": ["dB", "deg"],
+                    "frequency_hz": np.linspace(1e9, 8e9, freqs),
+                    "sweep_label": "Frequency (GHz)",
+                }
+            ),
         },
         run_dir / "best_model.pt",
     )
@@ -809,7 +823,7 @@ def test_a_running_task_is_named_in_the_start_button_tooltip(gui_window) -> None
     gui_window._set_action_controls_enabled(False)
 
     assert not gui_window.start_baseline_button.isEnabled()
-    assert "training task is running" in gui_window.start_baseline_button.toolTip()
+    assert "training run is running" in gui_window.start_baseline_button.toolTip()
 
     gui_window._set_action_controls_enabled(True)
     assert gui_window.start_baseline_button.isEnabled()
@@ -884,3 +898,364 @@ def test_a_config_without_transfer_settings_stays_quiet(gui_window, tmp_path) ->
         {"data_sources": {"output_dir": str(tmp_path / "out"), "run_name": "clean"}}
     )
     assert "self-transfer" not in gui_window.run_log_text_edit.toPlainText()
+
+
+# ----------------------------------------------------------------------------
+# Startup must survive a bad session file; close must never kill a worker
+# ----------------------------------------------------------------------------
+def _make_window(qtbot, monkeypatch: pytest.MonkeyPatch, executor):
+    """Like the gui_window fixture, but with a caller-chosen executor and the real
+    session loader left in place (the autouse fixture points it at a temp dir)."""
+    monkeypatch.setattr(
+        gui_window_module, "list_available_devices", lambda: [{"id": "cpu", "label": "cpu — CPU"}]
+    )
+    monkeypatch.setattr(gui_window_module, "save_last_session", lambda payload: None)
+    monkeypatch.setattr(gui_window_module.QMessageBox, "warning", lambda *a, **k: QMessageBox.StandardButton.Ok)
+    window = gui_window_module.MlpTrainingStudio(executor=executor)
+    qtbot.addWidget(window)
+    window.show()
+    qtbot.wait(20)
+    return window
+
+
+def test_a_corrupt_session_file_does_not_stop_the_window_from_opening(qtbot, monkeypatch, isolated_app_state) -> None:
+    """A save interrupted by a crash or a full disk left a JSON fragment, and the
+    read of it raised straight out of __init__: the GUI never opened again until
+    the file was deleted by hand. It must open, say so, and name the file."""
+    isolated_app_state.last_session_path.parent.mkdir(parents=True, exist_ok=True)
+    isolated_app_state.last_session_path.write_text('{"device": "cpu", "data_sou', encoding="utf-8")
+
+    window = _make_window(qtbot, monkeypatch, ImmediateTaskExecutor())
+
+    assert window.isVisible()
+    log = window.run_log_text_edit.toPlainText()
+    assert "Could not read the last GUI session" in log
+    assert str(isolated_app_state.last_session_path) in log
+
+
+class _PendingTaskExecutor:
+    """Starts a task that stays 'running' until the test finishes it -- a worker
+    mid-epoch, as far as the window can tell."""
+
+    def __init__(self) -> None:
+        self.stop_requested = False
+        self.finish = None
+
+    def start(self, function, *, kwargs, on_progress, on_result, on_error, on_finished) -> TaskHandle:
+        self.finish = on_finished
+        return TaskHandle(stop=self._stop, thread=None, runner=None, completed=False)
+
+    def _stop(self) -> None:
+        self.stop_requested = True
+
+
+def test_closing_during_a_task_asks_it_to_stop_and_closes_once_it_has(qtbot, monkeypatch) -> None:
+    executor = _PendingTaskExecutor()
+    window = _make_window(qtbot, monkeypatch, executor)
+    window._start_task(
+        lambda **kwargs: None, kwargs={}, task_name="training", busy_state="Training", on_result=lambda r: None
+    )
+    assert window.current_task is not None
+
+    window.close()
+
+    # Deferred, not forced: the window stays up while the worker unwinds.
+    assert window.isVisible()
+    assert executor.stop_requested
+    assert window.run_state_badge.text() == "Stopping"
+    assert not window.stop_training_button.isEnabled()
+    assert "Close requested" in window.run_log_text_edit.toPlainText()
+
+    window.close()  # a second click must not do anything drastic either
+    assert window.isVisible()
+    assert "Still waiting" in window.run_log_text_edit.toPlainText()
+
+    executor.finish()
+    qtbot.waitUntil(lambda: not window.isVisible(), timeout=2000)
+
+
+def test_a_worker_that_never_polls_should_stop_is_neither_waited_on_nor_terminated(qtbot, monkeypatch) -> None:
+    """The deadlock. The old close path blocked the GUI thread for up to 10 s and
+    then QThread.terminate()d a worker that may hold the GIL, and the process
+    never exited. With a real QThread and a task that ignores should_stop, close
+    must return at once, keep the window up, and let the task finish."""
+    import time
+
+    window = _make_window(qtbot, monkeypatch, QtTaskExecutor())
+
+    def stubborn(*, progress_callback, should_stop):
+        time.sleep(0.4)  # never checks should_stop, like a loader mid-file
+        return {"status": "ok"}
+
+    window._start_task(stubborn, kwargs={}, task_name="scan", busy_state="Scanning", on_result=lambda r: None)
+    assert window.current_task is not None and window.current_task.thread.isRunning()
+
+    started = time.monotonic()
+    window.close()
+    assert time.monotonic() - started < 0.2, "close() blocked the GUI thread waiting for the worker"
+    assert window.isVisible()
+    assert window.run_state_badge.text() == "Stopping"
+
+    qtbot.waitUntil(lambda: not window.isVisible(), timeout=5000)
+
+
+# ----------------------------------------------------------------------------
+# license_client.json is the file IT pre-seeds; the GUI must honour it
+# ----------------------------------------------------------------------------
+def _record_acquire_calls(monkeypatch):
+    """Stop auto-acquire from touching the network; record the URL it would use."""
+    calls: list[str] = []
+    monkeypatch.setattr(
+        gui_window_module.MlpTrainingStudio,
+        "acquire_license_seat",
+        lambda self: calls.append(self.license_server_url_edit.text()),
+    )
+    return calls
+
+
+def test_a_preseeded_license_client_config_supplies_the_server_url(qtbot, monkeypatch, isolated_app_state) -> None:
+    """The install docs and scripts/configure_gui_license_server.ps1 write this
+    file, but the GUI only ever read the URL back from its own session file, so a
+    pre-seeded URL never appeared and a customer following the docs found the
+    field empty."""
+    import json as _json
+
+    isolated_app_state.license_client_path.parent.mkdir(parents=True, exist_ok=True)
+    isolated_app_state.license_client_path.write_text(
+        _json.dumps({"server_url": "http://mlp-license-01:27850"}), encoding="utf-8"
+    )
+    calls = _record_acquire_calls(monkeypatch)
+
+    window = _make_window(qtbot, monkeypatch, ImmediateTaskExecutor())
+
+    assert window.license_server_url_edit.text() == "http://mlp-license-01:27850"
+    assert calls == ["http://mlp-license-01:27850"]
+    assert str(isolated_app_state.license_client_path) in window.run_log_text_edit.toPlainText()
+
+
+def test_the_seeded_config_wins_over_the_url_remembered_in_the_session(qtbot, monkeypatch, isolated_app_state) -> None:
+    """IT re-seeding the file is the only way the two can disagree, and IT's value
+    is the one that should take effect."""
+    import json as _json
+
+    isolated_app_state.license_client_path.parent.mkdir(parents=True, exist_ok=True)
+    isolated_app_state.license_client_path.write_text(_json.dumps({"server_url": "licsrv-new:27850"}), encoding="utf-8")
+    monkeypatch.setattr(
+        gui_window_module,
+        "load_last_session",
+        lambda: {"licensing": {"server_url": "http://licsrv-old:27850", "last_status": {"stale": True}}},
+    )
+    calls = _record_acquire_calls(monkeypatch)
+
+    window = _make_window(qtbot, monkeypatch, ImmediateTaskExecutor())
+
+    assert window.license_server_url_edit.text() == "http://licsrv-new:27850"  # scheme added too
+    assert calls == ["http://licsrv-new:27850"]
+    assert window.license_server_status is None  # the old server's status was not carried over
+
+
+def test_a_corrupt_license_client_config_does_not_stop_startup(qtbot, monkeypatch, isolated_app_state) -> None:
+    isolated_app_state.license_client_path.parent.mkdir(parents=True, exist_ok=True)
+    isolated_app_state.license_client_path.write_text("{not json", encoding="utf-8")
+
+    window = _make_window(qtbot, monkeypatch, ImmediateTaskExecutor())
+
+    assert window.isVisible()
+    assert "Could not read the license client config" in window.run_log_text_edit.toPlainText()
+
+
+def test_closing_writes_the_server_url_back_to_the_license_client_config(qtbot, monkeypatch, isolated_app_state) -> None:
+    import json as _json
+
+    window = _make_window(qtbot, monkeypatch, ImmediateTaskExecutor())
+    window.license_server_url_edit.setText("licsrv01:27850")
+
+    window.close()
+
+    saved = _json.loads(isolated_app_state.license_client_path.read_text(encoding="utf-8"))
+    assert saved == {"server_url": "http://licsrv01:27850"}
+
+
+# ----------------------------------------------------------------------------
+# Controls that used to fail silently
+# ----------------------------------------------------------------------------
+def _capture_warnings(monkeypatch, window):
+    shown: list[str] = []
+    monkeypatch.setattr(window, "_show_warning", lambda text: shown.append(text))
+    return shown
+
+
+def test_scan_explains_when_the_output_folder_is_a_file(gui_window, monkeypatch, tmp_path) -> None:
+    """mkdir raised FileExistsError out of the clicked slot; PySide6 swallowed it and
+    the Scan button did nothing at all."""
+    dataset = tmp_path / "d.npz"
+    dataset.write_bytes(b"")
+    not_a_folder = tmp_path / "output"
+    not_a_folder.write_text("I am a file")
+    gui_window.dataset_file_edit.setText(str(dataset))
+    gui_window.model_output_folder_path_edit.setText(str(not_a_folder))
+    gui_window.run_name_edit.setText("run")
+    shown = _capture_warnings(monkeypatch, gui_window)
+
+    gui_window.scan_dataset()
+
+    assert gui_window.current_task is None
+    assert shown and "existing file, not a folder" in shown[0]
+
+
+def test_scan_explains_when_the_output_folder_cannot_be_created(gui_window, monkeypatch, tmp_path) -> None:
+    dataset = tmp_path / "d.npz"
+    dataset.write_bytes(b"")
+    blocker = tmp_path / "blocker"
+    blocker.write_text("file where a directory is needed")
+    gui_window.dataset_file_edit.setText(str(dataset))
+    gui_window.model_output_folder_path_edit.setText(str(blocker / "out"))  # parent is a file
+    gui_window.run_name_edit.setText("run")
+    shown = _capture_warnings(monkeypatch, gui_window)
+
+    gui_window.scan_dataset()
+
+    assert gui_window.current_task is None
+    assert shown and "Could not create the output folder" in shown[0]
+    assert "Could not create the output folder" in gui_window.run_log_text_edit.toPlainText()
+
+
+def test_a_run_name_with_a_path_separator_is_refused(gui_window, monkeypatch, tmp_path) -> None:
+    dataset = tmp_path / "d.npz"
+    dataset.write_bytes(b"")
+    gui_window.dataset_file_edit.setText(str(dataset))
+    gui_window.model_output_folder_path_edit.setText(str(tmp_path / "out"))
+    gui_window.run_name_edit.setText("../escape")
+    shown = _capture_warnings(monkeypatch, gui_window)
+
+    assert gui_window._require_data_paths() is None
+    assert shown and "path separators" in shown[0]
+
+
+def test_open_output_folder_after_a_stopped_run_falls_back_to_the_output_folder(gui_window, monkeypatch, tmp_path) -> None:
+    """A stopped run's partial summary has no run_dir; the bare subscript raised
+    KeyError inside the slot and the button was dead."""
+    gui_window.model_output_folder_path_edit.setText(str(tmp_path))
+    gui_window.last_workflow_summary = {"status": "stopped", "baseline": {"status": "stopped", "epochs_completed": 2}}
+    opened: list[str] = []
+    monkeypatch.setattr(gui_window_module.QDesktopServices, "openUrl", lambda url: opened.append(url.toLocalFile()) or True)
+
+    assert gui_window._preferred_output_path() == str(tmp_path)
+    gui_window.open_output_folder()
+    assert opened == [str(tmp_path)]
+
+
+def test_export_summary_reports_a_write_failure(gui_window, monkeypatch, tmp_path) -> None:
+    blocker = tmp_path / "blocker"
+    blocker.write_text("a file, so no directory can be created under it")
+    target = blocker / "summary.json"
+    monkeypatch.setattr(gui_window_module.QFileDialog, "getSaveFileName", lambda *a, **k: (str(target), "JSON Files (*.json)"))
+    shown = _capture_warnings(monkeypatch, gui_window)
+
+    gui_window.export_run_summary()  # must not raise
+
+    assert shown and "Could not write the summary file" in shown[0]
+    assert "Could not export the GUI summary" in gui_window.run_log_text_edit.toPlainText()
+    assert not target.exists()
+
+
+# ----------------------------------------------------------------------------
+# Validation fraction floor, tooltip copy, stale metric cards
+# ----------------------------------------------------------------------------
+def test_the_validation_fraction_cannot_be_set_to_zero(gui_window) -> None:
+    """0.000 used to be accepted; the engine then picked the best epoch on one
+    arbitrary row and the dashboard showed that one-row loss as "Best val"."""
+    gui_window.baseline_validation_fraction_spin_box.setValue(0.0)
+    assert gui_window.baseline_validation_fraction_spin_box.value() == pytest.approx(gui_window_module.MIN_VALIDATION_FRACTION)
+
+    gui_window.apply_config_payload({"baseline": {"val_frac": 0.0}})
+    assert gui_window.baseline_validation_fraction_spin_box.value() == pytest.approx(gui_window_module.MIN_VALIDATION_FRACTION)
+    assert gui_window._validate_split_fractions()
+
+
+def test_the_disabled_start_tooltip_does_not_tell_the_user_to_press_a_disabled_stop(gui_window) -> None:
+    gui_window._controls_locked = True
+    gui_window.current_task_name = "license_checkout"
+    gui_window.stop_training_button.setEnabled(False)
+    reason = gui_window._start_blocked_reason()
+    assert reason == "A license checkout is running. Wait for it to finish."
+
+    gui_window.current_task_name = "training"
+    gui_window.stop_training_button.setEnabled(True)
+    assert gui_window._start_blocked_reason() == "A training run is running. Wait for it to finish, or press Stop."
+
+
+def test_per_channel_cards_from_another_dataset_are_removed(gui_window) -> None:
+    gui_window._update_channel_metric_cards(["gain: 0.20 dB", "phase: 1.50 deg"])
+    assert set(gui_window._channel_metric_cards) == {"gain", "phase"}
+
+    gui_window._update_channel_metric_cards(["S11_re: 0.01"])
+
+    assert set(gui_window._channel_metric_cards) == {"S11_re"}
+
+
+def test_window_export_of_a_legacy_checkpoint_without_its_cache_reports_an_error(gui_window, tmp_path, monkeypatch) -> None:
+    """This used to 'succeed': an .onnx with unknown transforms and an empty
+    frequency axis, and the log said 'Exported ONNX model to ...'. The sidecar could
+    then neither label nor reshape the output, and a log10 inverse may have been
+    silently dropped. It must fail visibly instead."""
+    pytest.importorskip("onnx")
+    run_dir = tmp_path / "legacy_run"
+    _write_minimal_baseline_checkpoint(run_dir, legacy=True)
+    gui_window.last_baseline_summary = {"run_dir": str(run_dir)}
+    out_path = tmp_path / "exported.onnx"
+    monkeypatch.setattr(gui_window_module.QFileDialog, "getSaveFileName", lambda *a, **k: (str(out_path), "ONNX Files (*.onnx)"))
+    shown = _capture_warnings(monkeypatch, gui_window)
+
+    gui_window.export_baseline_to_onnx()
+
+    assert not out_path.exists()
+    assert gui_window.last_onnx_export_path is None
+    assert shown and "training cache" in shown[0]
+    assert "Error:" in gui_window.run_log_text_edit.toPlainText()
+    assert gui_window.run_state_badge.text() == "Error"
+
+
+def test_a_task_chained_from_a_worker_callback_still_lets_the_window_close(qtbot, monkeypatch) -> None:
+    """Result callbacks run on the worker thread, so a task chained from one used to
+    get a QThread with worker-thread affinity: its own quit/finished were queued to a
+    thread that immediately exited, the task never reported completion, and a window
+    waiting to close after it stayed open forever. The old code hid this by calling
+    QThread.terminate() after a 10 s freeze."""
+    import time
+
+    window = _make_window(qtbot, monkeypatch, QtTaskExecutor())
+
+    def quick(*, progress_callback, should_stop):
+        time.sleep(0.2)
+        return {"status": "ok"}
+
+    def chain(_result):
+        window._force_clear_task_state()
+        window._start_task(quick, kwargs={}, task_name="suggest", busy_state="Suggesting", on_result=lambda r: None)
+
+    window._start_task(quick, kwargs={}, task_name="scan", busy_state="Scanning", on_result=chain)
+    qtbot.waitUntil(lambda: window.current_task_name == "suggest", timeout=5000)
+    # The chained task must have been marshalled onto the GUI thread.
+    assert window.current_task is not None and window.current_task.thread is not None
+    assert window.current_task.thread.thread() is window.thread()
+
+    window.close()
+    assert window.isVisible()
+    qtbot.waitUntil(lambda: not window.isVisible(), timeout=8000)
+
+
+def test_closing_survives_a_worker_whose_thread_wrapper_is_already_gone(qtbot, monkeypatch) -> None:
+    """Threads retired by _force_clear_task_state delete themselves via deleteLater,
+    so closeEvent's wait() can meet a live Python wrapper around a dead C++ object."""
+    from PySide6.QtCore import QThread
+
+    window = _make_window(qtbot, monkeypatch, ImmediateTaskExecutor())
+
+    class _DeadThread:
+        def wait(self, _ms):
+            raise RuntimeError("Internal C++ object (PySide6.QtCore.QThread) already deleted.")
+
+    window._retiring_threads = [_DeadThread()]
+    window.close()  # must not raise
+    assert not window.isVisible()

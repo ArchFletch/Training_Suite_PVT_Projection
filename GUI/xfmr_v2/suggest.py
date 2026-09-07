@@ -288,8 +288,11 @@ def _validate_suggest_config(config: SuggestConfig) -> None:
     # These checks are cheap and save the user from confusing downstream errors.
     if not 0.0 < config.train_frac < 1.0:
         raise ValueError("train_frac must be between 0 and 1.")
-    if not 0.0 <= config.val_frac < 1.0:
-        raise ValueError("val_frac must be between 0 and 1.")
+    if not 0.0 < config.val_frac < 1.0:
+        # Not >= 0: the validation fold selects the best checkpoint, so training
+        # refuses an empty one. Accepting it here produced a recommended config
+        # that train_baseline then rejected.
+        raise ValueError("val_frac must be greater than 0 and less than 1.")
     if config.train_frac + config.val_frac > 1.0:
         raise ValueError("train_frac + val_frac must not exceed 1.0.")
     if not 0.5 < config.variance_threshold < 1.0:

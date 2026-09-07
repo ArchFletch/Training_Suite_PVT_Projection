@@ -1,8 +1,10 @@
 """Persistence helpers for desktop-side license client settings.
 
-The packaging work establishes the writable location contract for the future GUI
-licensing flow. The licensing agent can store the on-prem server URL here
-without needing to re-decide OS-specific paths.
+``license_client.json`` is the per-user file an administrator pre-seeds with
+the licence server URL (scripts/configure_gui_license_server.ps1, the install
+docs). The GUI reads it at startup -- it wins over the URL remembered in the
+session file -- and rewrites it on close, so the two only disagree after a
+deliberate re-seed.
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from ..app_paths import current_runtime_paths
+from ..atomic_json import write_json_atomically
 
 
 def license_client_config_path() -> Path:
@@ -26,13 +29,13 @@ def load_license_client_config() -> dict[str, Any]:
     path = license_client_config_path()
     if not path.is_file():
         return {}
-    return json.loads(path.read_text(encoding="utf-8"))
+    # utf-8-sig: Windows PowerShell 5's `Set-Content -Encoding UTF8` -- what the
+    # pre-seed helper scripts/configure_gui_license_server.ps1 uses -- writes a
+    # UTF-8 BOM, and json.loads rejects a leading BOM in a str.
+    return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
 def save_license_client_config(payload: dict[str, Any]) -> Path:
     """Persist desktop licensing settings and return the saved file path."""
 
-    path = license_client_config_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    return path
+    return write_json_atomically(license_client_config_path(), payload)

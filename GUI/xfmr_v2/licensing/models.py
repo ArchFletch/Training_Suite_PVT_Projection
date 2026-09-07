@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import getpass
 import hashlib
 import socket
@@ -23,10 +25,25 @@ LICENSE_REQUIRED_MESSAGE = (
 )
 
 
-def normalize_server_url(server_url: str) -> str:
-    """Normalize a configured server URL into a stable form."""
+# A scheme is "name://", or a bare "name:" with nothing after it (what rstrip("/")
+# leaves of "http://"). Matching a plain "name:" would misread the host:port form
+# this exists to fix -- "licsrv01:27850" is a host and a port, not a scheme.
+_HAS_SCHEME = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*:(//|$)")
 
-    return server_url.strip().rstrip("/")
+
+def normalize_server_url(server_url: str) -> str:
+    """Normalize a configured server URL into a stable form.
+
+    A bare host or host:port gets ``http://`` in front: that is what someone
+    typing ``licsrv01:27850`` into the License Server field means, and without
+    a scheme urllib raised ``ValueError('unknown url type')`` out of the licence
+    client -- a raw traceback in a dialog and a panel stuck at "Checking".
+    """
+
+    normalized = server_url.strip().rstrip("/")
+    if not normalized or _HAS_SCHEME.match(normalized):
+        return normalized
+    return f"http://{normalized}"
 
 
 def parse_utc_timestamp(value: str | None) -> datetime | None:

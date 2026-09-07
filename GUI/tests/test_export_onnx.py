@@ -34,6 +34,9 @@ def _make_checkpoint(
     transforms: list[str] | None = None,
     with_cache: bool = False,
     target_scale: float = 1.0,
+    checkpoint_meta: bool = False,
+    cache_transforms: list[str] | None = None,
+    cache_freqs: int | None = None,
 ) -> tuple[Path, dict]:
     """Write a minimal but valid checkpoint and return (path, reference info).
 
@@ -69,9 +72,11 @@ def _make_checkpoint(
         units = ["dB", "deg", "V", "A"][:channels]
         np.savez_compressed(
             cache_path,
-            frequency_hz=np.linspace(1e9, 5e9, freqs).astype(np.float32),
+            frequency_hz=np.linspace(1e9, 5e9, cache_freqs or freqs).astype(np.float32),
             channel_units=np.asarray(units),
-            channel_transforms=np.asarray(transforms or [""] * channels),
+            # cache_transforms lets a test model a cache rebuilt since training
+            # that no longer agrees with what the checkpoint was trained on.
+            channel_transforms=np.asarray(cache_transforms if cache_transforms is not None else (transforms or [""] * channels)),
             sweep_label=np.asarray("Frequency (GHz)"),
         )
 
@@ -89,6 +94,16 @@ def _make_checkpoint(
         "target_mean": target_mean,
         "target_std": target_std,
     }
+    if checkpoint_meta:
+        # What runner._save_checkpoint writes for every new training run.
+        checkpoint.update(
+            {
+                "channel_transforms": list(transforms or [""] * channels),
+                "channel_units": ["dB", "deg", "V", "A"][:channels],
+                "frequency_hz": np.linspace(1e9, 5e9, freqs).astype(np.float64),
+                "sweep_label": "Frequency (GHz)",
+            }
+        )
     ckpt_path = run_dir / "best_model.pt"
     torch.save(checkpoint, ckpt_path)
     return ckpt_path, {
@@ -187,13 +202,121 @@ def test_meta_sidecar_contract_and_reshape(tmp_path: Path) -> None:
     assert np.allclose(as_cf, expected_cf, atol=1e-3)
 
 
-def test_missing_cache_still_exports_with_empty_axis_meta(tmp_path: Path) -> None:
-    ckpt, _ = _make_checkpoint(tmp_path / "nocache", model_type="SpectraHydra", with_cache=False)
+def test_checkpoint_axis_metadata_exports_without_any_cache(tmp_path: Path) -> None:
+    """New checkpoints carry their own transforms and frequency axis, so the export
+    no longer depends on the training cache still being where it was."""
+    transforms = ["log10", ""]
+    ckpt, ref = _make_checkpoint(
+        tmp_path / "ckpt_meta", model_type="SpectraHydra", transforms=transforms, with_cache=False, checkpoint_meta=True
+    )
     out = export_checkpoint_to_onnx(ckpt)
+
+    rng = np.random.default_rng(3)
+    x = rng.standard_normal((3, ref["n_features"])).astype(np.float32)
+    onnx_out = ort.InferenceSession(str(out)).run(["prediction"], {"input_features": x})[0]
+    assert np.max(np.abs(onnx_out - _reference(ref, x))) < 1e-3
+
     meta = json.loads(out.with_suffix(".meta.json").read_text())
-    # Export succeeds; axis labels are empty placeholders when no cache is present.
-    assert meta["frequency_hz"] == []
-    assert meta["num_channels"] == 2
+    assert meta["axis_metadata_source"] == "checkpoint"
+    assert meta["channel_transforms"] == transforms
+    assert len(meta["frequency_hz"]) == ref["freqs"]
+    assert meta["channel_units"] == ["dB", "deg"]
+
+
+def test_checkpoint_transforms_beat_a_cache_rebuilt_since_training(tmp_path: Path) -> None:
+    """The bug: export read transforms from the live cache. A cache rebuilt for a
+    dataset without a log10 channel then silently dropped the log10 inverse from
+    the graph of a model that was trained with one."""
+    trained_with = ["log10", ""]
+    ckpt, ref = _make_checkpoint(
+        tmp_path / "rebuilt",
+        model_type="SpectraHydra",
+        transforms=trained_with,
+        with_cache=True,
+        cache_transforms=["", ""],  # the rebuilt cache disagrees
+        checkpoint_meta=True,
+    )
+    out = export_checkpoint_to_onnx(ckpt)
+
+    rng = np.random.default_rng(4)
+    x = rng.standard_normal((3, ref["n_features"])).astype(np.float32)
+    onnx_out = ort.InferenceSession(str(out)).run(["prediction"], {"input_features": x})[0]
+    # _reference uses ref["transforms"] == what the model was trained with.
+    assert np.max(np.abs(onnx_out - _reference(ref, x))) < 1e-3
+    meta = json.loads(out.with_suffix(".meta.json").read_text())
+    assert meta["channel_transforms"] == trained_with
+    assert meta["axis_metadata_source"] == "checkpoint"
+
+
+def test_a_legacy_checkpoint_falls_back_to_the_cache_and_says_so(tmp_path: Path) -> None:
+    ckpt, _ = _make_checkpoint(tmp_path / "legacy", model_type="SpectraHydra", transforms=["log10", ""], with_cache=True)
+    with pytest.warns(UserWarning, match="predates saved axis metadata"):
+        out = export_checkpoint_to_onnx(ckpt)
+    meta = json.loads(out.with_suffix(".meta.json").read_text())
+    assert meta["axis_metadata_source"] == "cache"
+    assert meta["channel_transforms"] == ["log10", ""]
+
+
+def test_a_cache_that_describes_a_different_dataset_is_refused(tmp_path: Path) -> None:
+    ckpt, _ = _make_checkpoint(tmp_path / "wrong_cache", model_type="SpectraHydra", freqs=8, with_cache=True, cache_freqs=12)
+    with pytest.raises(RuntimeError, match="different dataset"):
+        export_checkpoint_to_onnx(ckpt)
+
+
+def test_missing_cache_and_no_checkpoint_metadata_refuses_to_export(tmp_path: Path) -> None:
+    """Previously this 'succeeded' with an empty frequency axis and unknown
+    transforms and reported plain success -- the sidecar could then neither
+    label nor reshape the output, and a log10 inverse may have been dropped."""
+    ckpt, _ = _make_checkpoint(tmp_path / "nocache", model_type="SpectraHydra", with_cache=False)
+    with pytest.raises(RuntimeError, match="training cache"):
+        export_checkpoint_to_onnx(ckpt)
+
+
+def test_cache_path_override_rescues_a_legacy_checkpoint_whose_cache_moved(tmp_path: Path) -> None:
+    ckpt, _ = _make_checkpoint(tmp_path / "moved", model_type="SpectraHydra", transforms=["log10", ""], with_cache=True)
+    moved = tmp_path / "elsewhere" / "cache.npz"
+    moved.parent.mkdir()
+    (tmp_path / "moved" / "cache.npz").rename(moved)
+    with pytest.raises(RuntimeError):
+        export_checkpoint_to_onnx(ckpt)
+    with pytest.warns(UserWarning):
+        out = export_checkpoint_to_onnx(ckpt, cache_path=moved)
+    assert json.loads(out.with_suffix(".meta.json").read_text())["channel_transforms"] == ["log10", ""]
+
+
+def test_save_checkpoint_records_the_axis_metadata_the_exporter_reads(tmp_path: Path) -> None:
+    """The contract between runner._save_checkpoint and export_onnx: what training
+    saw is what export inverts, with no cache in between."""
+    from dataclasses import fields
+    from types import SimpleNamespace
+
+    from xfmr_v2 import export_onnx, runner
+
+    model = build_model("SpectraHydra", num_frequencies=6, input_feature_dim=3, ground_truth_channels=2, width=8, depth=2)
+    bundle = SimpleNamespace(
+        active_names=["a", "b", "c"],
+        dropped_names=[],
+        channel_names=["gain", "phase"],
+        input_feature_mean=np.zeros(3, np.float32),
+        input_feature_std=np.ones(3, np.float32),
+        target_mean=np.zeros((2, 6), np.float32),
+        target_std=np.ones((2, 6), np.float32),
+        channel_transforms=["log10", ""],
+        channel_units=["dB", "deg"],
+        frequency_hz=np.linspace(1e9, 6e9, 6),
+        sweep_label="Frequency (GHz)",
+    )
+    config = runner.TrainConfig()
+    path = tmp_path / "run" / "best_model.pt"
+    runner._save_checkpoint(path, model, config, bundle, best_epoch=1, best_val=0.5, effective_train_frac=0.8)
+
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    assert checkpoint["channel_transforms"] == ["log10", ""]
+    assert checkpoint["channel_units"] == ["dB", "deg"]
+    assert len(checkpoint["frequency_hz"]) == 6
+    meta = export_onnx._resolve_axis_metadata(checkpoint, num_channels=2, num_frequencies=6)
+    assert meta["axis_metadata_source"] == "checkpoint"
+    assert meta["channel_transforms"] == ["log10", ""]
 
 
 def test_no_nan_with_large_nonlog10_outputs(tmp_path: Path) -> None:

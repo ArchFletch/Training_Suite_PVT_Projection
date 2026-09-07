@@ -38,6 +38,7 @@ from .data import (
     split_indices,
 )
 from .model import SpectraHydra, SpectraHydraProj, SpectraNet, SpectraTrunk
+from .atomic_json import dumps_json
 from .progress import ProgressCallback, RunCancelled, StopChecker, emit_progress, request_stop
 
 
@@ -501,6 +502,24 @@ def run_baseline_trial(
             )
 
         # Stage 3: create the model and optimization objects.
+        # Keep the resolved kwargs: a configured corner column that is constant in
+        # THIS training split is skipped, so config.projection_columns records what
+        # was asked for and this records what the network actually embeds. Without
+        # both, summary.json and best_model.pt claimed columns the model never used
+        # while the ONNX sidecar (which re-resolves) disagreed with them.
+        projection_kwargs = resolve_projection_kwargs(
+            config.model_type,
+            config.projection_columns,
+            config.projection_dim,
+            bundle.active_names,
+            bundle.dropped_names,
+        )
+        effective_projection_columns = [
+            bundle.active_names[index] for index in projection_kwargs.get("corner_indices", [])
+        ]
+        skipped_projection_columns = [
+            name for name in (config.projection_columns or []) if name not in effective_projection_columns
+        ] if projection_kwargs else []
         model = build_model(
             config.model_type,
             num_frequencies=len(bundle.frequency_ghz),
@@ -508,13 +527,7 @@ def run_baseline_trial(
             ground_truth_channels=len(bundle.channel_names),
             width=config.width,
             depth=config.depth,
-            **resolve_projection_kwargs(
-                config.model_type,
-                config.projection_columns,
-                config.projection_dim,
-                bundle.active_names,
-                bundle.dropped_names,
-            ),
+            **projection_kwargs,
         ).to(device)
         loss_fn = _build_loss_fn(config.loss_function)
         optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
@@ -756,6 +769,10 @@ def run_baseline_trial(
             "config": asdict(config),
             "active_input_feature_names": bundle.active_names,
             "dropped_input_feature_names": bundle.dropped_names,
+            # What the corner projection actually embedded, which can be a subset of
+            # config.projection_columns (constant columns are skipped per split).
+            "effective_projection_columns": effective_projection_columns,
+            "skipped_projection_columns": skipped_projection_columns,
         }
         if has_evaluation_split:
             result.update(
@@ -797,8 +814,17 @@ def run_baseline_trial(
         best_path = artifact_dir / "best_model.pt"
         split_title = evaluation_split.capitalize()
 
-        _save_checkpoint(best_path, model, config, bundle, best_epoch, best_val, effective_train_frac)
-        history_path.write_text(json.dumps(history, indent=2))
+        _save_checkpoint(
+            best_path,
+            model,
+            config,
+            bundle,
+            best_epoch,
+            best_val,
+            effective_train_frac,
+            effective_projection_columns=effective_projection_columns,
+        )
+        history_path.write_text(dumps_json(history))
         _plot_loss(history, artifact_dir / "loss_curve.png")
 
         artifact_summary = {
@@ -833,7 +859,7 @@ def run_baseline_trial(
                 }
             )
         result.update(artifact_summary)
-        summary_path.write_text(json.dumps(result, indent=2))
+        summary_path.write_text(dumps_json(result))
         emit_progress(
             progress_callback,
             event="artifacts_saved",
@@ -913,6 +939,11 @@ def train_baseline(
     """Train one full-spectrum baseline model and save the best checkpoint."""
     # `run_baseline_trial` already contains the full implementation. This wrapper
     # simply fixes the evaluation split and returns a smaller top-level summary.
+    if int(config.epochs) < 1:
+        # `--epochs 0` used to report status "ok", save an untrained random-init
+        # checkpoint, and write a bare `Infinity` best_val_loss into summary.json,
+        # which is not valid JSON.
+        raise ValueError(f"epochs must be at least 1 (got {config.epochs}).")
     result = run_baseline_trial(
         config=config,
         show_progress=show_progress,
@@ -933,6 +964,8 @@ def train_baseline(
         "best_val_loss": result["best_val_loss"],
         "active_input_feature_names": result["active_input_feature_names"],
         "dropped_input_feature_names": result["dropped_input_feature_names"],
+        "effective_projection_columns": result.get("effective_projection_columns", []),
+        "skipped_projection_columns": result.get("skipped_projection_columns", []),
         "loss_curve_path": result["loss_curve_path"],
         "effective_train_frac": result["effective_train_frac"],
         "test_fold_merged_into_train": result["test_fold_merged_into_train"],
@@ -1260,7 +1293,7 @@ def run_self_transfer(
                 "per_channel_mae": per_channel_mae,
             }
             results.append(result)
-            (run_dir / f"iteration_{t:02d}.json").write_text(json.dumps(result, indent=2))
+            (run_dir / f"iteration_{t:02d}.json").write_text(dumps_json(result))
             elapsed_seconds = perf_counter() - start_time
             progress_fraction = band_run_index / max(total_band_runs, 1) if total_band_runs > 0 else 0.0
             eta_seconds = (
@@ -1338,7 +1371,7 @@ def run_self_transfer(
             "band_mae_plot_path": str((run_dir / "band_mae_vs_iteration.png").resolve()),
             "final_average_mae_plot_path": str(final_average_plot_path.resolve()),
         }
-        (run_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+        (run_dir / "summary.json").write_text(dumps_json(summary))
         emit_progress(
             progress_callback,
             event="artifacts_saved",
@@ -1374,7 +1407,7 @@ def run_self_transfer(
             "final_average_mae": float(results[-1]["average_mae"]) if results else None,
             "iteration_results": results,
         }
-        (run_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+        (run_dir / "summary.json").write_text(dumps_json(summary))
         emit_progress(
             progress_callback,
             event="stopped",
@@ -1704,6 +1737,7 @@ def _save_checkpoint(
     best_epoch: int,
     best_val: float,
     effective_train_frac: float,
+    effective_projection_columns: list[str] | None = None,
 ) -> None:
     # Save not only the model weights, but also the normalization statistics and
     # active feature list required to reuse the checkpoint later.
@@ -1715,6 +1749,9 @@ def _save_checkpoint(
             # Sibling of "config", never inside it: two call sites rebuild a
             # TrainConfig from that dict with **kwargs and would raise on a new key.
             "effective_train_frac": float(effective_train_frac),
+            # The corner columns the network really embeds; config.projection_columns
+            # is only what was requested.
+            "effective_projection_columns": list(effective_projection_columns or []),
             "best_epoch": best_epoch,
             "best_val_loss": best_val,
             "active_input_feature_names": bundle.active_names,
@@ -1724,6 +1761,15 @@ def _save_checkpoint(
             "input_feature_std": bundle.input_feature_std,
             "target_mean": bundle.target_mean,
             "target_std": bundle.target_std,
+            # Axis metadata the ONNX exporter needs to invert per-channel transforms
+            # and label the output. It used to be read back from the training cache
+            # at export time, so a cache rebuilt for another dataset silently baked
+            # the wrong log10 inverse into the graph. The checkpoint is the record of
+            # what this model was trained on, so it carries the metadata itself.
+            "channel_transforms": [str(item) for item in bundle.channel_transforms],
+            "channel_units": [str(item) for item in bundle.channel_units],
+            "frequency_hz": np.asarray(bundle.frequency_hz, dtype=np.float64),
+            "sweep_label": str(bundle.sweep_label),
         },
         path,
     )

@@ -113,6 +113,7 @@ def status_colors() -> dict[str, str]:
         "Not Checked": APP_THEME.muted_text,
         "Unconfigured": APP_THEME.muted_text,
         "Stopped": APP_THEME.warning,
+        "Stopping": APP_THEME.warning,
         "Low": APP_THEME.danger,
         "Not Available": APP_THEME.muted_text,
         "Not Scanned": APP_THEME.muted_text,

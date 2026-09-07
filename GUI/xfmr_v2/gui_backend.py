@@ -23,6 +23,7 @@ import numpy as np
 import torch
 
 from .app_paths import current_runtime_paths
+from .atomic_json import write_json_atomically
 from .data import build_cache_from_dataset, load_existing_cache, load_split_bundle
 from .export_onnx import export_checkpoint_to_onnx
 from .runner import TrainConfig, TransferConfig, run_self_transfer, train_baseline
@@ -256,16 +257,30 @@ def run_training_workflow(
 
     baseline_summary: dict[str, Any] | None = None
     transfer_summary: dict[str, Any] | None = None
+    run_warnings: list[str] = []
 
     if baseline_config is not None:
-        baseline_summary = train_baseline(
-            baseline_config,
-            show_progress=False,
-            progress_callback=progress_callback,
-            should_stop=should_stop,
-        )
+        # resolve_projection_kwargs warns when a configured corner column is constant
+        # in this split and gets skipped. Nothing captured it, so the run reported
+        # "Completed" while quietly training a smaller embedding than the UI, the
+        # checkpoint config and summary.json all claimed. Surface it like the scan
+        # surfaces its split warnings.
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            baseline_summary = train_baseline(
+                baseline_config,
+                show_progress=False,
+                progress_callback=progress_callback,
+                should_stop=should_stop,
+            )
+        run_warnings = [str(entry.message) for entry in caught]
         if baseline_summary.get("status") == "stopped":
-            return {"status": "stopped", "baseline": baseline_summary, "transfer": None}
+            return {
+                "status": "stopped",
+                "baseline": baseline_summary,
+                "transfer": None,
+                "run_warnings": run_warnings,
+            }
 
     if transfer_config is not None:
         transfer_summary = run_self_transfer(
@@ -275,12 +290,18 @@ def run_training_workflow(
             should_stop=should_stop,
         )
         if transfer_summary.get("status") == "stopped":
-            return {"status": "stopped", "baseline": baseline_summary, "transfer": transfer_summary}
+            return {
+                "status": "stopped",
+                "baseline": baseline_summary,
+                "transfer": transfer_summary,
+                "run_warnings": run_warnings,
+            }
 
     return {
         "status": "ok",
         "baseline": baseline_summary,
         "transfer": transfer_summary,
+        "run_warnings": run_warnings,
     }
 
 
@@ -338,17 +359,16 @@ def export_model_to_onnx(
 
 
 def save_gui_config(path: str | Path, payload: dict[str, Any]) -> None:
-    """Save one GUI config payload as JSON."""
+    """Save one GUI config payload as JSON, atomically (see atomic_json)."""
 
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    write_json_atomically(path, payload)
 
 
 def load_gui_config(path: str | Path) -> dict[str, Any]:
     """Load one GUI config payload."""
 
-    return json.loads(Path(path).read_text(encoding="utf-8"))
+    # utf-8-sig tolerates a BOM from a hand-edited or PowerShell-written file.
+    return json.loads(Path(path).read_text(encoding="utf-8-sig"))
 
 
 def save_last_session(payload: dict[str, Any]) -> None:

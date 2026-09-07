@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import urllib.error
 import urllib.request
@@ -65,8 +66,9 @@ class LicenseHttpClient:
         if payload is not None:
             body = json.dumps(payload).encode("utf-8")
             headers["Content-Type"] = "application/json"
-        request = urllib.request.Request(f"{self.api_base}{path}", data=body, headers=headers, method=method)
+        url = f"{self.api_base}{path}"
         try:
+            request = urllib.request.Request(url, data=body, headers=headers, method=method)
             with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
                 raw = response.read()
         except urllib.error.HTTPError as exc:
@@ -76,6 +78,15 @@ class LicenseHttpClient:
         except urllib.error.URLError as exc:
             reason = getattr(exc, "reason", exc)
             raise LicenseConnectionError(f"Could not reach {self.server_url}: {reason}") from exc
+        except (ValueError, http.client.HTTPException) as exc:
+            # A malformed URL (no scheme, a space in the host, a non-numeric port)
+            # surfaces from urllib as ValueError or http.client.InvalidURL, not as a
+            # URLError. Left alone these escaped every `except LicenseClientError`
+            # in the GUI and reached the user as a raw traceback.
+            raise LicenseConnectionError(
+                f"'{self.server_url}' is not a valid license server URL ({exc}). "
+                "Use the form http://host:port, for example http://licsrv01:27850."
+            ) from exc
         except OSError as exc:
             raise LicenseConnectionError(f"Could not reach {self.server_url}: {exc}") from exc
 

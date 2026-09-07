@@ -141,7 +141,7 @@ python prepare_cache.py <path-to-dataset-folder>
 python suggest_initial_settings.py
 python quick_search.py
 python train_baseline.py
-python run_self_transfer.py --base-run-dir <path-to-compatible-baseline-run>
+python run_self_transfer.py --cache-path <path-to-training-cache.npz>
 ```
 
 A dataset is either one `.npz` file or a folder to auto-detect. Naming the `.npz`

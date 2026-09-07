@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,7 @@ import numpy as np
 import torch
 from torch import nn
 
+from .atomic_json import dumps_json
 from .runner import build_model, resolve_projection_kwargs
 
 
@@ -157,25 +159,85 @@ def _get(checkpoint: dict, *names: str) -> Any:
     raise KeyError(f"None of {names} found in checkpoint (have: {sorted(checkpoint)}).")
 
 
-def _load_axis_metadata(cache_path: str | None, num_channels: int) -> dict[str, Any]:
-    """Read the frequency axis, units, and transforms from the training cache.
+def _resolve_axis_metadata(
+    checkpoint: dict,
+    *,
+    num_channels: int,
+    num_frequencies: int,
+    cache_path: str | Path | None = None,
+    what: str = "checkpoint",
+) -> dict[str, Any]:
+    """Frequency axis, units and per-channel transforms for the export.
 
-    The cache is the source of truth for these labels.  If it has moved or been
-    deleted, export still succeeds with empty/placeholder metadata.
+    The transforms decide whether a log10 inverse is baked into the graph, so
+    getting them from the wrong place produces a silently wrong model. Order of
+    trust:
+
+    1. The checkpoint itself (``runner._save_checkpoint`` writes them). This is the
+       record of what the model was trained on.
+    2. The training cache -- ``cache_path`` if given, else the one named in the
+       checkpoint's config -- for checkpoints from before the metadata was saved.
+       The cache used to be read first for every export, so a cache rebuilt for a
+       different dataset since training baked the wrong inverse into the graph.
+       Its shape must match the checkpoint, and the sidecar records that it came
+       from the cache so the export can be questioned.
+    3. Otherwise refuse. Exporting with unknown transforms and an empty frequency
+       axis used to succeed and report plain success; the sidecar then could not
+       label or reshape the output, which is its whole purpose.
     """
     meta: dict[str, Any] = {"channel_units": [], "channel_transforms": [], "frequency_hz": [], "sweep_label": ""}
-    if not cache_path or not Path(cache_path).exists():
+
+    if "channel_transforms" in checkpoint:
+        meta["channel_transforms"] = [str(item) for item in checkpoint["channel_transforms"]]
+        meta["channel_units"] = [str(item) for item in checkpoint.get("channel_units", [])]
+        meta["frequency_hz"] = np.asarray(checkpoint.get("frequency_hz", []), dtype=float).tolist()
+        meta["sweep_label"] = str(checkpoint.get("sweep_label", "") or "")
+        meta["axis_metadata_source"] = "checkpoint"
+        _check_axis_shape(meta, num_channels, num_frequencies, f"the {what}'s own metadata")
         return meta
-    with np.load(cache_path, allow_pickle=False) as data:
-        if "frequency_hz" in data:
-            meta["frequency_hz"] = data["frequency_hz"].astype(float).tolist()
-        if "channel_units" in data:
-            meta["channel_units"] = data["channel_units"].astype(str).tolist()
-        if "channel_transforms" in data:
-            meta["channel_transforms"] = data["channel_transforms"].astype(str).tolist()
-        if "sweep_label" in data:
-            meta["sweep_label"] = str(data["sweep_label"])
-    return meta
+
+    resolved = cache_path or (checkpoint.get("config") or {}).get("cache_path")
+    if resolved and Path(resolved).exists():
+        with np.load(resolved, allow_pickle=False) as data:
+            if "frequency_hz" in data:
+                meta["frequency_hz"] = data["frequency_hz"].astype(float).tolist()
+            if "channel_units" in data:
+                meta["channel_units"] = data["channel_units"].astype(str).tolist()
+            if "channel_transforms" in data:
+                meta["channel_transforms"] = data["channel_transforms"].astype(str).tolist()
+            if "sweep_label" in data:
+                meta["sweep_label"] = str(data["sweep_label"])
+        meta["axis_metadata_source"] = "cache"
+        _check_axis_shape(meta, num_channels, num_frequencies, f"the training cache {resolved}")
+        warnings.warn(
+            f"The {what} predates saved axis metadata, so the channel transforms and "
+            f"frequency axis were taken from the training cache {resolved}. A cache "
+            "rebuilt since training may not describe this model; the sidecar records "
+            "axis_metadata_source = 'cache'. Re-train to embed the metadata.",
+            stacklevel=3,
+        )
+        return meta
+
+    raise RuntimeError(
+        f"Cannot export: the {what} predates saved axis metadata and its training cache "
+        f"({resolved or 'not recorded'}) is missing, so the per-channel transforms are "
+        "unknown and a log10 inverse could be silently dropped. Pass --cache-path with "
+        "the cache the model was trained on, or re-train with the current version."
+    )
+
+
+def _check_axis_shape(meta: dict[str, Any], num_channels: int, num_frequencies: int, source: str) -> None:
+    transforms, freqs = meta["channel_transforms"], meta["frequency_hz"]
+    if transforms and len(transforms) != num_channels:
+        raise RuntimeError(
+            f"Cannot export: {source} lists {len(transforms)} channel transform(s) but the model has "
+            f"{num_channels} channel(s). It describes a different dataset than this model was trained on."
+        )
+    if freqs and len(freqs) != num_frequencies:
+        raise RuntimeError(
+            f"Cannot export: {source} has {len(freqs)} frequency point(s) but the model predicts "
+            f"{num_frequencies}. It describes a different dataset than this model was trained on."
+        )
 
 
 def export_checkpoint_to_onnx(
@@ -185,10 +247,12 @@ def export_checkpoint_to_onnx(
     bake_normalization: bool = True,
     opset: int = 17,
     check: bool = False,
+    cache_path: str | Path | None = None,
 ) -> Path:
     """Export ``checkpoint_path`` to ONNX and write a ``<out>.meta.json`` sidecar.
 
-    Returns the path to the written ``.onnx`` file.
+    ``cache_path`` is only consulted for checkpoints that predate saved axis
+    metadata (see ``_resolve_axis_metadata``). Returns the path to the ``.onnx``.
     """
     checkpoint_path = Path(checkpoint_path)
     out_path = Path(out_path) if out_path else checkpoint_path.with_suffix(".onnx")
@@ -204,7 +268,9 @@ def export_checkpoint_to_onnx(
     target_std = np.asarray(checkpoint["target_std"], dtype=np.float32)
     num_channels, num_frequencies = target_mean.shape
 
-    axis_meta = _load_axis_metadata(config.get("cache_path"), num_channels)
+    axis_meta = _resolve_axis_metadata(
+        checkpoint, num_channels=num_channels, num_frequencies=num_frequencies, cache_path=cache_path
+    )
     transforms = axis_meta["channel_transforms"] or [""] * num_channels
     log10_mask = [t == "log10" for t in transforms]
 
@@ -259,6 +325,9 @@ def export_checkpoint_to_onnx(
         "num_frequencies": int(num_frequencies),
         "frequency_hz": axis_meta["frequency_hz"],
         "sweep_label": axis_meta["sweep_label"],
+        # "checkpoint" is authoritative; "cache" means a legacy checkpoint whose
+        # transforms were read from the training cache and should be checked.
+        "axis_metadata_source": axis_meta["axis_metadata_source"],
         "normalization_baked_in": bool(bake_normalization),
         # When normalization is NOT baked in, MATLAB needs these to do it manually.
         "input_mean": input_mean.tolist(),
@@ -274,7 +343,7 @@ def export_checkpoint_to_onnx(
         sidecar["projection_corner_indices"] = list(projection_kwargs["corner_indices"])
         sidecar["projection_dim"] = int(projection_kwargs["projection_dim"])
     meta_path = out_path.with_suffix(".meta.json")
-    meta_path.write_text(json.dumps(sidecar, indent=2))
+    meta_path.write_text(dumps_json(sidecar))
 
     if check:
         _verify(wrapper, str(out_path), len(active_names))
@@ -290,6 +359,7 @@ def export_transfer_to_onnx(
     bake_normalization: bool = True,
     opset: int = 17,
     check: bool = False,
+    cache_path: str | Path | None = None,
 ) -> Path:
     """Export a self-transfer (per-band) model to a single stitched ONNX graph.
 
@@ -323,6 +393,7 @@ def export_transfer_to_onnx(
         units = list(bundle.get("channel_units") or [""] * len(channel_names))
         freq_full = np.asarray(bundle["frequency_hz"], dtype=float).tolist() if "frequency_hz" in bundle else []
         sweep_label = "Frequency (GHz)"
+        axis_source = "transfer_bundle"
     else:
         # Legacy: the baseline run supplies model_type + normalization.
         if baseline_checkpoint is None:
@@ -347,11 +418,18 @@ def export_transfer_to_onnx(
         input_std = np.asarray(_get(base, "input_feature_std", "input_std"), dtype=np.float32)
         target_mean_full = np.asarray(base["target_mean"], dtype=np.float32)
         target_std_full = np.asarray(base["target_std"], dtype=np.float32)
-        axis_meta = _load_axis_metadata(config.get("cache_path"), target_mean_full.shape[0])
+        axis_meta = _resolve_axis_metadata(
+            base,
+            num_channels=target_mean_full.shape[0],
+            num_frequencies=target_mean_full.shape[1],
+            cache_path=cache_path,
+            what="baseline checkpoint",
+        )
         transforms = axis_meta["channel_transforms"] or [""] * len(channel_names)
         units = axis_meta["channel_units"]
         freq_full = axis_meta["frequency_hz"]
         sweep_label = axis_meta["sweep_label"]
+        axis_source = axis_meta["axis_metadata_source"]
 
     # The transfer model covers the (possibly trimmed) union of band indices, in band order.
     eff_idx = np.concatenate(bands)
@@ -396,6 +474,7 @@ def export_transfer_to_onnx(
         "num_frequencies": int(len(eff_idx)),
         "frequency_hz": freq_eff,
         "sweep_label": sweep_label,
+        "axis_metadata_source": axis_source,
         "normalization_baked_in": bool(bake_normalization),
         "input_mean": input_mean.tolist(),
         "input_std": input_std.tolist(),
@@ -410,7 +489,7 @@ def export_transfer_to_onnx(
         sidecar["projection_columns"] = [active_names[i] for i in corner_indices]
         sidecar["projection_corner_indices"] = corner_indices
         sidecar["projection_dim"] = int(model_kwargs.get("projection_dim", 16))
-    out_path.with_suffix(".meta.json").write_text(json.dumps(sidecar, indent=2))
+    out_path.with_suffix(".meta.json").write_text(dumps_json(sidecar))
 
     if check:
         _verify(wrapper, str(out_path), len(active_names))
@@ -459,6 +538,12 @@ def main() -> None:
         help="Export the bare network (normalized space); do normalization in MATLAB using the meta JSON.",
     )
     parser.add_argument("--opset", type=int, default=17, help="ONNX opset version (default: 17)")
+    parser.add_argument(
+        "--cache-path",
+        help="(legacy checkpoints only) the training cache .npz to read channel transforms and the "
+        "frequency axis from, when the checkpoint predates saved axis metadata and its recorded "
+        "cache has moved.",
+    )
     parser.add_argument("--check", action="store_true", help="Verify ONNX output matches torch (needs onnxruntime)")
     args = parser.parse_args()
 
@@ -470,6 +555,7 @@ def main() -> None:
             bake_normalization=not args.no_norm,
             opset=args.opset,
             check=args.check,
+            cache_path=args.cache_path,
         )
     else:
         out = export_checkpoint_to_onnx(
@@ -478,6 +564,7 @@ def main() -> None:
             bake_normalization=not args.no_norm,
             opset=args.opset,
             check=args.check,
+            cache_path=args.cache_path,
         )
     print(f"Wrote {out}")
     print(f"Wrote {out.with_suffix('.meta.json')}")

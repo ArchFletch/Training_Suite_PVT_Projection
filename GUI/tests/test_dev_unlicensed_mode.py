@@ -7,6 +7,8 @@ checkout, and it is inert everywhere else.
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 from PySide6.QtWidgets import QMessageBox
 
@@ -40,6 +42,22 @@ def test_a_packaged_build_ignores_the_bypass() -> None:
             dev_unlicensed_mode({DEV_UNLICENSED_ENV: value, "MLP_APP_PATH_MODE": "packaged"})
             is False
         ), f"a packaged build honoured {DEV_UNLICENSED_ENV}={value}"
+
+
+def test_a_frozen_build_ignores_the_bypass_even_when_told_it_is_a_source_checkout(monkeypatch) -> None:
+    """The hole the packaged-build test above did not cover.
+
+    It only ever proved that MODE=packaged closes the gate. The path policy used
+    to honour MODE=source ahead of the freeze markers, so a customer with two
+    environment variables reopened the gate in a shipped build. The freeze
+    markers must win.
+    """
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    for value in ("1", "true", "yes", "on"):
+        assert (
+            dev_unlicensed_mode({DEV_UNLICENSED_ENV: value, "MLP_APP_PATH_MODE": "source"})
+            is False
+        ), f"a frozen build honoured {DEV_UNLICENSED_ENV}={value} via MLP_APP_PATH_MODE=source"
 
 
 def _window(qtbot, monkeypatch):
@@ -93,3 +111,24 @@ def test_a_packaged_build_keeps_the_gate_closed_with_the_switch_set(qtbot, monke
     assert not window._license_allows_new_runs()
     assert not window.start_baseline_button.isEnabled()
     assert "licence check disabled" not in window.windowTitle()
+
+
+def test_a_frozen_build_keeps_the_gate_closed_when_told_it_is_a_source_checkout(qtbot, monkeypatch) -> None:
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setenv(DEV_UNLICENSED_ENV, "1")
+    monkeypatch.setenv("MLP_APP_PATH_MODE", "source")
+    window = _window(qtbot, monkeypatch)
+
+    assert not window._license_allows_new_runs()
+    assert not window.start_baseline_button.isEnabled()
+    assert "licence check disabled" not in window.windowTitle()
+    assert window.license_seat_state_badge.text() != "Dev Bypass"
+
+
+def test_a_nuitka_compiled_build_ignores_the_bypass(monkeypatch) -> None:
+    import xfmr_v2.app_paths as app_paths
+
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    monkeypatch.setitem(app_paths.__dict__, "__compiled__", True)
+    for value in ("1", "true", "yes", "on"):
+        assert dev_unlicensed_mode({DEV_UNLICENSED_ENV: value, "MLP_APP_PATH_MODE": "source"}) is False

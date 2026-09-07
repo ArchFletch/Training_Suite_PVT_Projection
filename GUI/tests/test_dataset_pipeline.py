@@ -883,3 +883,56 @@ def test_ensure_cache_builds_from_a_named_npz_file(tmp_path: Path) -> None:
 
     assert data.ensure_cache(data_root=str(source), cache_path=str(cache_path)) == cache_path
     assert cache_path.is_file()
+
+
+def test_an_empty_validation_fraction_is_refused(synthetic_dataset: dict[str, Path]) -> None:
+    """val_frac=0 used to be clamped to a single arbitrary row, and the run then
+    reported that one-row loss as "Best val". The fold selects the checkpoint, so
+    asking for none of it is an error, not a silent degradation."""
+    with pytest.raises(ValueError, match="val_frac must be greater than 0"):
+        data.load_split_bundle(synthetic_dataset["cache_path"], batch_size=2, train_frac=0.6, val_frac=0.0)
+
+
+def test_ensure_cache_rebuilds_when_the_dataset_is_newer_than_the_cache(tmp_path: Path) -> None:
+    """Suggest and training reused any existing cache, so a bundle.npz regenerated
+    in place was analysed and trained on from the old data with no sign of it."""
+    import os
+
+    bundle = tmp_path / "bundle.npz"
+    rng = np.random.default_rng(0)
+    np.savez(
+        bundle,
+        features=rng.standard_normal((6, 3)).astype(np.float32),
+        targets=rng.standard_normal((6, 2, 4)).astype(np.float32),
+        frequency_hz=np.linspace(1e9, 4e9, 4).astype(np.float32),
+        feature_names=np.asarray(["a", "b", "c"]),
+        channel_names=np.asarray(["gain", "phase"]),
+        channel_units=np.asarray(["dB", "deg"]),
+        channel_transforms=np.asarray(["", ""]),
+        sweep_label=np.asarray("Frequency (GHz)"),
+    )
+    cache_path = tmp_path / "cache" / "run.npz"
+
+    assert data.ensure_cache(bundle, cache_path) == cache_path
+    built_mtime = cache_path.stat().st_mtime
+
+    # Untouched source: the cache is returned as is.
+    assert data.ensure_cache(bundle, cache_path) == cache_path
+    assert cache_path.stat().st_mtime == built_mtime
+
+    # Source regenerated after the cache was written: it must be rebuilt.
+    later = built_mtime + 60
+    os.utime(bundle, (later, later))
+    assert data.ensure_cache(bundle, cache_path) == cache_path
+    rebuilt_mtime = cache_path.stat().st_mtime
+    assert rebuilt_mtime > built_mtime
+
+    # A source dated in the FUTURE (NFS clock skew) must not cause a rebuild on
+    # every call: the rebuilt cache is settled to the source's timestamp.
+    future = rebuilt_mtime + 3600
+    os.utime(bundle, (future, future))
+    assert data.ensure_cache(bundle, cache_path) == cache_path
+    settled = cache_path.stat().st_mtime
+    assert settled >= future
+    assert data.ensure_cache(bundle, cache_path) == cache_path
+    assert cache_path.stat().st_mtime == settled, "a future-dated source triggered a second rebuild"

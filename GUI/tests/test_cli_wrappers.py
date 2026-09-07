@@ -172,3 +172,35 @@ def test_quick_search_cli_passes_arguments_and_prints_compact_summary(
     assert seen["config"].objective == "best_accuracy"
     assert seen["config"].variance_threshold == pytest.approx(0.92)
     assert seen["config"].show_trial_progress is True
+
+
+def test_run_self_transfer_cli_forwards_device_and_checks_the_cache_exists(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """The only remaining entry point for self-transfer had no --device on a
+    multi-GPU host, and a missing cache died inside numpy with a bare
+    FileNotFoundError."""
+    import xfmr_v2.runner as runner_module
+
+    seen: dict[str, object] = {}
+
+    def fake_run_self_transfer(config):
+        seen["config"] = config
+        return {"status": "ok"}
+
+    monkeypatch.setattr(runner_module, "run_self_transfer", fake_run_self_transfer)
+    cache = tmp_path / "cache.npz"
+    cache.write_bytes(b"")
+    monkeypatch.setattr(sys, "argv", ["run_self_transfer.py", "--cache-path", str(cache), "--device", "cuda:1"])
+
+    runpy.run_path(str(REPO_ROOT / "run_self_transfer.py"), run_name="__main__")
+
+    assert seen["config"].device == "cuda:1"
+    assert seen["config"].cache_path == str(cache)
+    assert json.loads(capsys.readouterr().out)["status"] == "ok"
+
+    monkeypatch.setattr(sys, "argv", ["run_self_transfer.py", "--cache-path", str(tmp_path / "missing.npz")])
+    with pytest.raises(SystemExit) as excinfo:
+        runpy.run_path(str(REPO_ROOT / "run_self_transfer.py"), run_name="__main__")
+    assert excinfo.value.code == 2
+    assert "cache file not found" in capsys.readouterr().err

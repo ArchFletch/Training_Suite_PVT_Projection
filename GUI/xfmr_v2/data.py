@@ -33,6 +33,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
+from .atomic_json import dumps_json
 from .dataset_schema import DatasetSchema, Ground_TruthSchema, InputFeatureSchema
 from .progress import request_stop
 
@@ -231,7 +232,7 @@ def _save_cache(
         "num_channels": int(targets.shape[1]),
         "num_frequencies": int(targets.shape[2]),
     }
-    meta_path.write_text(json.dumps(summary, indent=2))
+    meta_path.write_text(dumps_json(summary))
     return summary
 
 
@@ -798,14 +799,15 @@ def ensure_cache(
     ground_truth_data_dir: str | Path | None = None,
     should_stop=None,
 ) -> Path:
-    """Return a ready-to-use cache path, building it when missing.
+    """Return a ready-to-use cache path, building it when missing or stale.
 
-    When the cache file does not exist, the dataset (``data_root``: a prebuilt
-    ``.npz`` file or a folder to auto-detect, or one derived from the explicit
-    paths) is built via ``build_cache_from_dataset``.
+    When the cache file does not exist -- or the dataset it was built from has
+    been modified since -- the dataset (``data_root``: a prebuilt ``.npz`` file or
+    a folder to auto-detect, or one derived from the explicit paths) is built via
+    ``build_cache_from_dataset``.
     """
     p = Path(cache_path)
-    if p.exists():
+    if p.exists() and not _cache_is_stale(p, data_root, input_feature_path, ground_truth_data_dir):
         return p
     root = data_root or ground_truth_data_dir or (
         Path(input_feature_path).parent if input_feature_path else None
@@ -817,9 +819,64 @@ def ensure_cache(
             "file or folder so it can be built."
         )
     build_cache_from_dataset(root, p, max_samples=max_samples, should_stop=should_stop)
+    _settle_cache_mtime(p, data_root, input_feature_path, ground_truth_data_dir)
     return p
 
 
+
+
+def _settle_cache_mtime(cache_path: Path, *sources: str | Path | None) -> None:
+    """Never leave a freshly built cache looking older than its source.
+
+    A source file dated in the future (clock skew between an NFS server and this
+    host -- the PVT bundles live on a network share) would otherwise still read as
+    newer after the rebuild, and every subsequent call would rebuild again.
+    """
+    try:
+        cache_mtime = cache_path.stat().st_mtime
+        newest = max(
+            (Path(source).stat().st_mtime for source in sources if source and Path(source).is_file()),
+            default=None,
+        )
+    except OSError:
+        return
+    if newest is not None and newest > cache_mtime:
+        os.utime(cache_path, (newest, newest))
+
+
+def _cache_is_stale(
+    cache_path: Path,
+    data_root: str | Path | None,
+    input_feature_path: str | Path | None,
+    ground_truth_data_dir: str | Path | None,
+) -> bool:
+    """Whether the dataset the cache was built from has changed since.
+
+    The GUI's Scan always rebuilds, but Suggest and training reused whatever cache
+    existed, so a bundle.npz regenerated in place (the datagen step appends
+    continuation batches to the same path) was silently analysed and trained on
+    from the OLD data while the schema badge still read Valid. A source FILE newer
+    than the cache is the one signal available without re-reading the data.
+
+    Only files count. A folder's mtime changes whenever anything is written into
+    it -- including this cache, logs, or a run directory -- so a folder source
+    (the CLI's auto-detected dataset directories) is never treated as stale here;
+    it keeps the old "rebuild only when missing" behaviour.
+    """
+    try:
+        cache_mtime = cache_path.stat().st_mtime
+    except OSError:
+        return False
+    for source in (data_root, input_feature_path, ground_truth_data_dir):
+        if not source:
+            continue
+        source_path = Path(source)
+        try:
+            if source_path.is_file() and source_path.stat().st_mtime > cache_mtime:
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def resolve_data_sources_from_schema(
@@ -913,6 +970,12 @@ def load_split_bundle(
 
     # An external evaluation set folds the internal test rows back into training.
     train_frac, val_frac = resolve_split_fractions(train_frac, val_frac, merge_test_into_train)
+    if val_frac <= 0.0:
+        raise ValueError(
+            "val_frac must be greater than 0: the validation fold selects the best "
+            "checkpoint. With 0 the split still held back one arbitrary row and every "
+            "epoch was scored against that single sample."
+        )
 
     # Compute the split first, then derive the active features and normalization
     # statistics from the training split only.
