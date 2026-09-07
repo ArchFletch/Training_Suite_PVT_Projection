@@ -67,8 +67,26 @@ on `build_bundle.sh` is for.
 
 | Output directory | Torch | Architectures |
 | --- | --- | --- |
-| `artifacts/packaging/linux-cu128` | cu128 | sm_75 - sm_120 (Turing to Blackwell) |
+| `artifacts/packaging/linux-cu128` | 2.7.1+cu128 | sm_75 - sm_120 + compute_120 (Turing to Blackwell) |
 | `artifacts/packaging/linux-cu121` | 2.5.1+cu121 | sm_50 - sm_90 (Maxwell to Hopper) |
+
+**Do not raise the cu128 wheel past 2.7.x without re-rehearsing the build.**
+The cu128 index offers up to 2.11.0, and 2.11.0 fails to compile: Nuitka 2.7.11
+aborts optimizing `torch/_dynamo/pgo.py` with
+
+    nuitka.Errors.NuitkaOptimizationError:
+    This statement does raise but didn't annotate an exception exit.
+    owner="torch$_dynamo$pgo$$$function__43_put_remote_code_state"
+
+The trigger is `name := "pgo." + event_name` at line 968 -- a string
+concatenation inside a walrus, which can raise and which Nuitka fails to
+annotate. 2.7.1 writes the same line as a plain constant, so it compiles.
+
+That module cannot simply be excluded: `torch.onnx.export` routes through
+dynamo from 2.7 onward, and a real export loads `torch._dynamo.pgo`, so
+dropping it would break ONNX export -- the app's headline output. 2.7.0 was
+also the first release with official Blackwell support, so 2.7.x is the whole
+usable window for this Nuitka pin.
 
 The two builds cannot run in parallel: `pyside6-deploy` uses one `deployment/`
 directory next to the project root, so run them in sequence and `rm -rf
