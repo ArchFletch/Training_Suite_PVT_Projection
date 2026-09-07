@@ -6,4 +6,4 @@ Comment=Train neural-network surrogate models from PVT corner datasets
 Exec=__INSTALL_ROOT__/bin/mlp-training-studio
 Terminal=false
 StartupNotify=true
-Categories=Science;Development;
+Categories=Science;Engineering;

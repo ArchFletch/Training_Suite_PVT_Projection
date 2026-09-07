@@ -240,3 +240,14 @@ def test_non_pvt_dataset_keeps_the_plain_model(tmp_path: Path) -> None:
     assert result["diagnostics"]["detected_corner_columns"] == []
     assert not any("PVT corner structure was detected" in w for w in result["warnings"])
 
+
+def test_suggest_refuses_an_empty_validation_fraction() -> None:
+    """Suggest validated val_frac separately and allowed 0, so it recommended a
+    baseline config that train_baseline refuses -- and its own diagnostics were
+    computed on a split with no validation rows."""
+    import pytest
+
+    from xfmr_v2.suggest import SuggestConfig, suggest_initial_settings
+
+    with pytest.raises(ValueError, match="val_frac must be greater than 0"):
+        suggest_initial_settings(SuggestConfig(cache_path="/nonexistent/cache.npz", val_frac=0.0))
