@@ -23,7 +23,10 @@ def _preflight_condition() -> str:
     """Return the shipped `if [[ ... ]]` condition, unescaped as bash would."""
 
     lines = BUILD_SCRIPT.read_text(encoding="utf-8").splitlines()
-    start = next(i for i, line in enumerate(lines) if "MLP_SKIP_LIBRARY_CHECK:-0" in line)
+    anchor = next(i for i, line in enumerate(lines) if "MLP_SKIP_LIBRARY_CHECK:-0" in line)
+    # Walk back to the `if [[`: the MLP_SKIP clause is no longer the first line of
+    # the condition, and anchoring on it produced a fragment starting with `&&`.
+    start = next(i for i in range(anchor, -1, -1) if lines[i].lstrip().startswith("if [["))
     end = next(i for i in range(start, len(lines)) if lines[i].rstrip().endswith("]]; then"))
     block = "\n".join(lines[start : end + 1])
     # The heredoc opens with an unquoted `EOF`, so bash strips exactly these.
@@ -31,10 +34,13 @@ def _preflight_condition() -> str:
     return unescaped.removeprefix("if ").removesuffix("; then")
 
 
-def _check_runs(**env: str) -> bool:
+def _check_runs(*, self_check: bool = False, **env: str) -> bool:
     """True when the preflight would run its library check in this environment."""
 
-    script = f"if {_preflight_condition()}; then echo RAN; else echo SKIPPED; fi"
+    # self_check_run is a shell variable the launcher sets from its own argv, not
+    # an environment variable, so it is seeded here the same way.
+    preamble = f"self_check_run={1 if self_check else 0}\n"
+    script = preamble + f"if {_preflight_condition()}; then echo RAN; else echo SKIPPED; fi"
     # A clean environment: inheriting the test runner's DISPLAY/WAYLAND_DISPLAY
     # would make the result depend on whoever ran pytest.
     completed = subprocess.run(
@@ -81,3 +87,24 @@ def test_the_escape_hatch_is_exact() -> None:
 
     assert _check_runs(DISPLAY=":0", MLP_SKIP_LIBRARY_CHECK="0") is True
     assert _check_runs(DISPLAY=":0", MLP_SKIP_LIBRARY_CHECK="yes") is True
+
+
+def test_the_self_check_run_skips_the_x11_preflight() -> None:
+    """`--self-check` trains a model and exports ONNX without a QApplication, so
+    it needs none of these libraries.
+
+    The gate is meant to run on a headless build host and in CI. Before this
+    exemption the launcher met it with "cannot start: your system is missing 1
+    library file(s)" and a list of packages Qt would need for a window it is
+    never going to open -- which is exactly where the gate is most needed."""
+
+    assert _check_runs(DISPLAY=":0") is True, "sanity: a normal X11 launch is checked"
+    assert _check_runs(DISPLAY=":0", self_check=True) is False
+
+
+def test_the_launcher_detects_the_flag_anywhere_in_argv() -> None:
+    """It is scanned out of "$@", not assumed to be $1."""
+
+    script = BUILD_SCRIPT.read_text(encoding="utf-8")
+    assert 'for arg in "\\$@"; do' in script
+    assert '[[ "\\$arg" == "--self-check" ]] && self_check_run=1' in script

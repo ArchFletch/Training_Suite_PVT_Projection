@@ -105,7 +105,18 @@ app_dir="\$(cd "\$script_dir/../app" && pwd)"
 # bare compositors, \`su\` into another user and systemd-user launches all leave
 # XDG_SESSION_TYPE unset while still exporting WAYLAND_DISPLAY, so the check ran,
 # found the X11 helpers absent, and exited 1 on a session that never needed them.
-if [[ "\${MLP_SKIP_LIBRARY_CHECK:-0}" != "1" \\
+#
+# --self-check is exempt: it runs the release gate, which trains a model and
+# exports ONNX without ever constructing a QApplication. Blocking it on X11
+# libraries defeated the point -- the gate is meant to run on a headless build
+# host or in CI, and there it refused with a list of packages Qt would need for
+# a window it is not going to open.
+self_check_run=0
+for arg in "\$@"; do
+  [[ "\$arg" == "--self-check" ]] && self_check_run=1
+done
+if [[ "\$self_check_run" != "1" \\
+   && "\${MLP_SKIP_LIBRARY_CHECK:-0}" != "1" \\
    && -z "\${WAYLAND_DISPLAY:-}" \\
    && "\${XDG_SESSION_TYPE:-}" != "wayland" \\
    && -n "\${DISPLAY:-}" ]]; then

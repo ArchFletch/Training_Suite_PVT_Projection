@@ -1259,3 +1259,58 @@ def test_closing_survives_a_worker_whose_thread_wrapper_is_already_gone(qtbot, m
     window._retiring_threads = [_DeadThread()]
     window.close()  # must not raise
     assert not window.isVisible()
+
+
+def test_export_finds_a_baseline_checkpoint_left_on_disk(gui_window, tmp_path) -> None:
+    """Session state is empty after a restart; a checkpoint on disk is still a run.
+
+    Export to ONNX used to consult only in-memory state, so pointing Output
+    Folder and Run Name at a directory that genuinely held best_model.pt got
+    "No baseline run is available yet. Complete a baseline training run first."
+    """
+
+    window = gui_window
+    window.last_baseline_summary = None
+    window.last_workflow_summary = None
+
+    run_dir = tmp_path / "runs" / "nightly" / "baseline"
+    run_dir.mkdir(parents=True)
+    (run_dir / "best_model.pt").write_bytes(b"not a real checkpoint")
+
+    window.model_output_folder_path_edit.setText(str(tmp_path / "runs"))
+    window.run_name_edit.setText("nightly")
+
+    assert window._current_baseline_run_dir() == str(run_dir)
+
+
+def test_export_prefers_in_session_state_over_the_disk_scan(gui_window, tmp_path) -> None:
+    """The run this process just finished wins over anything older on disk."""
+
+    window = gui_window
+    stale = tmp_path / "runs" / "nightly" / "baseline"
+    stale.mkdir(parents=True)
+    (stale / "best_model.pt").write_bytes(b"stale")
+    window.model_output_folder_path_edit.setText(str(tmp_path / "runs"))
+    window.run_name_edit.setText("nightly")
+
+    window.last_baseline_summary = {"run_dir": str(tmp_path / "fresh")}
+    assert window._current_baseline_run_dir() == str(tmp_path / "fresh")
+
+
+def test_export_reports_where_it_looked_when_nothing_is_there(gui_window, tmp_path, monkeypatch) -> None:
+    """An empty folder must name the folder, not tell the user to do what they did."""
+
+    window = gui_window
+    window.last_baseline_summary = None
+    window.last_workflow_summary = None
+    window.model_output_folder_path_edit.setText(str(tmp_path / "empty"))
+    window.run_name_edit.setText("nightly")
+
+    warnings: list[str] = []
+    monkeypatch.setattr(window, "_show_warning", warnings.append)
+    window.export_baseline_to_onnx()
+
+    assert len(warnings) == 1, warnings
+    assert "best_model.pt" in warnings[0]
+    assert str(tmp_path / "empty") in warnings[0]
+    assert "Complete a baseline training run first" not in warnings[0]
