@@ -188,3 +188,49 @@ def test_the_delivery_readme_names_a_section_that_exists() -> None:
     assert any(heading.startswith(referenced) for heading in headings), (
         f"no heading starting with {referenced!r} in {GUI_INSTALL.name}: {headings}"
     )
+
+
+def test_every_shipment_directory_gets_its_own_checksum_manifest() -> None:
+    """A recipient gets one folder, not the tree, so the manifest they run has to
+    live in that folder and name only its files.
+
+    The tree-level checksums.txt lists all three shipment directories. Customer
+    IT, sent gui-cu128/ and server/, ran it and got
+
+        gui-cu121/mlp-training-studio-linux-cu121.tar.gz: FAILED open or read
+        sha256sum: WARNING: 2 listed files could not be read
+
+    and exit 1, on the first command the instructions give them, for a tree in
+    which every file present verified fine.
+    """
+
+    assembler = (REPO_ROOT / "packaging" / "assemble_delivery.sh").read_text(encoding="utf-8")
+
+    # The per-recipient manifest is written, and by bare name rather than a path
+    # relative to the tree -- a tree-relative path fails the same way.
+    assert 'recipient_manifest="$output_dir/$recipient/checksums.txt"' in assembler
+    assert 'recipient_checksum_lines["$recipient"]+="$digest  $base"' in assembler
+
+    # Every artifact goes through the one recorder, so none can miss the manifest.
+    assert "record_checksum " in assembler
+    appends = {
+        line.strip()
+        for line in assembler.splitlines()
+        if line.strip().startswith("checksum_lines+=")
+    }
+    expected = {
+        # Inside record_checksum, which is the only route an artifact may take.
+        """checksum_lines+="$digest  $rel"$'\\n'""",
+        # The manifest files listing themselves, written after the artifacts.
+        """checksum_lines+="$(sha256_of "$recipient_manifest")  $recipient/checksums.txt"$'\\n'""",
+    }
+    assert appends == expected, (
+        "checksum bookkeeping changed; an artifact appended to the tree-level "
+        f"manifest without going through record_checksum would miss its shipment "
+        f"folder's checksums.txt. Unexpected: {sorted(appends - expected)}"
+    )
+
+    # And the README has to send the recipient into their own folder.
+    assert "cd gui-cu128 && sha256sum -c checksums.txt" in assembler, (
+        "the delivery README still tells the recipient to verify from the tree root"
+    )

@@ -122,7 +122,21 @@ The same list, with the soname each package provides, is in the bundle's own
 
 - license server settings: `~/.config/mlp-training-studio/license_client.json`
 - last GUI session: `~/.local/state/mlp-training-studio/last_session.json`
+- logs: `~/.local/state/mlp-training-studio/logs/`
 - default outputs and auto-managed cache: `~/Documents/Surrogate Model Training Suite/runs/`
+
+### Sending a Log With a Problem Report
+
+The app writes one log file per launch, named `session-<date>-<time>.log`, into
+the logs directory above. It holds everything the in-app Run Log shows plus the
+full traceback behind any failure, which the on-screen dialog shows once and
+then loses. The ten most recent are kept.
+
+The app prints the exact path into the Run Log as its first line, so the fastest
+way to find the right file is to read it off the top of the log panel. Nothing
+useful goes to the terminal: the app catches errors and routes them to the GUI,
+so `stdout` and `stderr` are empty even on a failed run. Attach the session log
+rather than a screenshot.
 
 ## License Server Settings
 

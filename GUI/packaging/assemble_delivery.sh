@@ -133,6 +133,13 @@ missing_count=0
 missing_labels=""
 carried_labels=""
 checksum_lines=""
+# Checksums are also written INSIDE each shipment directory, with paths relative
+# to it. The tree-level checksums.txt lists every folder, but only one of the two
+# GUI folders is ever sent, so on the customer's machine `sha256sum -c` against
+# the tree-level file reports the folder they were not sent as "FAILED open or
+# read" and exits 1 -- on the very first command the instructions give them.
+declare -A recipient_checksum_lines=()
+recipient_order=""
 readme_body=""
 # Newline-delimited list of output-dir-relative paths this run vouches for.
 accounted_rels=""
@@ -177,6 +184,17 @@ reject_key_material() {
   esac
 }
 
+record_checksum() {
+  local recipient="$1" base="$2" digest="$3" rel="$4"
+  checksum_lines+="$digest  $rel"$'\n'
+  recipient_checksum_lines["$recipient"]+="$digest  $base"$'\n'
+  case $'\n'"$recipient_order" in
+    *$'\n'"$recipient"$'\n'*) ;;
+    *) recipient_order+="$recipient"$'\n' ;;
+  esac
+  accounted_rels+="$rel"$'\n'
+}
+
 # Documentation the recipient needs in their hands. The README used to point
 # engineers at `doc/customer/gui_install_run.md`, which is in the repo and not in
 # the delivery -- so the one instruction they were given named a file they did not
@@ -203,8 +221,7 @@ collect_doc() {
     exit 1
   fi
   local digest; digest="$(sha256_of "$dest")"
-  checksum_lines+="$digest  $rel"$'\n'
-  accounted_rels+="$rel"$'\n'
+  record_checksum "$recipient" "$base" "$digest" "$rel"
   printf '  INCLUDED %s\n' "$rel"
 }
 
@@ -239,8 +256,7 @@ collect() {
       size="$(size_of "$dest")"
       carried_count=$((carried_count + 1))
       carried_labels+="    $label ($rel)"$'\n'
-      checksum_lines+="$digest  $rel"$'\n'
-      accounted_rels+="$rel"$'\n'
+      record_checksum "$recipient" "$base" "$digest" "$rel"
 
       printf '  CARRIED  %s\n' "$label"
       printf '           %s\n' "$rel"
@@ -303,8 +319,7 @@ collect() {
   digest="$(sha256_of "$dest")"
 
   placed_count=$((placed_count + 1))
-  checksum_lines+="$digest  $rel"$'\n'
-  accounted_rels+="$rel"$'\n'
+  record_checksum "$recipient" "$base" "$digest" "$rel"
 
   printf '  PRESENT  %s\n' "$label"
   printf '           %s\n' "$rel"
@@ -403,6 +418,23 @@ collect "server" "Linux license server bundle" \
   "artifacts/packaging/license_server/linux/mlp-license-server-linux.tar.gz" \
   'bash packaging/license_server/linux/build_bundle.sh' \
   'any host with bash and tar, no Python or Qt toolchain, no network access'
+
+# One checksums.txt per shipment directory, listing only that directory's files
+# by bare name. This is the file the recipient actually runs, from inside the one
+# folder they were sent; the tree-level manifest below is for whoever assembles
+# and hands over the tree, and naming folders the recipient does not have is what
+# made `sha256sum -c` exit 1 for them.
+while IFS= read -r recipient; do
+  [[ -n "$recipient" ]] || continue
+  recipient_manifest="$output_dir/$recipient/checksums.txt"
+  printf '%s' "${recipient_checksum_lines[$recipient]}" > "$recipient_manifest"
+  chmod 0644 "$recipient_manifest"
+  accounted_rels+="$recipient/checksums.txt"$'\n'
+  # Listed in the tree-level manifest too, so verifying the whole tree covers it.
+  checksum_lines+="$(sha256_of "$recipient_manifest")  $recipient/checksums.txt"$'\n'
+  printf '  MANIFEST %s/checksums.txt (%d files)\n' \
+    "$recipient" "$(printf '%s' "${recipient_checksum_lines[$recipient]}" | grep -c .)"
+done <<< "$recipient_order"
 
 present_count=$((placed_count + carried_count))
 total_count=$((present_count + missing_count))
@@ -568,8 +600,18 @@ written on the first run that finds something to collect.
 EOF
   else
     cat <<'EOF'
-`checksums.txt` has one line per file collected here. Verify from this
-directory:
+Every shipment directory carries its own `checksums.txt`, listing only that
+directory's files by bare name. That is the one to send on and the one the
+recipient runs, from inside the folder they were given:
+
+```bash
+cd gui-cu128 && sha256sum -c checksums.txt
+```
+
+The `checksums.txt` at the top of this tree is for whoever assembles and hands
+the tree over: it lists every folder, including the GUI bundle that is not being
+sent, so running it on the customer's machine reports the missing folder as
+`FAILED open or read` and exits 1. Verify the whole tree from here:
 
 ```bash
 sha256sum -c checksums.txt
