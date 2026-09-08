@@ -175,7 +175,7 @@ def suggest_initial_settings(
         progress_callback,
         event="recommendation_started",
         phase="suggest",
-        message="Building heuristic baseline and transfer recommendations.",
+        message="Building heuristic baseline recommendations.",
     )
     baseline = _suggest_baseline(
         request=config,

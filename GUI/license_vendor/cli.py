@@ -19,7 +19,13 @@ from .signer import (
     sign_license_payload,
 )
 
-DEFAULT_FEATURES = ("baseline", "transfer")
+# Only what the app can actually ask for. "transfer" was granted by default long
+# after frequency-domain self-transfer left the GUI, so show-status advertised a
+# feature no client requests and no server check exercises. Issuing it is not
+# harmful, but a licence should describe the product.  run_self_transfer.py is a
+# command-line tool and takes no seat, so nothing regresses by dropping it here;
+# pass --feature transfer explicitly if a licence ever needs it back.
+DEFAULT_FEATURES = ("baseline",)
 DEFAULT_EVALUATION_NOTES = "14-day floating POC, non-production"
 DEFAULT_PAID_NOTES = "Paid floating term license"
 DEFAULT_ISSUANCE_LOG = "license_vendor_issuance_log.jsonl"

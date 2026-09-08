@@ -114,10 +114,14 @@ def test_cli_issues_eval_and_paid_licenses_for_same_server_and_appends_log(
     assert eval_envelope.payload.host_fingerprint == paid_envelope.payload.host_fingerprint
     assert eval_envelope.payload.license_type == "evaluation"
     assert paid_envelope.payload.license_type == "paid"
-    assert eval_envelope.payload.features == paid_envelope.payload.features == [
-        "baseline",
-        "transfer",
-    ]
+    # The eval licence passes no --feature, so it gets the default; the paid one
+    # names both explicitly. They used to be identical because the default was
+    # ("baseline", "transfer"), which kept granting a feature the GUI no longer
+    # has -- show-status advertised it, no client requested it, no server check
+    # exercised it. Asserting them separately is what proves the default shrank
+    # AND that --feature still overrides it.
+    assert eval_envelope.payload.features == ["baseline"]
+    assert paid_envelope.payload.features == ["baseline", "transfer"]
     assert verify_license_signature(eval_envelope, signing_key.public_key)
     assert verify_license_signature(paid_envelope, signing_key.public_key)
 
