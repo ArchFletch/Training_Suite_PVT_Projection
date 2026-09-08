@@ -24,13 +24,32 @@ plugins =
 #
 # Every entry is verified against the app's real import surface by
 # tests/test_packaging_exclusions.py. Do not add one without adding it there.
-# Three candidates were REJECTED by that check and must stay included:
+#
+# torch.testing._internal is excluded LEAF BY LEAF, not as a package. Excluding
+# the package shipped a bundle that could not train at all: torch/utils/
+# checkpoint.py:16 imports torch.testing._internal.logging_tensor at module
+# scope, so torch.optim.AdamW -> torch._compile -> torch._dynamo ->
+# torch.utils.checkpoint died with ModuleNotFoundError one second into every
+# run. torch/_dynamo/variables/distributed.py needs .distributed.fake_pg the
+# same way. The two of them are 8 KB; the patterns below still drop 97% of the
+# 4.6 MB tree.
+#
+# Re-including them under a package-level nofollow does NOT work. Nuitka 2.7.11
+# answers --include-module with "Not allowed to include module X due to 'Module
+# is exact match of Y instructed by user to not follow to'" and the compiled
+# binary raises ModuleNotFoundError anyway. Verified with compiled binaries, not
+# from the docs. Naming a package here drops its whole subtree, and `*` crosses
+# dots -- which is why .distributed.rpc* is one entry and .distributed is not.
+#
+# Four candidates were REJECTED by the guard test and must stay included:
 #   unittest    - torch imports it for real, from torch/utils/_config_module.py
 #                 via torch/_inductor/config.py. Excluding it produced a bundle
 #                 that aborted at startup with no message on any stream.
 #   torch.testing (the package itself) - torch imports _creation, _comparison
-#                 and _utils from it at import time; only _internal is dropped.
+#                 and _utils from it at import time.
+#   torch.testing._internal.logging_tensor      - see above, 7 KB.
+#   torch.testing._internal.distributed.fake_pg - see above, 1 KB.
 #   sympy.polys.polyquinticconst (15.6 MB) - polyroots imports it at module
 #                 scope, so a bare `import sympy` would raise ImportError.
 mode = standalone
-extra_args = --quiet --assume-yes-for-downloads --noinclude-pytest-mode=nofollow --nofollow-import-to=torch.testing._internal --nofollow-import-to=numpy.tests --nofollow-import-to=numpy._core.tests --nofollow-import-to=matplotlib.tests --nofollow-import-to=onnx.test --module-parameter=torch-disable-jit=yes --noinclude-qt-translations --include-module=PySide6.QtOpenGL --include-module=PySide6.QtOpenGLWidgets --include-module=PySide6.QtSvg --include-module=PySide6.QtTest --include-package=xfmr_v2 --include-package=numpy --include-package=pyqtgraph --include-package=torch --include-package=matplotlib --include-package-data=matplotlib --include-package=onnx --include-package=onnxruntime --include-package-data=onnxruntime --include-package=onnxscript --include-package-data=onnxscript
+extra_args = --quiet --assume-yes-for-downloads --noinclude-pytest-mode=nofollow --nofollow-import-to=torch.testing._internal.common_* --nofollow-import-to=torch.testing._internal.opinfo* --nofollow-import-to=torch.testing._internal.optests* --nofollow-import-to=torch.testing._internal.generated* --nofollow-import-to=torch.testing._internal.jit_* --nofollow-import-to=torch.testing._internal.distributed.rpc* --nofollow-import-to=torch.testing._internal.distributed.distributed_test* --nofollow-import-to=torch.testing._internal.distributed.nn* --nofollow-import-to=torch.testing._internal.distributed._* --nofollow-import-to=torch.testing._internal.autocast_test_lists* --nofollow-import-to=torch.testing._internal.autograd_function_db* --nofollow-import-to=torch.testing._internal.custom_op_db* --nofollow-import-to=torch.testing._internal.hypothesis_utils* --nofollow-import-to=torch.testing._internal.triton_utils* --nofollow-import-to=torch.testing._internal.composite_compliance* --nofollow-import-to=torch.testing._internal.quantization_torch_package_models* --nofollow-import-to=numpy.tests --nofollow-import-to=numpy._core.tests --nofollow-import-to=matplotlib.tests --nofollow-import-to=onnx.test --module-parameter=torch-disable-jit=yes --noinclude-qt-translations --include-module=PySide6.QtOpenGL --include-module=PySide6.QtOpenGLWidgets --include-module=PySide6.QtSvg --include-module=PySide6.QtTest --include-package=xfmr_v2 --include-package=numpy --include-package=pyqtgraph --include-package=torch --include-package=matplotlib --include-package-data=matplotlib --include-package=onnx --include-package=onnxruntime --include-package-data=onnxruntime --include-package=onnxscript --include-package-data=onnxscript
