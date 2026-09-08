@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import datetime as _datetime
 import json
 import os
 import signal
 import socket
+import sys
 from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
@@ -235,11 +237,79 @@ class MetricCard(QFrame):
         self.value_label.setText(value)
 
 
+# How many previous session logs to keep. One file per launch, so this is a
+# rough number of sessions, not a size budget; the files are a few KB each.
+_SESSION_LOG_RETENTION = 10
+
+
+class _SessionLog:
+    """Mirrors the Run Log to a file under the platform's state directory.
+
+    Until this existed there was no log on disk at all on Linux: every message,
+    including the traceback behind a failed run, lived only in the Run Log widget
+    and a modal dialog. stdout and stderr are empty because the exception is
+    caught and routed to the GUI, so a customer reporting a problem could only
+    send a screenshot.
+
+    Every failure here is swallowed on purpose. A read-only or missing state
+    directory must degrade to "no log file", never take down the window the log
+    is supposed to be describing.
+    """
+
+    def __init__(self, log_dir: Path) -> None:
+        self.path: Path | None = None
+        self._handle = None
+        self._broken = False
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            self._prune(log_dir)
+            stamp = _datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            candidate = log_dir / f"session-{stamp}.log"
+            self._handle = candidate.open("a", encoding="utf-8")
+            self.path = candidate
+        except OSError:
+            self._broken = True
+
+    @staticmethod
+    def _prune(log_dir: Path) -> None:
+        existing = sorted(
+            (p for p in log_dir.glob("session-*.log") if p.is_file()),
+            key=lambda p: p.name,
+        )
+        for stale in existing[: max(0, len(existing) - _SESSION_LOG_RETENTION + 1)]:
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+
+    def write(self, text: str) -> None:
+        if self._handle is None:
+            return
+        stamp = _datetime.datetime.now().strftime("%H:%M:%S")
+        try:
+            for line in text.splitlines() or [""]:
+                self._handle.write(f"{stamp} {line}\n")
+            self._handle.flush()
+        except (OSError, ValueError):
+            # ValueError: the handle was closed under us on shutdown.
+            self._handle = None
+
+    def close(self) -> None:
+        if self._handle is not None:
+            try:
+                self._handle.close()
+            except OSError:
+                pass
+            self._handle = None
+
+
 class MlpTrainingStudio(QMainWindow):
     """Main application window."""
 
     def __init__(self, *, executor: QtTaskExecutor | None = None) -> None:
         super().__init__()
+        # Before anything that can log, so no startup message is lost.
+        self.session_log = _SessionLog(current_runtime_paths().log_dir)
         self.executor = executor or QtTaskExecutor()
         self.current_task = None
         self.license_connection_message = LICENSE_REQUIRED_MESSAGE
@@ -894,6 +964,8 @@ class MlpTrainingStudio(QMainWindow):
                 "check is disabled for this session. Runs will start without a seat. This "
                 "switch is ignored in a packaged build."
             )
+        if self.session_log.path is not None:
+            self.append_log(f"Session log: {self.session_log.path}")
         self.append_log("Ready. Select the .npz dataset file and scan the data to begin.")
 
     def _load_last_session_if_available(self) -> None:
@@ -1302,7 +1374,15 @@ class MlpTrainingStudio(QMainWindow):
         """Export the most recent baseline checkpoint to ONNX (e.g. for MATLAB)."""
         run_dir = self._current_baseline_run_dir()
         if not run_dir:
-            self._show_warning("No baseline run is available yet. Complete a baseline training run first.")
+            # Name the folder that was searched. "Complete a baseline training run
+            # first" is wrong and unhelpful when the user is looking at a finished
+            # run and the GUI simply did not look on disk for it.
+            self._show_warning(
+                "No baseline checkpoint was found.\n\n"
+                f"Looked for best_model.pt under:\n{self._output_root_path()}\n\n"
+                "Run a baseline training run, or point Output Folder and Run Name "
+                "at a folder that already holds one."
+            )
             return
         checkpoint_path = Path(run_dir) / "best_model.pt"
         if not checkpoint_path.exists():
@@ -1454,6 +1534,11 @@ class MlpTrainingStudio(QMainWindow):
             self.license_connection_message = f"License check failed: {message}"
             self._refresh_license_display()
         self.append_log(f"Error: {message}")
+        # The traceback goes to the file only. On screen it belongs in the dialog,
+        # where the user is already looking; in the Run Log it would push the
+        # messages around it out of view. On disk it is the whole point of the
+        # file, and it used to exist nowhere once the dialog was dismissed.
+        self.session_log.write(traceback_text)
         self._show_warning(f"{message}\n\n{traceback_text}")
 
     def _force_clear_task_state(self) -> None:
@@ -2423,6 +2508,55 @@ class MlpTrainingStudio(QMainWindow):
             return str(self.last_baseline_summary["run_dir"])
         if self.last_workflow_summary and self.last_workflow_summary.get("baseline"):
             return str(self.last_workflow_summary["baseline"].get("run_dir", "")) or None
+        return self._discover_baseline_run_dir()
+
+    def _baseline_run_dir_candidates(self) -> list[Path]:
+        """Places a finished baseline run can be, best guess first.
+
+        Session state is empty after a restart, and it used to be the only thing
+        Export to ONNX would look at: pointing Output Folder and Run Name at a
+        directory that genuinely held best_model.pt still got "No baseline run is
+        available yet. Complete a baseline training run first." A checkpoint on
+        disk is a baseline run whether or not this process is the one that made
+        it.
+        """
+
+        root = self._output_root_path()
+        run_name = self.run_name_edit.text().strip()
+        candidates: list[Path] = []
+        if run_name:
+            # The canonical layout the backend writes, then the run directory
+            # itself in case the user pointed Output Folder straight at it.
+            candidates.append(root / run_name / "baseline")
+            candidates.append(root / run_name)
+        candidates.append(root / "baseline")
+        candidates.append(root)
+        # Any other run under the output folder, newest first.
+        try:
+            siblings = sorted(
+                (d for d in root.iterdir() if d.is_dir()),
+                key=lambda d: d.stat().st_mtime,
+                reverse=True,
+            )
+        except OSError:
+            siblings = []
+        for sibling in siblings:
+            candidates.append(sibling / "baseline")
+            candidates.append(sibling)
+        return candidates
+
+    def _discover_baseline_run_dir(self) -> str | None:
+        seen: set[Path] = set()
+        for candidate in self._baseline_run_dir_candidates():
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                continue
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            if (candidate / "best_model.pt").is_file():
+                return str(candidate)
         return None
 
     def _default_cache_path(self, run_name: str | None = None) -> str:
@@ -2729,6 +2863,7 @@ class MlpTrainingStudio(QMainWindow):
     def append_log(self, text: str) -> None:
         self.run_log_text_edit.appendPlainText(text)
         self.run_log_text_edit.verticalScrollBar().setValue(self.run_log_text_edit.verticalScrollBar().maximum())
+        self.session_log.write(text)
 
     def _show_warning(self, text: str) -> None:
         QMessageBox.warning(self, "Surrogate Model Training Suite", text)
@@ -2776,6 +2911,8 @@ class MlpTrainingStudio(QMainWindow):
                 thread.wait(5000)
             except RuntimeError:
                 pass  # already deleted by its own deleteLater; nothing to wait for
+        self.session_log.write("Session closed.")
+        self.session_log.close()
         self.license_controller.shutdown()
         super().closeEvent(event)
 
@@ -2916,7 +3053,13 @@ def create_application() -> tuple[QApplication, MlpTrainingStudio]:
     # the window advertised itself as "gui_window.py". Qt reads the variable once
     # when it builds the first native window, so it has to be set before then.
     os.environ.setdefault("RESOURCE_NAME", APP_SLUG)
-    app = QApplication.instance() or QApplication([])
+    # argv[0], not an empty list. Qt derives applicationName from it during
+    # QApplication construction and stamps it into the clipboard's selection-owner
+    # window, which is created right there -- before apply_application_identity
+    # below can rename anything. With [] that window advertised itself on X11 as
+    # "Qt Selection Owner for gui_window.py". Real arguments are preserved so a
+    # Qt switch such as -platform still reaches Qt.
+    app = QApplication.instance() or QApplication([APP_SLUG, *sys.argv[1:]])
     # Before the first window exists: Qt reads the identity when it creates the
     # native window, so setting it afterwards leaves WM_CLASS at the default.
     apply_application_identity(app)
