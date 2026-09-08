@@ -47,6 +47,15 @@ from xfmr_v2.gui_window import create_application  # noqa: E402  (must follow th
 
 
 def main() -> None:
+    # --self-check runs the release gate inside this binary and exits. A
+    # launch-only smoke test passes on a bundle that cannot train: the app
+    # starts, takes a seat, scans and suggests, and only dies when an optimizer
+    # is constructed. Checked before Qt so the gate needs no display.
+    if "--self-check" in sys.argv[1:]:
+        from xfmr_v2.self_check import run_self_check
+
+        raise SystemExit(run_self_check())
+
     # `create_application` centralizes theme setup and window construction so the
     # entrypoint only needs to show the window and hand control to Qt's event loop.
     app, window = create_application()
