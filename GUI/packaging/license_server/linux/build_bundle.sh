@@ -141,7 +141,13 @@ if [[ $skip_archive -eq 0 ]]; then
   # a Windows mount safe to ship: drvfs reports every file 0777 and silently ignores
   # chmod, so the staged tree cannot be corrected in place. Without this the customer
   # extracts a license_server/ whose .py files any local user can rewrite.
-  tar -C "$output_dir" --mode='go-w' -czf "$tarball_path" "$bundle_name"
+  # --owner/--group/--numeric-owner: without them tar records the build host's
+  # numeric uid/gid, and `sudo tar -xzf ... -C /opt` reproduces them on the
+  # customer's machine -- every file showed as UNKNOWN:users (81256:100).
+  # It still runs, because the modes are 0755, but it reads as a broken install
+  # and trips file-integrity tooling. root:root is what a system package ships.
+  tar -C "$output_dir" --mode='go-w' --owner=0 --group=0 --numeric-owner \
+    -czf "$tarball_path" "$bundle_name"
 fi
 
 archive_summary="$tarball_path"
